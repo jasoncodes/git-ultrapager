@@ -204,6 +204,35 @@ index 00000000..4cb0e9b7
 +## 反映先
 "#;
 
+const MULTI_COMMIT_RANGE_DIFF: &str = r#"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Author: Example <example@example.com>
+Date:   Fri Jul 10 12:00:00 2026 +0900
+
+    add first file
+
+diff --git a/first.txt b/first.txt
+new file mode 100644
+index 00000000..11111111
+--- /dev/null
++++ b/first.txt
+@@ -0,0 +1 @@
++first
+
+commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Author: Example <example@example.com>
+Date:   Fri Jul 10 12:01:00 2026 +0900
+
+    update second file
+
+diff --git a/second.txt b/second.txt
+index 22222222..33333333 100644
+--- a/second.txt
++++ b/second.txt
+@@ -1 +1 @@
+-before
++after
+"#;
+
 fn assert_new_markdown_file_is_rich(document: &TestDocument) {
     let file = &document.files()[0];
     assert_eq!(file.mode, FileMode::Rich);
@@ -231,6 +260,65 @@ fn assert_new_markdown_file_is_rich(document: &TestDocument) {
         assert_eq!(line.old_line_number, None);
         assert_eq!(line.new_line_number, Some(index as u64 + 1));
     }
+}
+
+fn assert_multi_commit_range_is_rich(document: &TestDocument) {
+    assert_eq!(document.commits().len(), 2);
+    assert_eq!(document.files().len(), 2);
+    assert!(
+        document
+            .files()
+            .iter()
+            .all(|file| file.mode == FileMode::Rich)
+    );
+    assert_eq!(
+        (document.files()[0].additions, document.files()[0].deletions),
+        (Some(1), Some(0))
+    );
+    assert_eq!(
+        (document.files()[1].additions, document.files()[1].deletions),
+        (Some(1), Some(1))
+    );
+    assert!(
+        document
+            .hunks()
+            .iter()
+            .all(|hunk| hunk.kind == HunkKind::Unified && hunk.span.is_closed())
+    );
+
+    let lines = decoded_lines(document);
+    let separator = lines
+        .windows(2)
+        .find(|pair| pair[0].text.is_empty() && pair[1].kind == LineKind::CommitHeader)
+        .map(|pair| &pair[0])
+        .expect("commit blocks should be separated by an empty line");
+    assert_eq!(separator.kind, LineKind::FileMetadata);
+    assert_eq!(separator.commit_id, Some(document.commits()[0].id));
+    assert_eq!(separator.file_id, Some(document.files()[0].id));
+    assert_eq!(separator.hunk_id, None);
+
+    let source = lines
+        .iter()
+        .filter(|line| {
+            matches!(
+                line.kind,
+                LineKind::Context | LineKind::Deletion | LineKind::Addition
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(source.len(), 3);
+    assert_eq!(
+        (source[0].old_line_number, source[0].new_line_number),
+        (None, Some(1))
+    );
+    assert_eq!(
+        (source[1].old_line_number, source[1].new_line_number),
+        (Some(1), None)
+    );
+    assert_eq!(
+        (source[2].old_line_number, source[2].new_line_number),
+        (None, Some(1))
+    );
 }
 
 fn streaming_parser() -> (AppendStore, GitParser) {
@@ -659,6 +747,57 @@ fn new_markdown_file_frontmatter_and_lists_keep_source_line_numbers() {
     }
     raw.seal().unwrap();
     assert_new_markdown_file_is_rich(&materialize(parser.into_document().unwrap()));
+}
+
+#[test]
+fn completed_hunk_before_commit_separator_keeps_both_files_rich() {
+    assert_multi_commit_range_is_rich(&parse_bytes(MULTI_COMMIT_RANGE_DIFF.as_bytes()));
+
+    let (raw, mut parser) = streaming_parser();
+    let blank = MULTI_COMMIT_RANGE_DIFF.find("+first\n\ncommit").unwrap() + "+first\n".len();
+    let bytes = MULTI_COMMIT_RANGE_DIFF.as_bytes();
+    push_stored(&raw, &mut parser, &bytes[..blank]).unwrap();
+    push_stored(&raw, &mut parser, &bytes[blank..=blank]).unwrap();
+
+    let active = materialize(parser.snapshot().unwrap());
+    assert_eq!(active.files().len(), 1);
+    assert_eq!(active.files()[0].mode, FileMode::Rich);
+    assert!(!active.files()[0].span.is_closed());
+    assert!(!active.hunks()[0].span.is_closed());
+    let separator = decoded_lines(&active).pop().unwrap();
+    assert_eq!(separator.kind, LineKind::FileMetadata);
+    assert_eq!(separator.file_id, Some(active.files()[0].id));
+    assert_eq!(separator.hunk_id, None);
+
+    push_stored(&raw, &mut parser, &bytes[blank + 1..]).unwrap();
+    raw.seal().unwrap();
+    assert_multi_commit_range_is_rich(&materialize(parser.into_document().unwrap()));
+}
+
+#[test]
+fn commit_separator_does_not_mask_incomplete_or_excess_hunk_lines() {
+    for input in [
+        b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n\ncommit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            .as_slice(),
+        b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n+extra\n"
+            .as_slice(),
+        b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n\n+extra\n"
+            .as_slice(),
+    ] {
+        let document = parse_bytes(input);
+        assert_eq!(document.files()[0].mode, FileMode::Malformed);
+        assert_eq!(document.hunks()[0].kind, HunkKind::Malformed);
+        assert!(
+            decoded_lines(&document)
+                .iter()
+                .filter(|line| matches!(line.text.as_str(), "-old" | "+new" | "+extra"))
+                .all(|line| {
+                    line.kind == LineKind::Fallback
+                        && line.old_line_number.is_none()
+                        && line.new_line_number.is_none()
+                })
+        );
+    }
 }
 
 #[test]

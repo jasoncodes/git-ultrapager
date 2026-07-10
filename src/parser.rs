@@ -864,6 +864,13 @@ impl GitParser {
             return self.append_current_file_line(span, text.len(), LineKind::Binary, None, None);
         }
 
+        // `git show <range>` は commit block 間に marker なしの空行を置く。hunk header の
+        // old/new count を両方消費した Rich hunk に限って file metadata とし、hunk cursor は
+        // 次の構造境界まで残す。余剰な source marker が続けば従来どおり Malformed へ落ちる。
+        if text.is_empty() && self.current_rich_hunk_is_complete()? {
+            return self.append_current_file_metadata_line(span, text.len());
+        }
+
         if self.current_hunk.is_some() {
             if self.current_file_mode()? == Some(FileMode::Rich) {
                 if let Some(line) = self.consume_rich_hunk_line(text)? {
@@ -1180,6 +1187,15 @@ impl GitParser {
         Ok(())
     }
 
+    fn current_rich_hunk_is_complete(&self) -> Result<bool, ParseError> {
+        if self.current_file_mode()? != Some(FileMode::Rich) {
+            return Ok(false);
+        }
+        Ok(self
+            .current_hunk
+            .is_some_and(|cursor| cursor.old_remaining == 0 && cursor.new_remaining == 0))
+    }
+
     fn close_file(&mut self, end: LineId) -> Result<(), ParseError> {
         self.close_hunk(end)?;
         if self.awaiting_new_file_header {
@@ -1359,6 +1375,27 @@ impl GitParser {
             hunk_id,
             old_line_number,
             new_line_number,
+        )
+    }
+
+    fn append_current_file_metadata_line(
+        &mut self,
+        span: RawLineSpan,
+        display_len: usize,
+    ) -> Result<(), ParseError> {
+        let file_id = self.current_file;
+        let commit_id = file_id
+            .map(|id| self.document.open_file(id).map(|file| file.commit_id()))
+            .transpose()?;
+        self.append_line(
+            span,
+            display_len,
+            LineKind::FileMetadata,
+            commit_id,
+            file_id,
+            None,
+            None,
+            None,
         )
     }
 
