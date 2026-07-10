@@ -10,7 +10,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use ratatui::Frame;
+use ratatui::buffer::{Buffer, CellWidth};
 use ratatui::layout::Rect;
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph};
 use thiserror::Error;
@@ -1036,6 +1038,7 @@ pub fn render(
 
     if area.height < 5 || area.width < 11 || state.layout_error().is_some() {
         render_too_small(frame, area, theme);
+        preserve_wide_cell_styles(frame.buffer_mut());
         return;
     }
     let empty_decorations = DecorationSet::default();
@@ -1061,6 +1064,37 @@ pub fn render(
         Mode::FileList(_) => render_file_list(frame, content_area, lines.file_list.as_ref(), theme),
     }
     render_status(frame, status_area, state, theme, lines);
+    preserve_wide_cell_styles(frame.buffer_mut());
+}
+
+/// Wide glyphが実端末で占有するtrailing cellへlead cellのstyleを記録する。
+///
+/// Ratatuiのbufferはwide glyphの後半をdefaultの空白cellとして保持する一方、実端末はlead cellの
+/// foreground、background、modifierをglyph幅全体へ描く。後続frameのwide glyphが1列左から旧lead
+/// cellへ重なると、diff iteratorはその位置を新glyphの後半として読み飛ばす。この関数で物理的な占有
+/// styleをbufferにも残しておけば、重なりから露出した旧trailing cellがstyle差分となり空白で消去される。
+/// Symbolとdiff optionは変えず、通常frameでbackendへ余分なtrailing cellを書かせない。
+fn preserve_wide_cell_styles(buffer: &mut Buffer) {
+    let area = buffer.area;
+
+    for y in area.y..area.bottom() {
+        let mut x = area.x;
+        while x < area.right() {
+            let (width, style) = {
+                let cell = &buffer[(x, y)];
+                (cell.cell_width().max(1), cell.style())
+            };
+            let next = x.saturating_add(width).min(area.right());
+            for trailing_x in x.saturating_add(1)..next {
+                let trailing = &mut buffer[(trailing_x, y)];
+                if trailing.symbol() == " " {
+                    trailing.modifier = Modifier::empty();
+                    trailing.set_style(style);
+                }
+            }
+            x = next.max(x.saturating_add(1));
+        }
+    }
 }
 
 fn render_too_small(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -2338,6 +2372,8 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
+    use ratatui::style::{Color, Style};
 
     use super::*;
     use crate::cli::ThemeChoice;
@@ -2359,6 +2395,30 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn wide_glyph_shift_exposes_previous_trailing_background_to_buffer_diff() {
+        let area = Rect::new(0, 0, 4, 1);
+        let highlighted = Style::new()
+            .bg(Color::Green)
+            .add_modifier(Modifier::REVERSED);
+        let mut previous = Buffer::empty(area);
+        previous.set_string(1, 0, "界", highlighted);
+        preserve_wide_cell_styles(&mut previous);
+        assert_eq!(previous[(1, 0)].style(), previous[(2, 0)].style());
+
+        let mut next = Buffer::empty(area);
+        next.set_string(0, 0, "界", highlighted);
+        preserve_wide_cell_styles(&mut next);
+
+        let updates = previous.diff(&next);
+        assert!(
+            updates.iter().any(|(x, y, cell)| {
+                *x == 2 && *y == 0 && cell.symbol() == " " && cell.bg == Color::Reset
+            }),
+            "1列左へ移った全角文字の旧末尾cellが消去対象に含まれていない: {updates:?}"
+        );
     }
 
     fn apply_search_preview(state: &mut AppState, pattern: &str) {
