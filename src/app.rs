@@ -528,7 +528,16 @@ fn run_interactive(
                 guards.terminal.restore().map_err(anyhow::Error::new)?;
                 return Ok(ExitCode::from(code));
             }
-            if state.whitespace() != previous_whitespace || viewport_hunk(&state) != previous_hunk {
+            // 実行中のfull scanを移動のたびにcancelすると、priority setだけが入れ替わり続けて
+            // 同じ画面の別hunkから装飾が消える。Current scanを完了させ、full resultがbudgetで
+            // 覆えなかったhunkへ移動した場合だけ次のpriority requestを開始する。
+            let decoration_scan_pending = state.background_status() == Some("highlighting…");
+            if should_submit_decorations(
+                state.whitespace() != previous_whitespace,
+                decoration_scan_pending,
+                viewport_hunk(&state) != previous_hunk,
+                viewport_hunk_has_applied_decorations(&state, &decorations),
+            ) {
                 submit_decorations(
                     &decorations_worker,
                     &mut decoration_generation,
@@ -585,6 +594,34 @@ fn submit_decorations(
 /// 返すため、長いdocumentでも移動先のsyntax/intraline装飾をfull scanより先に描画できる。
 fn viewport_hunk(state: &AppState) -> Option<HunkId> {
     state.current_row().and_then(|row| row.hunk_id)
+}
+
+/// 現在hunkのvisible source rowが、同じsnapshot・whitespace modeの適用済みresultに含まれるかを返す。
+///
+/// Full resultが既にhunkを覆う場合は、移動のたびにpriority resultで置き換える必要がない。Result budgetで
+/// full scanが打ち切られたhunkはvisible rowを1件も持たないため、priority計算へ進んで表示位置を補う。
+fn viewport_hunk_has_applied_decorations(
+    state: &AppState,
+    decorations: &crate::decorations::DecorationSet,
+) -> bool {
+    let Some(hunk_id) = viewport_hunk(state) else {
+        return false;
+    };
+    decorations.belongs_to(state.document())
+        && decorations.whitespace() == state.whitespace()
+        && state
+            .visible_rows()
+            .iter()
+            .any(|row| row.hunk_id == Some(hunk_id) && decorations.line(row.line_id).is_some())
+}
+
+const fn should_submit_decorations(
+    whitespace_changed: bool,
+    scan_pending: bool,
+    hunk_changed: bool,
+    current_hunk_is_covered: bool,
+) -> bool {
+    whitespace_changed || (!scan_pending && hunk_changed && !current_hunk_is_covered)
 }
 
 fn read_terminal_event() -> Result<Option<StateEvent>> {
@@ -1013,6 +1050,14 @@ mod tests {
         let storage = StructuralStorage::new().unwrap();
         let parser = GitParser::new(raw.clone(), &storage).unwrap();
         (raw, parser)
+    }
+
+    #[test]
+    fn hunk_movement_does_not_cancel_an_active_full_decoration_scan() {
+        assert!(!should_submit_decorations(false, true, true, false));
+        assert!(should_submit_decorations(false, false, true, false));
+        assert!(!should_submit_decorations(false, false, true, true));
+        assert!(should_submit_decorations(true, true, false, true));
     }
 
     fn push_stored(parser: &mut GitParser, raw: &crate::input::AppendStore, bytes: &[u8]) {
