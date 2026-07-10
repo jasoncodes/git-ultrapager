@@ -20,7 +20,7 @@ fn ansi_sequence_is_removed_across_chunk_boundaries() {
     for chunk in chunks {
         stripper.push(chunk, &mut output);
     }
-    stripper.finish();
+    stripper.finish_into(&mut output);
 
     assert_eq!(escape_interactive_bytes(&output), "plainred safe end!");
 }

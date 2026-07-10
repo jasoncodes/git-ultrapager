@@ -1,9 +1,9 @@
 //! Process mode の選択と各 subsystem の lifecycle を調停する。
 //!
-//! stdout が TTY でない経路は byte-preserving passthrough、TTY direct 経路は complete document、
-//! interactive 経路は stdin reader・search worker・terminal event を `AppState` へ集約する。reader
-//! と worker の thread は user quit 時に join しない。receiver を drop して process を返すことで、
-//! pipe の読み切りや実行中 regex を終了条件に持ち込まない。
+//! stdout が TTY でない経路はANSI sequenceだけを除くbyte passthrough、TTY direct 経路はcomplete
+//! document、interactive 経路は stdin reader・search worker・terminal event を `AppState` へ集約する。
+//! reader と worker の thread は user quit 時に join しない。receiver を drop して process を返す
+//! ことで、pipe の読み切りや実行中 regex を終了条件に持ち込まない。
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::ExitCode;
@@ -30,7 +30,6 @@ const READ_CHUNK_BYTES: usize = 32 * 1024;
 const AUTO_PROBE_TIME: Duration = Duration::from_millis(100);
 const EVENT_POLL_TIME: Duration = Duration::from_millis(16);
 const DOCUMENT_PUBLISH_TIME: Duration = Duration::from_millis(33);
-const SEARCH_QUEUE_DEPTH: usize = 2;
 const DEFAULT_TERMINAL_WIDTH: u16 = 80;
 const DEFAULT_TERMINAL_HEIGHT: u16 = 24;
 
@@ -278,8 +277,7 @@ fn run_interactive(
         cli.whitespace,
         eof,
     );
-    let search =
-        SearchWorker::spawn(SEARCH_QUEUE_DEPTH).context("failed to spawn search worker")?;
+    let search = SearchWorker::spawn().context("failed to spawn search worker")?;
     let decorations_worker =
         DecorationWorker::spawn().context("failed to spawn decoration worker")?;
     let mut decoration_generation = 0_u64;
@@ -714,7 +712,14 @@ fn passthrough<R: Read, W: Write>(mut reader: R, mut writer: W) -> Result<ExitCo
     loop {
         let count = reader.read(&mut input).context("failed to read stdin")?;
         if count == 0 {
-            stripper.finish();
+            let mut sanitized_tail = Vec::new();
+            stripper.finish_into(&mut sanitized_tail);
+            if let Err(error) = writer.write_all(&sanitized_tail) {
+                if error.kind() == io::ErrorKind::BrokenPipe {
+                    return Ok(ExitCode::SUCCESS);
+                }
+                return Err(error).context("failed to write passthrough output");
+            }
             break;
         }
         let mut sanitized = Vec::with_capacity(count);
@@ -749,6 +754,14 @@ mod tests {
         let code = passthrough(&b"a\xff\x1b[31mb"[..], &mut output).unwrap();
         assert_eq!(code, ExitCode::SUCCESS);
         assert_eq!(output, b"a\xffb");
+    }
+
+    #[test]
+    fn passthrough_replays_invalid_utf8_c1_and_flushes_safe_eof_tail() {
+        let mut output = Vec::new();
+        let code = passthrough(&b"a\xf0\x9b31mb\xe0\xa0"[..], &mut output).unwrap();
+        assert_eq!(code, ExitCode::SUCCESS);
+        assert_eq!(output, b"a\xf0b\xe0\xa0");
     }
 
     #[test]

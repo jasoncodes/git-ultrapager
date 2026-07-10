@@ -7,9 +7,11 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Stdout, Write};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::thread::{self, JoinHandle};
 
-use crossbeam_channel::{Receiver, unbounded};
+use crossbeam_channel::TryRecvError;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
@@ -42,9 +44,89 @@ pub enum SignalEvent {
     Suspend,
 }
 
+const PENDING_HUP: u8 = 1 << 0;
+const PENDING_TERM: u8 = 1 << 1;
+const PENDING_QUIT: u8 = 1 << 2;
+const PENDING_SUSPEND: u8 = 1 << 3;
+
+/// Signal iteratorからmain loopへ渡す4種類のpending flag。
+///
+/// Producerは`fetch_or`だけを行うため、main threadが停止中でも待たず、同じsignalの連続到着は1 bitへ
+/// 畳み込まれる。異なるtermination signalは別bitに残し、consumerはterminationをsuspendより先に返す。
+/// Termination待ちの状態でjob controlへ入ると終了が`SIGCONT`まで遅れるため、この優先順にする。
+#[derive(Default)]
+struct PendingSignals {
+    bits: AtomicU8,
+    closed: AtomicBool,
+}
+
+impl PendingSignals {
+    fn record(&self, signal: i32) {
+        let bit = match signal {
+            SIGHUP => PENDING_HUP,
+            SIGTERM => PENDING_TERM,
+            SIGQUIT => PENDING_QUIT,
+            SIGTSTP => PENDING_SUSPEND,
+            _ => return,
+        };
+        self.bits.fetch_or(bit, Ordering::Release);
+    }
+
+    fn try_take(&self) -> Result<SignalEvent, TryRecvError> {
+        loop {
+            let pending = self.bits.load(Ordering::Acquire);
+            let Some((bit, event)) = next_signal_event(pending) else {
+                if !self.closed.load(Ordering::Acquire) {
+                    return Err(TryRecvError::Empty);
+                }
+                // Producerは最後のbitをpublishしてからclosedを立てる。最初のbits loadとcloseの間に
+                // signalが届いた場合を拾い直し、pending eventを残したままDisconnectedを返さない。
+                if self.bits.load(Ordering::Acquire) == 0 {
+                    return Err(TryRecvError::Disconnected);
+                }
+                continue;
+            };
+            if self
+                .bits
+                .compare_exchange_weak(pending, pending & !bit, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Ok(event);
+            }
+        }
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+}
+
+fn next_signal_event(pending: u8) -> Option<(u8, SignalEvent)> {
+    [
+        (PENDING_HUP, SignalEvent::Terminate(SIGHUP)),
+        (PENDING_TERM, SignalEvent::Terminate(SIGTERM)),
+        (PENDING_QUIT, SignalEvent::Terminate(SIGQUIT)),
+        (PENDING_SUSPEND, SignalEvent::Suspend),
+    ]
+    .into_iter()
+    .find(|(bit, _)| pending & bit != 0)
+}
+
+/// `Receiver`と同じnonblocking read契約を持つ、固定4 bitのsignal event queue。
+pub struct SignalEvents {
+    pending: Arc<PendingSignals>,
+}
+
+impl SignalEvents {
+    /// Pending eventを1件返す。同じsignalの未処理eventは1件へcoalesceされる。
+    pub fn try_recv(&self) -> Result<SignalEvent, TryRecvError> {
+        self.pending.try_take()
+    }
+}
+
 /// Signal-hook thread と shutdown handle。
 pub struct SignalWatcher {
-    pub events: Receiver<SignalEvent>,
+    pub events: SignalEvents,
     handle: SignalHandle,
     join: Option<JoinHandle<()>>,
 }
@@ -54,26 +136,20 @@ impl SignalWatcher {
     pub fn spawn() -> io::Result<Self> {
         let mut signals = Signals::new([SIGHUP, SIGTERM, SIGQUIT, SIGTSTP])?;
         let handle = signals.handle();
-        // Bounded channel のblocking sendは、queueが満杯のままwatcherをdropするとjoinを永久に
-        // 待たせる。signal-hookが同一signalをflagでまとめるため、unboundedでもsignal stormごとに
-        // allocationする経路にはならず、shutdownをreceiverの消費状態から独立させられる。
-        let (sender, receiver) = unbounded();
+        let pending = Arc::new(PendingSignals::default());
+        let worker_pending = Arc::clone(&pending);
         let join = thread::Builder::new()
             .name("git-ultrapager-signals".to_owned())
             .spawn(move || {
                 for signal in signals.forever() {
-                    let event = if signal == SIGTSTP {
-                        SignalEvent::Suspend
-                    } else {
-                        SignalEvent::Terminate(signal)
-                    };
-                    if sender.send(event).is_err() {
-                        break;
-                    }
+                    // Atomic flag更新はallocationも待機も行わない。同じsignalがmain loopの処理より
+                    // 速く届いてもpending bitを維持し、watcher shutdownをconsumerから独立させる。
+                    worker_pending.record(signal);
                 }
+                worker_pending.close();
             })?;
         Ok(Self {
-            events: receiver,
+            events: SignalEvents { pending },
             handle,
             join: Some(join),
         })
@@ -230,5 +306,39 @@ mod tests {
     fn signal_events_preserve_shell_exit_codes() {
         assert_eq!(SignalEvent::Terminate(SIGTERM), SignalEvent::Terminate(15));
         assert_eq!(128 + SIGQUIT, 131);
+    }
+
+    #[test]
+    fn pending_signals_coalesce_duplicates_without_dropping_distinct_signals() {
+        let pending = PendingSignals::default();
+        pending.record(SIGTSTP);
+        pending.record(SIGTSTP);
+        pending.record(SIGTERM);
+        pending.record(SIGQUIT);
+
+        assert_eq!(pending.try_take(), Ok(SignalEvent::Terminate(SIGTERM)));
+        assert_eq!(pending.try_take(), Ok(SignalEvent::Terminate(SIGQUIT)));
+        assert_eq!(pending.try_take(), Ok(SignalEvent::Suspend));
+        assert_eq!(pending.try_take(), Err(TryRecvError::Empty));
+    }
+
+    #[test]
+    fn pending_termination_takes_priority_over_suspend() {
+        let pending = PendingSignals::default();
+        pending.record(SIGTSTP);
+        pending.record(SIGHUP);
+
+        assert_eq!(pending.try_take(), Ok(SignalEvent::Terminate(SIGHUP)));
+        assert_eq!(pending.try_take(), Ok(SignalEvent::Suspend));
+    }
+
+    #[test]
+    fn closed_pending_queue_drains_before_disconnect() {
+        let pending = PendingSignals::default();
+        pending.record(SIGTERM);
+        pending.close();
+
+        assert_eq!(pending.try_take(), Ok(SignalEvent::Terminate(SIGTERM)));
+        assert_eq!(pending.try_take(), Err(TryRecvError::Disconnected));
     }
 }

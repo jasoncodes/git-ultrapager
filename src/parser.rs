@@ -126,7 +126,9 @@ impl GitParser {
             return before.delta(&self.document, true, false);
         }
 
-        self.ansi.finish();
+        let mut sanitized_tail = Vec::new();
+        self.ansi.finish_into(&mut sanitized_tail);
+        self.consume_sanitized(&sanitized_tail);
         if !self.pending_line.is_empty() {
             let bytes = mem::take(&mut self.pending_line);
             self.process_line(escape_interactive_bytes(&bytes), false);

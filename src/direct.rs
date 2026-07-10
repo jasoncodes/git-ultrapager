@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::ops::Range;
+use std::sync::Arc;
 
 use ratatui::style::{Color, Modifier, Style};
 use thiserror::Error;
@@ -18,11 +19,71 @@ use crate::model::{CommitId, Document, DocumentLine, FileId, HunkId, LineId, Lin
 use crate::text::wrap_hard;
 use crate::theme::{SemanticRole, Theme};
 
-/// Layout がsource本文1cellを確保できない場合のfailure。
+/// Layout parameterの検証またはlogical lineのreflowに失敗した理由。
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum LayoutError {
+    /// Tab stopを計算できない幅0が渡された。
+    #[error("tab width must be at least 1, got {actual}")]
+    InvalidTabWidth { actual: usize },
+    /// 現在行の行番号が、呼び出し側から渡されたfile共通gutterへ収まらない。
+    #[error(
+        "gutter widths old={old_width}, new={new_width} are smaller than the line-number widths old={required_old_width}, new={required_new_width}"
+    )]
+    UndersizedGutter {
+        old_width: usize,
+        required_old_width: usize,
+        new_width: usize,
+        required_new_width: usize,
+    },
+    /// Gutterと本文1cellをterminal幅へ収められない。
     #[error("terminal width {actual} is smaller than the required width {required}")]
     TooNarrow { actual: usize, required: usize },
+}
+
+/// Source行の左右の行番号欄に割り当てるcell数。
+///
+/// 各幅は`u64`の最大桁数20を含められる`u8`で保持する。2つの幅と固定separatorを
+/// `usize`へ変換しても最大514cellなので、terminal幅との加減算前にoverflowしない。
+/// Metadata行ではgutterを描かないため、この値は参照されない。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GutterSpec {
+    old_width: u8,
+    new_width: u8,
+}
+
+impl GutterSpec {
+    /// Parserがfile全体の最大行番号をまだ持たない場合に使う最小幅。
+    pub const MINIMUM: Self = Self::new(3, 3);
+
+    /// 左右それぞれの行番号欄を作る。
+    ///
+    /// 3cell未満では短いdiffのgutterがfileごとに揺れるため3へ切り上げる。呼び出し側は
+    /// 同じfileの最大行番号を収める幅を渡し、file内の各行へ同じ値を再利用する。
+    #[must_use]
+    pub const fn new(old_width: u8, new_width: u8) -> Self {
+        Self {
+            old_width: if old_width < 3 { 3 } else { old_width },
+            new_width: if new_width < 3 { 3 } else { new_width },
+        }
+    }
+
+    /// 旧file側の行番号欄を占めるcell数を返す。
+    #[must_use]
+    pub const fn old_width(self) -> usize {
+        self.old_width as usize
+    }
+
+    /// 新file側の行番号欄を占めるcell数を返す。
+    #[must_use]
+    pub const fn new_width(self) -> usize {
+        self.new_width as usize
+    }
+}
+
+impl Default for GutterSpec {
+    fn default() -> Self {
+        Self::MINIMUM
+    }
 }
 
 /// 画面に描画する1 visual row。
@@ -41,6 +102,36 @@ pub struct VisualRow {
     pub rendered_content_range: Range<usize>,
     pub continuation: bool,
     span_map: Vec<SpanMapping>,
+}
+
+/// 1 logical lineから作ったvisual row群。
+///
+/// 内部の`Arc`はtab展開済みtextとlogical/rendered span mappingを含む`VisualRow`を共有する。
+/// Viewport cacheが同じline layoutを複数frameから参照しても`String`とmappingを複製しない。
+/// `layout_document`は同じrow生成関数へ自身の連続bufferを渡し、per-lineの`Arc`を作らない。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LineLayout {
+    rows: Arc<Vec<VisualRow>>,
+}
+
+impl LineLayout {
+    /// このlogical lineを構成するvisual rowを表示順で返す。
+    #[must_use]
+    pub fn rows(&self) -> &[VisualRow] {
+        self.rows.as_slice()
+    }
+
+    /// 折り返し後のvisual row数を返す。
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Visual rowが存在しないかを返す。正常なlayoutでは空logical lineも1 rowになる。
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,13 +251,64 @@ impl VisualRow {
     }
 }
 
+/// Sanitized済みの1 logical lineをterminal widthへhard-wrapする。
+///
+/// この関数は`Document`や前後行を参照しない。Source行のgutter幅はfile全体で揃える必要が
+/// あるため、呼び出し側が同じfileから算出した`GutterSpec`を明示的に渡す。`tab_width == 0`
+/// は`InvalidTabWidth`、現在行の番号を収められないgutterは`UndersizedGutter`、本文を1cell
+/// も確保できないterminal幅は`TooNarrow`を返す。
+pub fn layout_line(
+    line: &DocumentLine,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+) -> Result<LineLayout, LayoutError> {
+    let mut rows = Vec::new();
+    append_line_rows(&mut rows, line, width, tab_width, gutter)?;
+    Ok(LineLayout {
+        rows: Arc::new(rows),
+    })
+}
+
+/// Publicなper-line layoutとdocument-wide layoutが共有する唯一のrow生成経路。
+///
+/// 呼び出し側が所有する`Vec`へ直接追加するため、`layout_document`はlogical lineごとの一時
+/// `Vec`と`Arc`を作らない。失敗したlineより前に追加済みのrowは残るが、この関数はmodule内
+/// だけで使い、公開APIは失敗時に構築途中のbufferを外へ返さない。
+fn append_line_rows(
+    rows: &mut Vec<VisualRow>,
+    line: &DocumentLine,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+) -> Result<(), LayoutError> {
+    validate_tab_width(tab_width)?;
+    if is_source_line(line.kind) {
+        validate_gutter(line, gutter)?;
+        append_source_rows(
+            rows,
+            line,
+            width,
+            tab_width,
+            gutter.old_width(),
+            gutter.new_width(),
+        )?;
+    } else {
+        append_metadata_rows(rows, line, width, tab_width)?;
+    }
+    Ok(())
+}
+
 /// Document を terminal width へhard-wrapする。
 pub fn layout_document(
     document: &Document,
     width: usize,
     tab_width: usize,
 ) -> Result<DocumentLayout, LayoutError> {
-    let gutter_widths = file_gutter_widths(document);
+    // Empty documentでも無効なlayout parameterを成功扱いにしない。これにより入力内容によって
+    // 同じtab幅の成否が変わらず、`layout_line`とfailure contractが揃う。
+    validate_tab_width(tab_width)?;
+    let gutter_specs = file_gutter_specs(document);
     let mut layout = DocumentLayout::default();
 
     for line in document.lines() {
@@ -182,24 +324,40 @@ pub fn layout_document(
             layout.first_row_by_hunk.entry(id).or_insert(row_start);
         }
 
-        if is_source_line(line.kind) {
-            let (old_width, new_width) = line
-                .file_id
-                .and_then(|id| gutter_widths.get(&id).copied())
-                .unwrap_or((3, 3));
-            append_source_rows(
-                &mut layout.rows,
-                line,
-                width,
-                tab_width,
-                old_width,
-                new_width,
-            )?;
-        } else {
-            append_metadata_rows(&mut layout.rows, line, width, tab_width)?;
-        }
+        let gutter = line
+            .file_id
+            .and_then(|id| gutter_specs.get(&id).copied())
+            .unwrap_or_default();
+        append_line_rows(&mut layout.rows, line, width, tab_width, gutter)?;
     }
     Ok(layout)
+}
+
+fn validate_tab_width(tab_width: usize) -> Result<(), LayoutError> {
+    if tab_width == 0 {
+        return Err(LayoutError::InvalidTabWidth { actual: tab_width });
+    }
+    Ok(())
+}
+
+fn validate_gutter(line: &DocumentLine, gutter: GutterSpec) -> Result<(), LayoutError> {
+    let required_old_width = line
+        .old_line_number
+        .map_or(0, |number| usize::from(decimal_width(number)));
+    let required_new_width = line
+        .new_line_number
+        .map_or(0, |number| usize::from(decimal_width(number)));
+    let old_width = gutter.old_width();
+    let new_width = gutter.new_width();
+    if required_old_width > old_width || required_new_width > new_width {
+        return Err(LayoutError::UndersizedGutter {
+            old_width,
+            required_old_width,
+            new_width,
+            required_new_width,
+        });
+    }
+    Ok(())
 }
 
 fn append_source_rows(
@@ -407,25 +565,25 @@ fn mapping_bounds(mappings: &[SpanMapping]) -> Option<Range<usize>> {
     Some(mappings.first()?.logical.start..mappings.last()?.logical.end)
 }
 
-fn file_gutter_widths(document: &Document) -> HashMap<FileId, (usize, usize)> {
+fn file_gutter_specs(document: &Document) -> HashMap<FileId, GutterSpec> {
     let mut widths = HashMap::new();
     for line in document.lines() {
         let Some(file_id) = line.file_id else {
             continue;
         };
-        let entry = widths.entry(file_id).or_insert((3, 3));
+        let entry = widths.entry(file_id).or_insert(GutterSpec::MINIMUM);
         if let Some(number) = line.old_line_number {
-            entry.0 = entry.0.max(decimal_width(number));
+            entry.old_width = entry.old_width.max(decimal_width(number));
         }
         if let Some(number) = line.new_line_number {
-            entry.1 = entry.1.max(decimal_width(number));
+            entry.new_width = entry.new_width.max(decimal_width(number));
         }
     }
     widths
 }
 
-fn decimal_width(number: u64) -> usize {
-    number.checked_ilog10().map_or(1, |log| log as usize + 1)
+fn decimal_width(number: u64) -> u8 {
+    number.checked_ilog10().map_or(1, |log| log as u8 + 1)
 }
 
 fn is_source_line(kind: LineKind) -> bool {
@@ -768,6 +926,177 @@ mod tests {
     use crate::decorations::DecorationSet;
     use crate::parser::parse_bytes;
     use crate::theme::ColorLevel;
+
+    #[test]
+    fn gutter_spec_is_compact_and_keeps_the_minimum_alignment() {
+        assert_eq!(std::mem::size_of::<GutterSpec>(), 2);
+        assert_eq!(GutterSpec::new(0, 2), GutterSpec::MINIMUM);
+        assert_eq!(GutterSpec::new(4, 7).old_width(), 4);
+        assert_eq!(GutterSpec::new(4, 7).new_width(), 7);
+    }
+
+    #[test]
+    fn zero_tab_width_is_rejected_for_tab_free_and_empty_documents() {
+        let document = parse_bytes(b"metadata without tabs\n");
+        let expected = LayoutError::InvalidTabWidth { actual: 0 };
+        assert_eq!(
+            layout_line(&document.lines()[0], 80, 0, GutterSpec::MINIMUM).unwrap_err(),
+            expected,
+        );
+        assert_eq!(layout_document(&document, 80, 0).unwrap_err(), expected);
+
+        let empty = parse_bytes(b"");
+        assert_eq!(layout_document(&empty, 80, 0).unwrap_err(), expected);
+    }
+
+    #[test]
+    fn line_layout_rejects_gutters_that_cannot_hold_current_line_numbers() {
+        let document = parse_bytes(
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -12345 +54321 @@\n value\n",
+        );
+        let context = document
+            .lines()
+            .iter()
+            .find(|line| line.kind == LineKind::Context)
+            .unwrap();
+
+        assert_eq!(
+            layout_line(context, 0, 4, GutterSpec::new(3, 4)).unwrap_err(),
+            LayoutError::UndersizedGutter {
+                old_width: 3,
+                required_old_width: 5,
+                new_width: 4,
+                required_new_width: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn line_layout_matches_document_layout_for_metadata_source_tabs_and_unicode() {
+        let document = parse_bytes(
+            "ab\t界cd\n\
+             diff --git a/a.rs b/a.rs\n\
+             --- a/a.rs\n\
+             +++ b/a.rs\n\
+             @@ -98,1 +12345,1 @@\n\
+             -\t界abc\n\
+             +\t界xyz\n"
+                .as_bytes(),
+        );
+        let width = 17;
+        let tab_width = 4;
+        let whole = layout_document(&document, width, tab_width).unwrap();
+        let gutter_specs = file_gutter_specs(&document);
+        let mut per_line = Vec::new();
+
+        for line in document.lines() {
+            let gutter = line
+                .file_id
+                .and_then(|id| gutter_specs.get(&id).copied())
+                .unwrap_or_default();
+            let line_layout = layout_line(line, width, tab_width, gutter).unwrap();
+            let cloned = line_layout.clone();
+            assert_eq!(line_layout.rows().as_ptr(), cloned.rows().as_ptr());
+
+            let first = whole.row_for_line(line.id).unwrap();
+            let count = whole.rows()[first..]
+                .iter()
+                .take_while(|row| row.line_id == line.id)
+                .count();
+            assert_eq!(line_layout.rows(), &whole.rows()[first..first + count]);
+            per_line.push(line_layout);
+        }
+
+        let metadata = &per_line[0];
+        assert_eq!(metadata.rows()[0].text, "ab  界cd");
+
+        let deletion = document
+            .lines()
+            .iter()
+            .find(|line| line.kind == LineKind::Deletion)
+            .unwrap();
+        let deletion_layout = &per_line[deletion.id.index()];
+        assert_eq!(
+            deletion_layout
+                .rows()
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            vec![" 98       │-    ", "          │ 界abc"]
+        );
+        assert_eq!(
+            deletion_layout.rows()[0]
+                .rendered_ranges_for_logical(1..2)
+                .into_iter()
+                .map(|range| deletion_layout.rows()[0].text[range].to_owned())
+                .collect::<String>(),
+            "    "
+        );
+        assert_eq!(
+            deletion_layout.rows()[1]
+                .rendered_ranges_for_logical(2..5)
+                .into_iter()
+                .map(|range| deletion_layout.rows()[1].text[range].to_owned())
+                .collect::<String>(),
+            "界"
+        );
+
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
+        let mut whole_output = Vec::new();
+        write_direct(&mut whole_output, &whole, &theme).unwrap();
+        let mut per_line_output = Vec::new();
+        write_direct_rows(
+            &mut per_line_output,
+            per_line
+                .iter()
+                .flat_map(|line_layout| line_layout.rows().iter()),
+            &theme,
+        )
+        .unwrap();
+        assert_eq!(per_line_output, whole_output);
+    }
+
+    #[test]
+    fn line_layout_reports_the_same_too_narrow_errors_as_document_layout() {
+        let metadata = parse_bytes(b"metadata\n");
+        assert_eq!(
+            layout_line(
+                &metadata.lines()[0],
+                0,
+                4,
+                GutterSpec::new(u8::MAX, u8::MAX),
+            ),
+            Err(LayoutError::TooNarrow {
+                actual: 0,
+                required: 1,
+            })
+        );
+        assert_eq!(
+            layout_document(&metadata, 0, 4).unwrap_err(),
+            LayoutError::TooNarrow {
+                actual: 0,
+                required: 1,
+            }
+        );
+
+        let source = parse_bytes(
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +12345 @@\n+value\n",
+        );
+        let addition = source
+            .lines()
+            .iter()
+            .find(|line| line.kind == LineKind::Addition)
+            .unwrap();
+        let expected = LayoutError::TooNarrow {
+            actual: 12,
+            required: 13,
+        };
+        assert_eq!(
+            layout_line(addition, 12, 4, GutterSpec::new(3, 5)).unwrap_err(),
+            expected,
+        );
+        assert_eq!(layout_document(&source, 12, 4).unwrap_err(), expected);
+    }
 
     #[test]
     fn source_rows_have_dual_numbers_and_blank_continuations() {

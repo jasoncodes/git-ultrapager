@@ -2,8 +2,9 @@
 //!
 //! scanner は document model に依存せず、呼び出し側が stable line ID と text の snapshot を渡す。
 //! 結果の span は UTF-8 byte offset であり、renderer は同じ sanitized text に対してだけ適用する。
-//! 16 MiB を超える line は表示対象のまま検索から除外し、除外数を結果へ積算する。background worker
-//! の中断は行わず、世代が一致しない結果を state へ適用しないことで cancel を表現する。
+//! 16 MiB を超える line は表示対象のまま検索から除外し、除外数を結果へ積算する。Scannerは
+//! `SearchSource`から1行ずつ読み、background workerの世代変更をline/match境界で検出した場合は
+//! 部分resultを破棄する。Source I/O failureはcancelと別のoutcomeとしてcallerへ返す。
 
 use std::num::NonZeroUsize;
 use std::ops::Range;
@@ -84,6 +85,49 @@ impl<'text, Id> SearchLine<'text, Id> {
     #[must_use]
     pub const fn new(id: Id, text: &'text str) -> Self {
         Self { id, text }
+    }
+}
+
+/// Search対象をlogical-line indexで読むためのaccessor。
+///
+/// Scannerは全lineの参照配列を先に作らず、走査位置だけをこのtraitへ問い合わせる。`line`はmutable
+/// accessなので、disk-backed実装は1つのdecode bufferを次の呼び出しまで再利用できる。I/Oやdecode
+/// failureはassociated errorで返し、世代変更によるcooperative cancellationとは区別する。
+pub trait SearchSource<Id> {
+    /// Lineの読み出しに失敗した理由。
+    type Error;
+
+    /// 現在のimmutable snapshotに含まれるlogical-line数。
+    fn line_count(&self) -> usize;
+
+    /// `index`のstable IDと本文を返す。本文のborrowは次のmutable accessより前に解放する。
+    fn line(&mut self, index: usize) -> Result<SearchLine<'_, Id>, Self::Error>;
+
+    /// Snapshotが空かを返す。
+    fn is_empty(&self) -> bool {
+        self.line_count() == 0
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SliceSearchSourceError;
+
+struct SliceSearchSource<'lines, 'text, Id> {
+    lines: &'lines [SearchLine<'text, Id>],
+}
+
+impl<Id: Clone> SearchSource<Id> for SliceSearchSource<'_, '_, Id> {
+    type Error = SliceSearchSourceError;
+
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn line(&mut self, index: usize) -> Result<SearchLine<'_, Id>, Self::Error> {
+        self.lines
+            .get(index)
+            .map(|line| SearchLine::new(line.id.clone(), line.text))
+            .ok_or(SliceSearchSourceError)
     }
 }
 
@@ -209,6 +253,17 @@ pub struct ScanResult<Id> {
     pub forward_resume: Option<ForwardResume>,
 }
 
+/// Cooperative cancellationを含むscanの完了状態。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ScanOutcome<Id, Error> {
+    /// Snapshot全体または要求countまで走査し、適用可能なresultを得た。
+    Completed(ScanResult<Id>),
+    /// Callerの世代が変わり、部分結果を破棄した。
+    Cancelled,
+    /// Sourceがlineの読み出しに失敗し、部分結果を破棄した。
+    Failed(Error),
+}
+
 /// Logical line snapshot を document 順または逆順に scan する。
 ///
 /// backward scan は各 line の候補数を一度数え、対象 ordinal だけを二度目の iterator で取得する。
@@ -219,35 +274,77 @@ pub fn scan_lines<Id: Clone>(
     lines: &[SearchLine<'_, Id>],
     request: ScanRequest,
 ) -> ScanResult<Id> {
-    match request.direction {
-        SearchDirection::Forward => scan_forward(compiled, lines, request.anchor, request.count),
-        SearchDirection::Backward => scan_backward(compiled, lines, request.anchor, request.count),
+    let mut source = SliceSearchSource { lines };
+    match scan_source(compiled, &mut source, request, &|| false) {
+        ScanOutcome::Completed(result) => result,
+        // Predicateはfalse固定で、sliceは`0..len`を必ず返す。このarmは型の全列挙性だけを満たす。
+        ScanOutcome::Cancelled | ScanOutcome::Failed(_) => match request.direction {
+            SearchDirection::Forward => exhausted_forward(lines.len(), request.count.get(), 0),
+            SearchDirection::Backward => exhausted_backward(request.count.get(), 0),
+        },
     }
 }
 
-fn scan_forward<Id: Clone>(
+/// Accessorからlineを逐次取得し、世代変更を検出したら部分結果を破棄する。
+///
+/// `cancelled`は各logical lineと各matchの間で呼ぶ。Regex engineが1件のmatch候補を探索している
+/// 最中は割り込めないが、16 MiB超のlineはregex対象外なので、1回の非協調区間は1 logical lineに
+/// 制限される。
+#[must_use]
+pub fn scan_source<Id: Clone, Source: SearchSource<Id> + ?Sized, Cancel: Fn() -> bool + ?Sized>(
     compiled: &CompiledSearch,
-    lines: &[SearchLine<'_, Id>],
+    source: &mut Source,
+    request: ScanRequest,
+    cancelled: &Cancel,
+) -> ScanOutcome<Id, Source::Error> {
+    if cancelled() {
+        return ScanOutcome::Cancelled;
+    }
+    match request.direction {
+        SearchDirection::Forward => {
+            scan_forward(compiled, source, request.anchor, request.count, cancelled)
+        }
+        SearchDirection::Backward => {
+            scan_backward(compiled, source, request.anchor, request.count, cancelled)
+        }
+    }
+}
+
+fn scan_forward<Id: Clone, Source: SearchSource<Id> + ?Sized, Cancel: Fn() -> bool + ?Sized>(
+    compiled: &CompiledSearch,
+    source: &mut Source,
     anchor: SearchAnchor,
     count: NonZeroUsize,
-) -> ScanResult<Id> {
+    cancelled: &Cancel,
+) -> ScanOutcome<Id, Source::Error> {
+    let line_count = source.line_count();
     let (start_line, first_offset) = match anchor {
         SearchAnchor::BeforeDocument => (0, 0),
         SearchAnchor::At {
             line_index,
             byte_offset,
-        } if line_index < lines.len() => (
-            line_index,
-            ceil_char_boundary(lines[line_index].text, byte_offset),
-        ),
+        } if line_index < line_count => {
+            let line = match source.line(line_index) {
+                Ok(line) => line,
+                Err(error) => return ScanOutcome::Failed(error),
+            };
+            (line_index, ceil_char_boundary(line.text, byte_offset))
+        }
         SearchAnchor::At { .. } | SearchAnchor::AfterDocument => {
-            return exhausted_forward(lines.len(), count.get(), 0);
+            return ScanOutcome::Completed(exhausted_forward(line_count, count.get(), 0));
         }
     };
 
     let mut remaining = count.get();
     let mut skipped = 0_usize;
-    for (line_index, line) in lines.iter().enumerate().skip(start_line) {
+    for line_index in start_line..line_count {
+        if cancelled() {
+            return ScanOutcome::Cancelled;
+        }
+        let line = match source.line(line_index) {
+            Ok(line) => line,
+            Err(error) => return ScanOutcome::Failed(error),
+        };
         if line.text.len() > MAX_SEARCH_LINE_BYTES {
             skipped = skipped.saturating_add(1);
             continue;
@@ -259,25 +356,32 @@ fn scan_forward<Id: Clone>(
             0
         };
         for found in compiled.regex.find_iter(line.text) {
+            if cancelled() {
+                return ScanOutcome::Cancelled;
+            }
             if found.start() < lower_bound {
                 continue;
             }
             remaining -= 1;
             if remaining == 0 {
-                return ScanResult {
+                return ScanOutcome::Completed(ScanResult {
                     found: Some(SearchMatch {
-                        line_id: line.id.clone(),
+                        line_id: line.id,
                         line_index,
                         byte_range: found.range(),
                     }),
                     skipped_oversized_lines: skipped,
                     forward_resume: None,
-                };
+                });
             }
         }
     }
 
-    exhausted_forward(lines.len(), remaining, skipped)
+    if cancelled() {
+        ScanOutcome::Cancelled
+    } else {
+        ScanOutcome::Completed(exhausted_forward(line_count, remaining, skipped))
+    }
 }
 
 fn exhausted_forward<Id>(
@@ -296,37 +400,52 @@ fn exhausted_forward<Id>(
     }
 }
 
-fn scan_backward<Id: Clone>(
+fn scan_backward<Id: Clone, Source: SearchSource<Id> + ?Sized, Cancel: Fn() -> bool + ?Sized>(
     compiled: &CompiledSearch,
-    lines: &[SearchLine<'_, Id>],
+    source: &mut Source,
     anchor: SearchAnchor,
     count: NonZeroUsize,
-) -> ScanResult<Id> {
-    if lines.is_empty() || matches!(anchor, SearchAnchor::BeforeDocument) {
-        return exhausted_backward(count.get(), 0);
+    cancelled: &Cancel,
+) -> ScanOutcome<Id, Source::Error> {
+    let line_count = source.line_count();
+    if source.is_empty() || matches!(anchor, SearchAnchor::BeforeDocument) {
+        return ScanOutcome::Completed(exhausted_backward(count.get(), 0));
     }
 
     let (start_line, first_offset) = match anchor {
         SearchAnchor::AfterDocument => {
-            let index = lines.len() - 1;
-            (index, lines[index].text.len())
+            let index = line_count - 1;
+            let line = match source.line(index) {
+                Ok(line) => line,
+                Err(error) => return ScanOutcome::Failed(error),
+            };
+            (index, line.text.len())
         }
         SearchAnchor::At {
             line_index,
             byte_offset,
-        } if line_index < lines.len() => (
-            line_index,
-            floor_char_boundary(lines[line_index].text, byte_offset),
-        ),
+        } if line_index < line_count => {
+            let line = match source.line(line_index) {
+                Ok(line) => line,
+                Err(error) => return ScanOutcome::Failed(error),
+            };
+            (line_index, floor_char_boundary(line.text, byte_offset))
+        }
         SearchAnchor::At { .. } | SearchAnchor::BeforeDocument => {
-            return exhausted_backward(count.get(), 0);
+            return ScanOutcome::Completed(exhausted_backward(count.get(), 0));
         }
     };
 
     let mut remaining = count.get();
     let mut skipped = 0_usize;
     for line_index in (0..=start_line).rev() {
-        let line = &lines[line_index];
+        if cancelled() {
+            return ScanOutcome::Cancelled;
+        }
+        let line = match source.line(line_index) {
+            Ok(line) => line,
+            Err(error) => return ScanOutcome::Failed(error),
+        };
         if line.text.len() > MAX_SEARCH_LINE_BYTES {
             skipped = skipped.saturating_add(1);
             continue;
@@ -337,32 +456,46 @@ fn scan_backward<Id: Clone>(
         } else {
             line.text.len()
         };
-        let candidates = compiled
-            .regex
-            .find_iter(line.text)
-            .filter(|found| found.end() <= upper_bound)
-            .count();
+        let mut candidates = 0_usize;
+        for found in compiled.regex.find_iter(line.text) {
+            if cancelled() {
+                return ScanOutcome::Cancelled;
+            }
+            if found.end() <= upper_bound {
+                candidates = candidates.saturating_add(1);
+            }
+        }
         if candidates < remaining {
             remaining -= candidates;
             continue;
         }
 
         let ordinal_from_start = candidates - remaining;
-        let found = compiled
-            .regex
-            .find_iter(line.text)
-            .filter(|found| found.end() <= upper_bound)
-            .nth(ordinal_from_start);
-        if let Some(found) = found {
-            return ScanResult {
+        let mut ordinal = 0_usize;
+        let mut selected = None;
+        for found in compiled.regex.find_iter(line.text) {
+            if cancelled() {
+                return ScanOutcome::Cancelled;
+            }
+            if found.end() > upper_bound {
+                continue;
+            }
+            if ordinal == ordinal_from_start {
+                selected = Some(found);
+                break;
+            }
+            ordinal = ordinal.saturating_add(1);
+        }
+        if let Some(found) = selected {
+            return ScanOutcome::Completed(ScanResult {
                 found: Some(SearchMatch {
-                    line_id: line.id.clone(),
+                    line_id: line.id,
                     line_index,
                     byte_range: found.range(),
                 }),
                 skipped_oversized_lines: skipped,
                 forward_resume: None,
-            };
+            });
         }
 
         // 同じ deterministic iterator を二度使うため通常は到達しない。regex backend の契約が
@@ -370,7 +503,11 @@ fn scan_backward<Id: Clone>(
         remaining = 1;
     }
 
-    exhausted_backward(remaining, skipped)
+    if cancelled() {
+        ScanOutcome::Cancelled
+    } else {
+        ScanOutcome::Completed(exhausted_backward(remaining, skipped))
+    }
 }
 
 fn exhausted_backward<Id>(_remaining: usize, skipped: usize) -> ScanResult<Id> {

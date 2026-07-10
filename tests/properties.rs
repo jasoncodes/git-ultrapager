@@ -27,14 +27,14 @@ proptest! {
         let mut one_shot = AnsiStripper::default();
         let mut expected = Vec::new();
         one_shot.push(&input, &mut expected);
-        one_shot.finish();
+        one_shot.finish_into(&mut expected);
 
         let mut chunked = AnsiStripper::default();
         let mut actual = Vec::new();
         for chunk in input.chunks(chunk_size) {
             chunked.push(chunk, &mut actual);
         }
-        chunked.finish();
+        chunked.finish_into(&mut actual);
 
         prop_assert_eq!(&actual, &expected);
         let _ = escape_interactive_bytes(&actual);

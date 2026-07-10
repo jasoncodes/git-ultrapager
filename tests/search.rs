@@ -1,14 +1,66 @@
+use std::cell::Cell;
 use std::num::NonZeroUsize;
 
 use git_ultrapager::search::{
-    CommitIncrementalError, IncrementalQueryStatus, RepeatCommand, ScanRequest, SearchAnchor,
-    SearchDirection, SearchHistory, SearchLine, SearchSession, compile_smart_case,
-    match_spans_in_line, repeat_anchor, scan_lines,
+    CommitIncrementalError, IncrementalQueryStatus, RepeatCommand, ScanOutcome, ScanRequest,
+    ScanResult, SearchAnchor, SearchDirection, SearchHistory, SearchLine, SearchSession,
+    SearchSource, compile_smart_case, match_spans_in_line, repeat_anchor, scan_lines, scan_source,
 };
 use git_ultrapager::text::MAX_SEARCH_LINE_BYTES;
 
 fn count(value: usize) -> NonZeroUsize {
     NonZeroUsize::new(value).expect("test count is non-zero")
+}
+
+struct CountingSource {
+    lines: Vec<&'static str>,
+    accesses: Cell<usize>,
+    fail_at: Option<usize>,
+}
+
+impl SearchSource<usize> for CountingSource {
+    type Error = &'static str;
+
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn line(&mut self, index: usize) -> Result<SearchLine<'_, usize>, Self::Error> {
+        self.accesses.set(self.accesses.get().saturating_add(1));
+        if self.fail_at == Some(index) {
+            return Err("page read failed");
+        }
+        self.lines
+            .get(index)
+            .copied()
+            .map(|text| SearchLine::new(index, text))
+            .ok_or("line missing")
+    }
+}
+
+struct ReusingBufferSource {
+    line_count: usize,
+    accesses: usize,
+    buffer: String,
+}
+
+impl SearchSource<usize> for ReusingBufferSource {
+    type Error = ();
+
+    fn line_count(&self) -> usize {
+        self.line_count
+    }
+
+    fn line(&mut self, index: usize) -> Result<SearchLine<'_, usize>, Self::Error> {
+        if index >= self.line_count {
+            return Err(());
+        }
+        self.accesses = self.accesses.saturating_add(1);
+        self.buffer.clear();
+        self.buffer
+            .push_str(if index == 0 { "needle" } else { "haystack" });
+        Ok(SearchLine::new(index, &self.buffer))
+    }
 }
 
 #[test]
@@ -58,6 +110,82 @@ fn scanning_walks_matches_in_both_document_directions() {
     let found = backward.found.expect("second match in reverse order");
     assert_eq!(found.line_id, 10);
     assert_eq!(found.byte_range, 8..11);
+}
+
+#[test]
+fn accessor_scan_cancels_before_reading_the_remaining_lines() {
+    let compiled = compile_smart_case("missing").expect("valid regex");
+    let mut source = CountingSource {
+        lines: vec!["haystack"; 100],
+        accesses: Cell::new(0),
+        fail_at: None,
+    };
+    let checks = Cell::new(0_usize);
+    let outcome = scan_source(
+        &compiled,
+        &mut source,
+        ScanRequest::new(
+            SearchDirection::Forward,
+            SearchAnchor::BeforeDocument,
+            count(1),
+        ),
+        &|| {
+            let next = checks.get().saturating_add(1);
+            checks.set(next);
+            next > 8
+        },
+    );
+
+    assert!(matches!(outcome, ScanOutcome::Cancelled));
+    assert!(source.accesses.get() < source.lines.len());
+}
+
+#[test]
+fn accessor_scan_does_not_preload_a_large_virtual_document() {
+    let compiled = compile_smart_case("needle").expect("valid regex");
+    let mut source = ReusingBufferSource {
+        line_count: 5_000_000,
+        accesses: 0,
+        buffer: String::new(),
+    };
+    let outcome = scan_source(
+        &compiled,
+        &mut source,
+        ScanRequest::new(
+            SearchDirection::Forward,
+            SearchAnchor::BeforeDocument,
+            count(1),
+        ),
+        &|| false,
+    );
+
+    assert!(matches!(
+        outcome,
+        ScanOutcome::Completed(ScanResult { found: Some(_), .. })
+    ));
+    assert_eq!(source.accesses, 1);
+}
+
+#[test]
+fn accessor_failure_is_distinct_from_generation_cancellation() {
+    let compiled = compile_smart_case("needle").expect("valid regex");
+    let mut source = CountingSource {
+        lines: vec!["first", "needle"],
+        accesses: Cell::new(0),
+        fail_at: Some(1),
+    };
+    let outcome = scan_source(
+        &compiled,
+        &mut source,
+        ScanRequest::new(
+            SearchDirection::Forward,
+            SearchAnchor::BeforeDocument,
+            count(1),
+        ),
+        &|| false,
+    );
+
+    assert_eq!(outcome, ScanOutcome::Failed("page read failed"));
 }
 
 #[test]

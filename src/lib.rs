@@ -9,9 +9,11 @@
 
 pub mod ansi;
 pub mod app;
+pub mod cache;
 pub mod cli;
 pub mod decorations;
 pub mod direct;
+pub mod document_store;
 pub mod highlight;
 pub mod input;
 pub mod intraline;
@@ -20,6 +22,7 @@ pub mod parser;
 pub mod runtime;
 pub mod search;
 pub mod state;
+pub mod storage;
 pub mod terminal;
 pub mod text;
 pub mod theme;
