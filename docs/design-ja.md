@@ -217,7 +217,11 @@ path の拡張子と既知 file name から syntax を選ぶ。
 
 削除側と追加側は別の parse state を持ち、hunk 内で継続し、hunk 境界で reset する。
 両 state が diverge した context 行は new side の style、deleted file では old side を使う。
-stdin-only のため hunk 冒頭が multiline comment/string の途中なら best-effort となる。
+
+Hunk 冒頭では各 side の先頭32行・64 KiBを先読みし、grammar が opener から push し得る multiline context を候補にする。
+候補は dark/light theme のどちらかで通常 state と異なる style を持ち、先頭行を越えて継続し、先読み範囲内で通常 state へ戻る場合だけ採用する。
+複数候補が戻る場合は最初の合流位置を選び、同じ位置で異なる style を返す候補があれば推定しない。
+stdin に hunk 外の本文がないため、合流を観測できない multiline context は通常 state のまま表示する。
 
 syntax 計算は decoration worker で行い、未計算部分を plain diff style で先に表示する。
 現在の hunk を8 MiBの priority result として先に返し、その後 document 先頭から64 MiBの full result を計算する。

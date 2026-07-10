@@ -51,6 +51,9 @@ use crate::theme::{ColorLevel, Theme};
 
 /// Syntax上限はsource本文に適用するため、bounded readerへはdiff marker 1 byteを加えて渡す。
 const MAX_SYNTAX_DISPLAY_BYTES: usize = MAX_SYNTAX_LINE_BYTES + 1;
+/// Prefix推定は各sideの先頭32行・64 KiBまでとし、候補context数との積で計算量を固定する。
+const MAX_CONTINUATION_INFERENCE_LINES: usize = 32;
+const MAX_CONTINUATION_INFERENCE_BYTES: usize = 64 * 1024;
 /// Intralineのblock byte上限もsource本文だけを数える。1 lineの復元上限にはmarkerを含める。
 const MAX_INTRALINE_LINE_DISPLAY_BYTES: usize = MAX_BLOCK_BYTES + 1;
 const DERIVED_RESULT_BUDGET_BYTES: usize = NEXT_DECORATION_MEMORY_BYTES;
@@ -794,13 +797,26 @@ fn decorate_syntax_hunk(
 ) -> Result<bool, DecorationComputeError> {
     let old_path = file.old_path.or(file.new_path);
     let new_path = file.new_path.or(file.old_path);
-    // Syntax検出用first lineを先読みして保持せず、各sideで最初に現れたsource lineからsessionを開く。
-    // 以後は同じsessionへ順番どおり渡すため、複数行のtextを同時に所有する必要がない。
     let mut old = None;
     let mut new = None;
     let mut old_opened = false;
     let mut new_opened = false;
     let use_old_context = file.status == ChangeStatus::Deleted;
+
+    if let Some(prefix) = collect_inference_prefix(context, hunk, SyntaxSide::Old, readers)? {
+        old = open_inferred_session(builder, engine, old_path, &prefix.lines, context.theme);
+        old_opened = true;
+    }
+    if (context.cancelled)() {
+        return Ok(false);
+    }
+    if let Some(prefix) = collect_inference_prefix(context, hunk, SyntaxSide::New, readers)? {
+        new = open_inferred_session(builder, engine, new_path, &prefix.lines, context.theme);
+        new_opened = true;
+    }
+    if (context.cancelled)() {
+        return Ok(false);
+    }
 
     for raw_id in hunk_line_range(context.document, hunk) {
         if (context.cancelled)() {
@@ -923,6 +939,89 @@ fn decorate_syntax_hunk(
     Ok(true)
 }
 
+#[derive(Clone, Copy)]
+enum SyntaxSide {
+    Old,
+    New,
+}
+
+struct InferencePrefix {
+    lines: Vec<String>,
+    _lease: DerivedMemoryLease,
+}
+
+/// Hunk先頭から片側のsource列をboundedに復元する。
+///
+/// Source順はaddition/deletionを除けば各file sideの行順と一致する。上限超過lineを読むと欠けた
+/// 遷移を既知扱いしてしまうため、そのsideの推定全体を捨てる。固定leaseはString payloadとVecの
+/// 最大capacityを復元前に確保し、候補評価が終わるまでprefixと同じlifetimeで保持する。
+fn collect_inference_prefix(
+    context: &DecorationContext<'_>,
+    hunk: StoredHunk,
+    side: SyntaxSide,
+    readers: &mut DecorationReaders,
+) -> Result<Option<InferencePrefix>, DecorationComputeError> {
+    let reserved_bytes =
+        MAX_CONTINUATION_INFERENCE_BYTES + MAX_CONTINUATION_INFERENCE_LINES * size_of::<String>();
+    let Ok(lease) = context
+        .ledger
+        .reserve(DerivedMemoryPool::DecorationWorkspace, reserved_bytes)
+    else {
+        return Ok(None);
+    };
+    let mut lines = Vec::with_capacity(MAX_CONTINUATION_INFERENCE_LINES);
+    let mut bytes = 0_usize;
+
+    for raw_id in hunk_line_range(context.document, hunk) {
+        if (context.cancelled)() {
+            return Ok(None);
+        }
+        let line_id = LineId::new(raw_id);
+        let metadata = readers
+            .metadata
+            .read(context.document, line_id)?
+            .ok_or(DecorationComputeError::MissingLine { line_id })?;
+        let belongs_to_side = match side {
+            SyntaxSide::Old => matches!(metadata.kind, LineKind::Deletion | LineKind::Context),
+            SyntaxSide::New => matches!(metadata.kind, LineKind::Addition | LineKind::Context),
+        };
+        if !belongs_to_side || metadata.hunk_id != Some(hunk.id) {
+            continue;
+        }
+        if lines.len() == MAX_CONTINUATION_INFERENCE_LINES {
+            break;
+        }
+        if metadata.display_len.exceeds(MAX_SYNTAX_DISPLAY_BYTES)
+            || !readers.reserve_text_read(metadata)
+        {
+            return Ok(None);
+        }
+        let text = match readers.text.read(
+            context.document,
+            line_id,
+            MAX_SYNTAX_DISPLAY_BYTES,
+            context.cancelled,
+        )? {
+            BoundedTextRead::Available { text, .. } => text,
+            BoundedTextRead::Oversized { .. } | BoundedTextRead::Cancelled => return Ok(None),
+        };
+        let content = text.get(1..).unwrap_or_default();
+        let Some(next_bytes) = bytes.checked_add(content.len()) else {
+            return Ok(None);
+        };
+        if next_bytes > MAX_CONTINUATION_INFERENCE_BYTES {
+            break;
+        }
+        lines.push(content.to_owned());
+        bytes = next_bytes;
+    }
+
+    Ok((!lines.is_empty()).then_some(InferencePrefix {
+        lines,
+        _lease: lease,
+    }))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn reset_skipped_syntax_line<'engine>(
     builder: &mut DecorationBuilder,
@@ -992,6 +1091,32 @@ fn open_session<'engine>(
     theme: &Theme,
 ) -> Option<SyntaxSession<'engine>> {
     match engine.session_with_budget(path, first_line, theme.choice(), builder.ledger) {
+        Ok(session) => session,
+        Err(HighlightError::WorkspaceBudgetExceeded) => {
+            builder.syntax_omitted = true;
+            None
+        }
+        Err(error) => {
+            builder.record_syntax_error(&error);
+            None
+        }
+    }
+}
+
+fn open_inferred_session<'engine>(
+    builder: &mut DecorationBuilder,
+    engine: &'engine SyntaxEngine,
+    path: Option<&str>,
+    lines: &[String],
+    theme: &Theme,
+) -> Option<SyntaxSession<'engine>> {
+    match engine.session_with_inferred_continuation(
+        path,
+        lines.first().map(String::as_str),
+        theme.choice(),
+        lines,
+        builder.ledger,
+    ) {
         Ok(session) => session,
         Err(HighlightError::WorkspaceBudgetExceeded) => {
             builder.syntax_omitted = true;
@@ -2108,6 +2233,7 @@ mod tests {
     use crate::cli::ThemeChoice;
     use crate::document::DocumentLineReader;
     use crate::document_store::CHUNKED_LINE_RAW_BYTES;
+    use crate::highlight::syntax_spans_equivalent;
     use crate::input::AppendStore;
     use crate::parser::{GitParser, parse_bytes as parse_snapshot};
     use crate::storage::{StorageConfig, StructuralStorage};
@@ -2388,6 +2514,78 @@ mod tests {
                 .filter_map(|span| shift_syntax_span(span, context.text.len()))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn hunk_prefix_infers_a_multiline_syntax_state_from_its_closer() {
+        let document = parse_bytes(
+            b"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -20,4 +20,5 @@\n  * existing contract.\n+ * added contract.\n  */\n pub fn value() -> usize {\n     1\n",
+        );
+        let added = read_lines(&document)
+            .into_iter()
+            .find(|line| line.text == "+ * added contract.")
+            .unwrap();
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+
+        let engine = SyntaxEngine::new().unwrap();
+        let mut expected_session = engine
+            .session(
+                Some("src/main.rs"),
+                Some("/* hidden before the hunk"),
+                ThemeChoice::Dark,
+            )
+            .unwrap()
+            .unwrap();
+        let _ = expected_session
+            .highlight_line("/* hidden before the hunk")
+            .unwrap();
+        let _ = expected_session
+            .highlight_line(" * existing contract.")
+            .unwrap();
+        let expected = expected_session
+            .highlight_line(" * added contract.")
+            .unwrap();
+        let HighlightedLine::Styled(expected) = expected else {
+            panic!("expected inferred comment syntax");
+        };
+
+        let expected = expected
+            .into_iter()
+            .filter_map(|span| shift_syntax_span(span, added.text.len()))
+            .collect::<Vec<_>>();
+        let actual = &decorations.line(added.id).unwrap().syntax;
+        assert!(
+            syntax_spans_equivalent(actual, &expected),
+            "actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
+    fn hunk_prefix_does_not_infer_from_a_first_line_closer() {
+        let document = parse_bytes(
+            b"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -20,3 +20,3 @@\n-*/\n+*/\n let value = 1;\n drop(value);\n",
+        );
+        let addition = line_with_kind(&document, LineKind::Addition);
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+
+        let engine = SyntaxEngine::new().unwrap();
+        let expected = engine
+            .session(Some("src/main.rs"), Some("*/"), ThemeChoice::Dark)
+            .unwrap()
+            .unwrap()
+            .highlight_line("*/")
+            .unwrap();
+        let HighlightedLine::Styled(expected) = expected else {
+            panic!("expected standalone syntax");
+        };
+        let expected = expected
+            .into_iter()
+            .filter_map(|span| shift_syntax_span(span, addition.text.len()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(decorations.line(addition.id).unwrap().syntax, expected);
     }
 
     #[test]
