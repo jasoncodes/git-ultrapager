@@ -2562,13 +2562,30 @@ fn prepare_viewport(
             fallback_anchor
         };
         let mut rows = viewport.collect(document, top, body_height, config)?;
-        if clamp_bottom
-            && rows.at_end
-            && rows.rows.len() < body_height
-            && let Some(bottom) = viewport.bottom_aligned_top(document, body_height, config)?
-        {
-            rows = viewport.collect(document, Some(bottom), body_height, config)?;
+        if clamp_bottom && rows.at_end {
+            // File境界の仮想headerもbodyを1行使う。Raw rowだけでbottom-alignすると末尾がheaderの
+            // ぶん隠れるため、表示行の超過数だけtopを進めて末尾raw rowをviewport内へ戻す。
+            if let Some(mut bottom) = viewport.bottom_aligned_top(document, body_height, config)? {
+                loop {
+                    rows = viewport.collect(document, Some(bottom), body_height, config)?;
+                    let displayed = displayed_body_row_count(&rows.rows);
+                    if displayed <= body_height {
+                        break;
+                    }
+                    let next = viewport.step_forward(
+                        document,
+                        bottom,
+                        displayed.saturating_sub(body_height),
+                        config,
+                    )?;
+                    if next == bottom {
+                        break;
+                    }
+                    bottom = next;
+                }
+            }
         }
+        fit_body_rows(&mut rows, body_height);
         Ok(rows)
     };
 
@@ -2596,6 +2613,51 @@ fn prepare_viewport(
             viewport.cancel_preparation();
             Err(map_viewport_error(error))
         }
+    }
+}
+
+/// Raw row間にfile context headerを差し込んだ後のbody行数を返す。
+///
+/// 先頭fileのheaderは固定sticky行が表示する。2行目以降でfile IDが切り替わる箇所だけを数え、
+/// [`crate::ui::FrameLoader`]がpreloadするinline headerと同じ行数契約を保つ。
+fn displayed_body_row_count(rows: &[ViewportRow]) -> usize {
+    let Some(first) = rows.first() else {
+        return 0;
+    };
+    let mut displayed = 1_usize;
+    let mut previous_file = first.file_id;
+    for row in &rows[1..] {
+        if row.file_id.is_some() && row.file_id != previous_file && !row.continuation {
+            displayed = displayed.saturating_add(1);
+        }
+        displayed = displayed.saturating_add(1);
+        previous_file = row.file_id;
+    }
+    displayed
+}
+
+/// Inline headerを含めてbody高さに収まるraw rowだけを残す。
+///
+/// Layout cacheのbyte accountingはtruncate前の保守値を保持する。末尾を落としたframeはdocument末尾を
+/// 表示していないため`at_end`を解除し、次のnavigationで残りを収集できるようにする。
+fn fit_body_rows(rows: &mut ViewportRows, body_height: usize) {
+    let mut displayed = 0_usize;
+    let mut retained = 0_usize;
+    let mut previous_file = None;
+    for (index, row) in rows.rows.iter().enumerate() {
+        let inline_header =
+            index > 0 && row.file_id.is_some() && row.file_id != previous_file && !row.continuation;
+        let required = 1_usize.saturating_add(usize::from(inline_header));
+        if displayed.saturating_add(required) > body_height {
+            break;
+        }
+        displayed = displayed.saturating_add(required);
+        retained = index.saturating_add(1);
+        previous_file = row.file_id;
+    }
+    if retained < rows.rows.len() {
+        rows.rows.truncate(retained);
+        rows.at_end = false;
     }
 }
 

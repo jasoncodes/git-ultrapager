@@ -66,6 +66,7 @@ pub struct FrameLines {
     current_column: Option<(LineId, usize)>,
     transient_raw_bytes_read: u64,
     sticky_header: String,
+    inline_file_headers: HashMap<LineId, String>,
     fallback_found: bool,
     fallback_scan_pending: bool,
     file_list: Option<FileListFrame>,
@@ -185,6 +186,7 @@ impl FrameLoader {
         }
 
         let sticky_header = self.load_sticky_header(state)?;
+        let inline_file_headers = self.load_inline_file_headers(state)?;
         let (fallback_found, fallback_scan_pending) = self.advance_fallback_scan(state)?;
         let visible = state.visible_rows();
         let visible_ranges = visible_logical_ranges(visible)?;
@@ -214,8 +216,9 @@ impl FrameLoader {
         lines
             .try_reserve(requested_ids.len())
             .map_err(|_| FrameLinesError::Allocation { requested })?;
-        let reserved =
-            retained_frame_index_bytes(lines.capacity()).saturating_add(sticky_header.capacity());
+        let reserved = retained_frame_index_bytes(lines.capacity())
+            .saturating_add(sticky_header.capacity())
+            .saturating_add(retained_inline_file_headers(&inline_file_headers));
         if reserved > MAX_FRAME_RETAINED_BYTES {
             return Err(FrameLinesError::FrameBudget {
                 requested: reserved,
@@ -274,6 +277,7 @@ impl FrameLoader {
             let next_retained = retained_frame_index_bytes(lines.capacity())
                 .saturating_add(retained_weak_match_bytes(&lines))
                 .saturating_add(sticky_header.capacity())
+                .saturating_add(retained_inline_file_headers(&inline_file_headers))
                 .saturating_add(
                     weak_matches
                         .capacity()
@@ -302,6 +306,7 @@ impl FrameLoader {
                 .raw_bytes_read
                 .saturating_sub(raw_bytes_before),
             sticky_header,
+            inline_file_headers,
             fallback_found,
             fallback_scan_pending,
             file_list: None,
@@ -389,6 +394,79 @@ impl FrameLoader {
             return Ok(fit_end(&commit_label(commit), width));
         }
         Ok(fit_end("git-ultrapager", width))
+    }
+
+    /// Body先頭より後にfile先頭が現れる場合だけ、stickyと同じlabelを仮想行としてpreloadする。
+    ///
+    /// Body先頭のfile contextは固定sticky行がすでに担うため重複させない。Rendererはraw diff行を
+    /// 変更せず、対応するfile開始行の直前へこの文字列を差し込む。
+    fn load_inline_file_headers(
+        &mut self,
+        state: &AppState,
+    ) -> Result<HashMap<LineId, String>, FrameLinesError> {
+        let visible = state.visible_rows();
+        let mut headers = HashMap::new();
+        let requested = visible
+            .windows(2)
+            .filter(|pair| {
+                pair[1].file_id.is_some()
+                    && pair[1].file_id != pair[0].file_id
+                    && !pair[1].continuation
+            })
+            .count();
+        headers
+            .try_reserve(requested.min(MAX_FRAME_LINE_ENTRIES))
+            .map_err(|_| FrameLinesError::Allocation { requested })?;
+        if visible.len() < 2 {
+            return Ok(headers);
+        }
+
+        let structure = state.document().structure();
+        let counts = structure.visible_counts()?;
+        let total = state
+            .document()
+            .is_complete()
+            .then(|| counts.files.to_string());
+        let width = usize::from(state.terminal_width());
+        let mut previous_file = visible[0].file_id;
+        for row in &visible[1..] {
+            let Some(file_id) = row.file_id else {
+                previous_file = None;
+                continue;
+            };
+            if previous_file == Some(file_id) {
+                continue;
+            }
+            previous_file = Some(file_id);
+            if row.continuation {
+                continue;
+            }
+            let file = self
+                .file_reader
+                .read_file(structure, file_id)?
+                .ok_or(FrameLinesError::MissingFile { file_id })?;
+            if row.line_id != file.span.start {
+                continue;
+            }
+            let commit = if counts.commits > 1 {
+                self.commit_reader.read_commit(structure, file.commit_id)?
+            } else {
+                None
+            };
+            headers.insert(
+                row.line_id,
+                sticky_file_header(file, total.as_deref(), commit, width),
+            );
+            let retained = retained_frame_index_bytes(0)
+                .saturating_add(retained_inline_file_headers(&headers));
+            if retained > MAX_FRAME_RETAINED_BYTES {
+                return Err(FrameLinesError::FrameBudget {
+                    requested: retained,
+                    limit: MAX_FRAME_RETAINED_BYTES,
+                });
+            }
+        }
+        Ok(headers)
     }
 
     fn load_file_list(
@@ -800,12 +878,19 @@ impl FrameLines {
             .map(|(_, column)| column)
     }
 
+    /// File開始行の直前へ表示する、事前整形済みcontext headerを返す。
+    #[must_use]
+    pub fn inline_file_header(&self, line_id: LineId) -> Option<&str> {
+        self.inline_file_headers.get(&line_id).map(String::as_str)
+    }
+
     /// Rendererへ保持するmetadata、range vector、hash tableの保守的byte数。
     #[must_use]
     pub fn retained_bytes(&self) -> usize {
         retained_frame_index_bytes(self.lines.capacity())
             .saturating_add(retained_weak_match_bytes(&self.lines))
             .saturating_add(self.sticky_header.capacity())
+            .saturating_add(retained_inline_file_headers(&self.inline_file_headers))
             .saturating_add(self.file_list.as_ref().map_or(0, retained_file_list_bytes))
     }
 
@@ -947,6 +1032,15 @@ fn retained_weak_match_bytes(lines: &HashMap<LineId, FrameLine>) -> usize {
                 .saturating_mul(std::mem::size_of::<Range<usize>>()),
         )
     })
+}
+
+fn retained_inline_file_headers(headers: &HashMap<LineId, String>) -> usize {
+    headers
+        .capacity()
+        .saturating_mul(std::mem::size_of::<(LineId, String)>() + 2 * std::mem::size_of::<usize>())
+        .saturating_add(headers.values().fold(0_usize, |total, header| {
+            total.saturating_add(header.capacity())
+        }))
 }
 
 fn retained_file_list_bytes(file_list: &FileListFrame) -> usize {
@@ -1132,14 +1226,30 @@ fn render_body(
         .visible_rows()
         .len()
         .min(usize::from(body_area.height))];
-    for (screen_row, row) in visible_rows.iter().enumerate() {
+    let mut screen_row = 0_usize;
+    for (row_index, row) in visible_rows.iter().enumerate() {
+        if let Some(header) = lines.inline_file_header(row.line_id) {
+            frame.render_widget(
+                Paragraph::new(header).style(theme.style(SemanticRole::Sticky)),
+                Rect::new(
+                    body_area.x,
+                    body_area.y.saturating_add(screen_row as u16),
+                    body_area.width,
+                    1,
+                ),
+            );
+            screen_row = screen_row.saturating_add(1);
+            if screen_row >= usize::from(body_area.height) {
+                break;
+            }
+        }
         let y = body_area.y.saturating_add(screen_row as u16);
         let weak_matches = lines.weak_matches(row.line_id);
         frame.render_widget(
             Paragraph::new(render_visual_row(
                 state,
                 row,
-                screen_row,
+                row_index,
                 weak_matches,
                 theme,
                 decorations,
@@ -1147,6 +1257,10 @@ fn render_body(
             )),
             Rect::new(body_area.x, y, body_area.width, 1),
         );
+        screen_row = screen_row.saturating_add(1);
+        if screen_row >= usize::from(body_area.height) {
+            break;
+        }
     }
 }
 
@@ -2512,6 +2626,50 @@ mod tests {
         assert!(screen.contains("10     │-old"), "{screen}");
         assert!(screen.contains("10 │+new"), "{screen}");
         assert!(screen.contains("line 1/6"), "{screen}");
+    }
+
+    #[test]
+    fn body_inserts_file_header_before_each_file_section() {
+        let document = parse_bytes(
+            b"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+second-new\n",
+        )
+        .unwrap();
+        let mut state = AppState::new(
+            Arc::new(document),
+            80,
+            12,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore).unwrap();
+        let lines = load_frame(&state);
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        let rows = screen.lines().collect::<Vec<_>>();
+
+        assert!(rows[0].contains("src/main.rs  1/2"), "{screen}");
+        assert!(rows[7].contains("src/lib.rs  2/2"), "{screen}");
+        assert!(
+            rows[8].contains("diff --git a/src/lib.rs b/src/lib.rs"),
+            "{screen}"
+        );
+
+        state
+            .update(Event::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)))
+            .unwrap();
+        let lines = load_frame(&state);
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("second-new"), "{screen}");
     }
 
     #[test]

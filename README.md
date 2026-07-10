@@ -13,7 +13,7 @@ sticky file context, and fast file navigation.
 - Shows old and new source line numbers and wraps long lines to terminal width.
 - Highlights source syntax based on the changed path or a detected shebang.
 - Highlights intraline changes while ignoring whitespace differences by default.
-- Keeps the current file in a sticky header while scrolling.
+- Marks each file boundary with a context header and keeps the current one sticky while scrolling.
 - Opens a filterable, commit-grouped changed-file list with `Tab`.
 - Searches Git logical lines up to 16 MiB with counted, smart-case regular
   expressions.
@@ -161,7 +161,9 @@ when no input is active. Help uses the same row/page and `g`/`G` scrolling; `Esc
 ## Display behavior
 
 Interactive mode reserves one row for a sticky context header and one row for a
-status bar. Diff source lines have separate old/new line-number columns. Long
+status bar. The same context header appears inline before each file section and
+moves into the sticky row when it reaches the top. Diff source lines have
+separate old/new line-number columns. Long
 lines hard-wrap at grapheme boundaries; continuation rows leave both number
 columns blank and align with the source text. A single grapheme larger than 64 KiB
 is split at Unicode scalar boundaries so one crafted cluster cannot require an
