@@ -29,6 +29,8 @@ pub enum SemanticRole {
     HunkHeader,
     Added,
     Removed,
+    AdditionMarker,
+    DeletionMarker,
     Context,
     LineNumber,
     Sticky,
@@ -239,6 +241,22 @@ fn palette(choice: ThemeChoice, role: SemanticRole) -> (Option<Rgb>, Option<Rgb>
             } else {
                 Rgb(253, 231, 236)
             }),
+        ),
+        SemanticRole::AdditionMarker => (
+            Some(if dark {
+                Rgb(166, 227, 161)
+            } else {
+                Rgb(19, 102, 54)
+            }),
+            None,
+        ),
+        SemanticRole::DeletionMarker => (
+            Some(if dark {
+                Rgb(243, 139, 168)
+            } else {
+                Rgb(161, 37, 63)
+            }),
+            None,
         ),
         SemanticRole::Sticky => (
             Some(if dark {

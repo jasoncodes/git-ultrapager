@@ -12,12 +12,12 @@ styles:
   s4: fg=Rgb(167, 29, 93) bg=Reset mod=BOLD
   s5: fg=Rgb(50, 50, 50) bg=Reset mod=NONE
   s6: fg=Rgb(24, 54, 145) bg=Reset mod=NONE
-  s7: fg=Rgb(161, 37, 63) bg=Rgb(253, 231, 236) mod=NONE
+  s7: fg=Rgb(161, 37, 63) bg=Reset mod=NONE
   s8: fg=Rgb(167, 29, 93) bg=Rgb(253, 231, 236) mod=BOLD
   s9: fg=Rgb(50, 50, 50) bg=Rgb(253, 231, 236) mod=NONE
   s10: fg=Rgb(50, 50, 50) bg=Rgb(246, 185, 197) mod=NONE
   s11: fg=Rgb(24, 54, 145) bg=Rgb(253, 231, 236) mod=NONE
-  s12: fg=Rgb(19, 102, 54) bg=Rgb(225, 246, 232) mod=NONE
+  s12: fg=Rgb(19, 102, 54) bg=Reset mod=NONE
   s13: fg=Rgb(167, 29, 93) bg=Rgb(225, 246, 232) mod=BOLD
   s14: fg=Rgb(50, 50, 50) bg=Rgb(225, 246, 232) mod=NONE
   s15: fg=Rgb(50, 50, 50) bg=Rgb(181, 230, 195) mod=NONE

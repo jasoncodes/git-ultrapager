@@ -1535,8 +1535,8 @@ fn render_visual_row<'line>(
                 .is_some_and(|marker| marker.start <= range.start && range.end <= marker.end)
             {
                 match metadata.kind {
-                    LineKind::Deletion => SemanticRole::Removed,
-                    LineKind::Addition => SemanticRole::Added,
+                    LineKind::Deletion => SemanticRole::DeletionMarker,
+                    LineKind::Addition => SemanticRole::AdditionMarker,
                     _ => unreachable!("diff marker range exists only for changed source lines"),
                 }
             } else if range.start < gutter_end {

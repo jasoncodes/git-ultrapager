@@ -1867,7 +1867,7 @@ fn write_large_undecorated_row<W: Write>(
         writer.write_all(&row.text.as_bytes()[..line_number_end])?;
     }
     if let Some(marker) = marker_range {
-        write_style(writer, theme.style(role_for_line(kind)))?;
+        write_style(writer, theme.style(marker_role(kind)))?;
         writer.write_all(&row.text.as_bytes()[marker.clone()])?;
         if marker.end < gutter_end {
             write_style(writer, theme.style(SemanticRole::LineNumber))?;
@@ -1962,7 +1962,7 @@ fn write_composed_row<W: Write>(
             .as_ref()
             .is_some_and(|marker| marker.start <= range.start && range.end <= marker.end)
         {
-            role_for_line(kind)
+            marker_role(kind)
         } else if range.start < gutter_end {
             SemanticRole::LineNumber
         } else {
@@ -2009,6 +2009,14 @@ fn source_marker_range(row: &VisualRow, kind: LineKind) -> Option<Range<usize>> 
     let end = row.rendered_content_range.start.checked_sub("│".len())?;
     let start = end.checked_sub(marker.len())?;
     (row.text.get(start..end)? == marker).then_some(start..end)
+}
+
+const fn marker_role(kind: LineKind) -> SemanticRole {
+    match kind {
+        LineKind::Deletion => SemanticRole::DeletionMarker,
+        LineKind::Addition => SemanticRole::AdditionMarker,
+        _ => SemanticRole::LineNumber,
+    }
 }
 
 fn direct_syntax_ranges<'decoration>(
