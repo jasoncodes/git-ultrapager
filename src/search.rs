@@ -202,47 +202,6 @@ impl<Id> SearchMatch<Id> {
     }
 }
 
-/// Viewport 内の弱い highlight を描くための1行分の match span。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LineMatchSpans<Id> {
-    pub line_id: Id,
-    pub line_index: usize,
-    pub byte_ranges: Vec<Range<usize>>,
-    pub skipped_oversized: bool,
-}
-
-/// 1 logical line にある non-overlapping match を入力順で返す。
-///
-/// `regex::Regex::find_iter` は空 match の後に次の UTF-8 boundary へ進むため、zero-width pattern でも
-/// loop しない。oversized line には regex を実行せず、`skipped_oversized` だけを立てる。
-#[must_use]
-pub fn match_spans_in_line<Id: Clone>(
-    compiled: &CompiledSearch,
-    line_index: usize,
-    line: SearchLine<'_, Id>,
-) -> LineMatchSpans<Id> {
-    if line.text.len() > MAX_SEARCH_LINE_BYTES {
-        return LineMatchSpans {
-            line_id: line.id,
-            line_index,
-            byte_ranges: Vec::new(),
-            skipped_oversized: true,
-        };
-    }
-
-    let byte_ranges = compiled
-        .regex
-        .find_iter(line.text)
-        .map(|found| found.range())
-        .collect();
-    LineMatchSpans {
-        line_id: line.id,
-        line_index,
-        byte_ranges,
-        skipped_oversized: false,
-    }
-}
-
 /// N番目の候補を探す1回の scan request。`count` は数値 prefix を解決した後の非0値。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScanRequest {
@@ -276,6 +235,9 @@ pub struct ForwardResume {
 }
 
 /// 1 snapshot に対する scan result。
+///
+/// `found` は request が指した ordinal の1件だけを保持する。Line 内の match 数は
+/// result メモリ量に影響せず、zero-width pattern でも span 一覧を作らない。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScanResult<Id> {
     pub found: Option<SearchMatch<Id>>,
@@ -1076,6 +1038,9 @@ impl<Id> SearchSession<Id> {
             direction,
         });
         self.current_match = preview.as_ref().and_then(|value| value.found.clone());
+        self.last_skipped_oversized_lines = preview
+            .as_ref()
+            .map_or(0, |value| value.skipped_oversized_lines);
         self.incremental = None;
 
         Ok(CommittedSearch {

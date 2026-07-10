@@ -23,10 +23,19 @@ use crate::bounded_text::{
 use crate::cli::WhitespaceChoice;
 use crate::decorations::{DecorationSet, LineDecoration};
 use crate::direct::VisualRow;
-use crate::document::{DocumentError, DocumentLineMetadata, DocumentLineMetadataReader};
-use crate::model::{Commit, CommitKind, FileEntry, LineId, LineKind};
+use crate::document::{
+    DocumentError, DocumentIdentity, DocumentLineMetadata, DocumentLineMetadataReader,
+};
+use crate::model::{CommitId, CommitKind, FileId, LineId, LineKind};
 use crate::search::{CompiledSearch, IncrementalQueryStatus, SearchMatch};
-use crate::state::{AppState, FileListState, Mode, SearchInputState, TextInput};
+use crate::state::{
+    AppState, FileListItem, FileListState, Mode, SearchInputState, TextInput,
+    first_unfiltered_file_list_item, next_unfiltered_file_list_item,
+    previous_unfiltered_file_list_item,
+};
+use crate::structure_store::{
+    StoredCommitRef, StoredFileRef, StructureMetadataReader, StructureReader, StructureStoreError,
+};
 use crate::text::MAX_SEARCH_LINE_BYTES;
 use crate::theme::{SemanticRole, Theme};
 use crate::viewport::ViewportRow;
@@ -40,23 +49,60 @@ const MAX_FRAME_TRANSIENT_TEXT_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_RETAINED_BYTES: usize = 4 * 1024 * 1024;
 const MAX_PATH_SCAN_BYTES: usize = 64 * 1024;
 const MAX_DETAIL_ROW_BYTES: usize = 64 * 1024;
-
+// Input全体はfilter contractの上限まで保持する一方、status rowが1 frameでsegment/width計算する
+// 範囲はcursor周辺だけにする。幅0のformat characterでも描画時間と一時Stringを入力長へ比例させない。
+const MAX_INPUT_WINDOW_SCAN_BYTES: usize = 4 * 1024;
+const MAX_FALLBACK_FILES_PER_FRAME: u64 = 4_096;
 /// 1 frameが参照するfixed metadataと事前計算済みsearch rangeを保持するbounded data。
 ///
-/// [`Self::load`]は`Terminal::draw`より前に呼ぶ。Rendererはこのmapだけを読み、raw storeやspill fileへ
-/// I/Oを発生させない。Weak matchとsearch columnにfull textが要るlineもreaderの借用buffer内で計算し、
-/// `FrameLines`へはrangeと数値だけを移す。
+/// [`FrameLoader::load`]は`Terminal::draw`より前に呼ぶ。Rendererはこの値だけを読み、raw storeや
+/// structure spill fileへI/Oを発生させない。Weak matchとsearch columnにfull textが要るlineもreaderの
+/// 借用buffer内で計算し、`FrameLines`へはrange、表示済み文字列、数値だけを移す。
 #[derive(Debug, Default)]
 pub struct FrameLines {
     lines: HashMap<LineId, FrameLine>,
     current_column: Option<(LineId, usize)>,
     transient_raw_bytes_read: u64,
+    sticky_header: String,
+    fallback_found: bool,
+    fallback_scan_pending: bool,
+    file_list: Option<FileListFrame>,
 }
 
 #[derive(Debug)]
 struct FrameLine {
     metadata: DocumentLineMetadata,
     weak_matches: Vec<Range<usize>>,
+}
+
+/// File-list modeがdraw中に参照するowned表示data。
+///
+/// `overlay_rows`はselection周辺だけをGit出力順で保持する。Path、commit subject、object IDは
+/// [`FrameLoader`]内でdecodeと幅調整を終え、この値にはspill readerの借用を残さない。
+#[derive(Debug, Default)]
+struct FileListFrame {
+    detail_rows: Vec<String>,
+    overlay_rows: Vec<FileListRow>,
+    total_matches: u64,
+    loading: bool,
+}
+
+#[derive(Debug)]
+struct FileListRow {
+    text: String,
+    role: SemanticRole,
+    selected: bool,
+}
+
+/// Virtual file-list item 1件をowned表示行へ変換した値。
+///
+/// Commit headerは隣接itemと同じcommitなら挿入時に省く。選択行を先に`FileListFrame`へ保持してから
+/// 前後itemを追加するため、長いsubject/pathが4 MiB枠を使い切ってもselectionは残る。
+#[derive(Debug)]
+struct PreparedFileListItem {
+    commit_id: CommitId,
+    header: FileListRow,
+    entry: FileListRow,
 }
 
 /// Visible frameの事前decodeに失敗した理由。
@@ -66,6 +112,8 @@ pub enum FrameLinesError {
     Document(#[from] DocumentError),
     #[error(transparent)]
     BoundedText(#[from] BoundedTextError),
+    #[error(transparent)]
+    Structure(#[from] StructureStoreError),
     #[error("document snapshot does not contain frame logical line {line_id}")]
     MissingLine { line_id: LineId },
     #[error("could not allocate frame line index for {requested} logical lines")]
@@ -74,17 +122,71 @@ pub enum FrameLinesError {
     LineLimit { requested: usize, limit: usize },
     #[error("frame metadata/ranges retain {requested} bytes, exceeding the {limit}-byte bound")]
     FrameBudget { requested: usize, limit: usize },
+    #[error("document snapshot does not contain file-list file {file_id}")]
+    MissingFile { file_id: FileId },
+    #[error("document snapshot does not contain file-list commit {commit_id}")]
+    MissingCommit { commit_id: crate::model::CommitId },
 }
 
-impl FrameLines {
-    /// 現在viewportとsearch statusが参照するmetadata/search rangeをdraw前に構築する。
-    /// Raw長がeager decoder上限を越えるlineは、display textが短くてもmain threadではdecodeせず、
-    /// current matchのcolumnをbyte offsetへfallbackさせてweak matchだけを省略する。
-    pub fn load(state: &AppState) -> Result<Self, FrameLinesError> {
+/// Draw前のbounded preloadに使うreaderと、document世代をまたいで進めるfallback走査cursor。
+///
+/// 1 instanceをapp loop全体で再利用する。Document identityが変わった時だけfallback cursorを0へ戻し、
+/// 同じbuilder lineageの追記snapshotでは前frameまでに調べたfinalized fileを再走査しない。
+#[derive(Debug)]
+pub struct FrameLoader {
+    text_reader: BoundedDocumentTextReader,
+    line_metadata_reader: DocumentLineMetadataReader,
+    file_reader: StructureReader,
+    file_metadata_reader: StructureMetadataReader,
+    commit_reader: StructureReader,
+    fallback_reader: StructureMetadataReader,
+    fallback_identity: Option<DocumentIdentity>,
+    fallback_cursor: u64,
+    fallback_found: bool,
+}
+
+impl Default for FrameLoader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FrameLoader {
+    /// Allocation前のreader群と未走査のfallback stateを作る。
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            text_reader: BoundedDocumentTextReader::new(),
+            line_metadata_reader: DocumentLineMetadataReader::new(),
+            file_reader: StructureReader::new(),
+            file_metadata_reader: StructureMetadataReader::new(),
+            commit_reader: StructureReader::new(),
+            fallback_reader: StructureMetadataReader::new(),
+            fallback_identity: None,
+            fallback_cursor: 0,
+            fallback_found: false,
+        }
+    }
+
+    /// Current modeがdraw中に参照するmetadataと表示文字列をpreloadする。
+    ///
+    /// File-listではbody/search lineを読まず、Body/Searchではfile-list pathを読まない。Raw長がeager
+    /// decoder上限を越えるlineはcurrent match columnをbyte offsetへfallbackさせ、weak matchだけを
+    /// 省略する。戻り値のretained allocationは4 MiB以内に制限する。
+    pub fn load(&mut self, state: &AppState) -> Result<FrameLines, FrameLinesError> {
+        if let Mode::FileList(list) = state.mode() {
+            return self.load_file_list(state, list);
+        }
+
+        if matches!(state.mode(), Mode::Help { .. }) {
+            return Ok(FrameLines::default());
+        }
+
+        let sticky_header = self.load_sticky_header(state)?;
+        let (fallback_found, fallback_scan_pending) = self.advance_fallback_scan(state)?;
         let visible = state.visible_rows();
-        let current = displayed_current_match(state).map(|found| found.line_id);
-        let requested = visible.len().saturating_add(usize::from(current.is_some()));
         let visible_ranges = visible_logical_ranges(visible)?;
+        let requested = visible.len();
         let mut requested_ids = Vec::new();
         requested_ids
             .try_reserve(requested.min(MAX_FRAME_LINE_ENTRIES))
@@ -93,7 +195,7 @@ impl FrameLines {
         requested_seen
             .try_reserve(requested.min(MAX_FRAME_LINE_ENTRIES))
             .map_err(|_| FrameLinesError::Allocation { requested })?;
-        for line_id in visible.iter().map(|row| row.line_id).chain(current) {
+        for line_id in visible.iter().map(|row| row.line_id) {
             if requested_seen.contains(&line_id) {
                 continue;
             }
@@ -110,32 +212,38 @@ impl FrameLines {
         lines
             .try_reserve(requested_ids.len())
             .map_err(|_| FrameLinesError::Allocation { requested })?;
-        let reserved = retained_frame_index_bytes(lines.capacity());
+        let reserved =
+            retained_frame_index_bytes(lines.capacity()).saturating_add(sticky_header.capacity());
         if reserved > MAX_FRAME_RETAINED_BYTES {
             return Err(FrameLinesError::FrameBudget {
                 requested: reserved,
                 limit: MAX_FRAME_RETAINED_BYTES,
             });
         }
-        let mut reader = BoundedDocumentTextReader::new();
-        let mut metadata_reader = DocumentLineMetadataReader::new();
         let compiled = displayed_search(state);
         let current_match = displayed_current_match(state);
         let mut remaining_weak_matches = MAX_WEAK_MATCH_SPANS_PER_FRAME;
         let mut current_column =
             current_match.map(|found| (found.line_id, found.byte_range.start.saturating_add(1)));
+        let raw_bytes_before = self.text_reader.large_line_stats().raw_bytes_read;
         for line_id in requested_ids {
-            let metadata = metadata_reader
+            let metadata = self
+                .line_metadata_reader
                 .read(state.document(), line_id)?
                 .ok_or(FrameLinesError::MissingLine { line_id })?;
-            let requires_text = (compiled.is_some() && visible_ranges.contains_key(&line_id))
-                || current_match.is_some_and(|found| found.line_id == line_id);
+            let weak_text_required = remaining_weak_matches > 0
+                && compiled.is_some()
+                && visible_ranges.contains_key(&line_id);
+            let current_text_required = current_match.is_some_and(|found| {
+                found.line_id == line_id && visible_ranges.contains_key(&line_id)
+            });
+            let requires_text = weak_text_required || current_text_required;
             let raw_is_eager = u64::try_from(MAX_EAGER_TEXT_RAW_BYTES)
                 .is_ok_and(|limit| metadata.raw_len <= limit);
             let mut weak_matches = Vec::new();
             if requires_text
                 && raw_is_eager
-                && let BoundedTextRead::Available { text, .. } = reader.read(
+                && let BoundedTextRead::Available { text, .. } = self.text_reader.read(
                     state.document(),
                     line_id,
                     MAX_FRAME_TRANSIENT_TEXT_BYTES,
@@ -163,6 +271,7 @@ impl FrameLines {
             }
             let next_retained = retained_frame_index_bytes(lines.capacity())
                 .saturating_add(retained_weak_match_bytes(&lines))
+                .saturating_add(sticky_header.capacity())
                 .saturating_add(
                     weak_matches
                         .capacity()
@@ -182,10 +291,18 @@ impl FrameLines {
                 },
             );
         }
-        let frame = Self {
+        let frame = FrameLines {
             lines,
             current_column,
-            transient_raw_bytes_read: reader.large_line_stats().raw_bytes_read,
+            transient_raw_bytes_read: self
+                .text_reader
+                .large_line_stats()
+                .raw_bytes_read
+                .saturating_sub(raw_bytes_before),
+            sticky_header,
+            fallback_found,
+            fallback_scan_pending,
+            file_list: None,
         };
         let retained = frame.retained_bytes();
         if retained > MAX_FRAME_RETAINED_BYTES {
@@ -197,6 +314,468 @@ impl FrameLines {
         Ok(frame)
     }
 
+    fn advance_fallback_scan(&mut self, state: &AppState) -> Result<(bool, bool), FrameLinesError> {
+        let identity = state.document().identity();
+        if self.fallback_identity.as_ref() != Some(&identity) {
+            self.fallback_identity = Some(identity);
+            self.fallback_cursor = 0;
+            self.fallback_found = false;
+            self.fallback_reader.reset_statistics();
+        }
+
+        let structure = state.document().structure();
+        let finalized = structure.finalized_file_count();
+        if !self.fallback_found {
+            let end = self
+                .fallback_cursor
+                .saturating_add(MAX_FALLBACK_FILES_PER_FRAME)
+                .min(finalized);
+            while self.fallback_cursor < end {
+                let file_id = FileId::new(self.fallback_cursor);
+                let file = self
+                    .fallback_reader
+                    .read_file(structure, file_id)?
+                    .ok_or(FrameLinesError::MissingFile { file_id })?;
+                self.fallback_cursor = self.fallback_cursor.saturating_add(1);
+                if !file.mode.is_rich() {
+                    self.fallback_found = true;
+                    break;
+                }
+            }
+        }
+
+        // Open overlayはfixed tableへ移るまで同じIDのままmodeがdowngradeし得るため、frameごとに
+        // current 1件だけを見る。Fallbackからrichへ戻る遷移はparser contractにないので発見後は保持する。
+        if structure
+            .open_file()
+            .is_some_and(|file| !file.mode.is_rich())
+        {
+            self.fallback_found = true;
+        }
+        let pending = !self.fallback_found && self.fallback_cursor < finalized;
+        Ok((self.fallback_found, pending))
+    }
+
+    fn load_sticky_header(&mut self, state: &AppState) -> Result<String, FrameLinesError> {
+        let width = usize::from(state.terminal_width());
+        let Some(row) = state.current_row() else {
+            return Ok(fit_end("git-ultrapager", width));
+        };
+        let structure = state.document().structure();
+        if let Some(file_id) = row.file_id {
+            let counts = structure.visible_counts()?;
+            let file = self
+                .file_reader
+                .read_file(structure, file_id)?
+                .ok_or(FrameLinesError::MissingFile { file_id })?;
+            let commit = if counts.commits > 1 {
+                self.commit_reader.read_commit(structure, file.commit_id)?
+            } else {
+                None
+            };
+            let total = state
+                .document()
+                .is_complete()
+                .then(|| counts.files.to_string());
+            return Ok(sticky_file_header(file, total.as_deref(), commit, width));
+        }
+        if let Some(commit_id) = row.commit_id {
+            let commit = self
+                .commit_reader
+                .read_commit(structure, commit_id)?
+                .ok_or(FrameLinesError::MissingCommit { commit_id })?;
+            return Ok(fit_end(&commit_label(commit), width));
+        }
+        Ok(fit_end("git-ultrapager", width))
+    }
+
+    fn load_file_list(
+        &mut self,
+        state: &AppState,
+        list: &FileListState,
+    ) -> Result<FrameLines, FrameLinesError> {
+        let width = usize::from(state.terminal_width());
+        let content_height = usize::from(state.terminal_height().saturating_sub(1));
+        let filtered = list
+            .filter
+            .as_ref()
+            .is_some_and(|filter| !filter.text().is_empty());
+        let total_matches = list
+            .window
+            .as_ref()
+            .map_or(0, |window| window.total_matches);
+        let selected_file = if filtered {
+            list.window
+                .as_ref()
+                .and_then(|window| window.selected_file())
+                .or(list.selected_file)
+        } else {
+            list.selected_item
+                .and_then(FileListItem::file_id)
+                .or(list.selected_file)
+        };
+        let selected_item = if filtered {
+            selected_file.map(FileListItem::File)
+        } else if let Some(item) = list
+            .selected_item
+            .or_else(|| selected_file.map(FileListItem::File))
+        {
+            Some(item)
+        } else {
+            first_unfiltered_file_list_item(
+                &mut self.file_metadata_reader,
+                state.document().structure(),
+            )?
+        };
+        let mut file_list = FileListFrame {
+            detail_rows: Vec::new(),
+            overlay_rows: Vec::new(),
+            total_matches,
+            loading: list.loading || !state.document().is_complete(),
+        };
+
+        file_list.detail_rows =
+            self.load_file_list_detail(state, selected_item, width, content_height)?;
+        let retained_base = retained_frame_index_bytes(0);
+        let detail_retained = retained_base.saturating_add(retained_file_list_bytes(&file_list));
+        if detail_retained > MAX_FRAME_RETAINED_BYTES {
+            return Err(FrameLinesError::FrameBudget {
+                requested: detail_retained,
+                limit: MAX_FRAME_RETAINED_BYTES,
+            });
+        }
+
+        let available_rows = content_height.saturating_sub(file_list.detail_rows.len());
+        let entry_limit = available_rows.min(MAX_FRAME_LINE_ENTRIES);
+        if !filtered {
+            return self.load_unfiltered_file_list_rows(
+                state,
+                file_list,
+                selected_item,
+                width,
+                entry_limit,
+            );
+        }
+
+        let Some(window) = list.window.as_ref() else {
+            let text = if file_list.loading {
+                "(loading files…)"
+            } else {
+                "(no matching files)"
+            };
+            let _ = push_file_list_row(
+                &mut file_list,
+                FileListRow {
+                    text: fit_end(text, width),
+                    role: SemanticRole::Dim,
+                    selected: false,
+                },
+            );
+            return finish_file_list_frame(file_list);
+        };
+        if window.total_matches == 0 || window.file_ids.is_empty() || entry_limit == 0 {
+            let text = if file_list.loading {
+                "(loading files…)"
+            } else {
+                "(no matching files)"
+            };
+            let _ = push_file_list_row(
+                &mut file_list,
+                FileListRow {
+                    text: fit_end(text, width),
+                    role: SemanticRole::Dim,
+                    selected: false,
+                },
+            );
+            return finish_file_list_frame(file_list);
+        }
+
+        let selected_index = window
+            .selected_rank
+            .and_then(|rank| rank.checked_sub(window.start_rank))
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|index| *index < window.file_ids.len())
+            .or_else(|| {
+                selected_file.and_then(|selected| {
+                    window
+                        .file_ids
+                        .iter()
+                        .position(|candidate| *candidate == selected)
+                })
+            })
+            .unwrap_or(0);
+        self.load_filtered_file_list_rows(
+            state,
+            file_list,
+            window,
+            selected_index,
+            width,
+            entry_limit,
+        )
+    }
+
+    fn load_file_list_detail(
+        &mut self,
+        state: &AppState,
+        selected_item: Option<FileListItem>,
+        width: usize,
+        height: usize,
+    ) -> Result<Vec<String>, FrameLinesError> {
+        let structure = state.document().structure();
+        match selected_item {
+            Some(FileListItem::File(file_id)) => {
+                let file = self
+                    .file_reader
+                    .read_file(structure, file_id)?
+                    .ok_or(FrameLinesError::MissingFile { file_id })?;
+                let parts = match (file.old_path, file.new_path) {
+                    (Some(old), Some(new)) if old != new => vec![old, " → ", new],
+                    (Some(path), _) | (_, Some(path)) => vec![path],
+                    (None, None) => vec!["(unparsed path)"],
+                };
+                detail_lines(&parts, width, height)
+            }
+            Some(FileListItem::EmptyCommit(commit_id)) => {
+                let commit = self
+                    .commit_reader
+                    .read_commit(structure, commit_id)?
+                    .ok_or(FrameLinesError::MissingCommit { commit_id })?;
+                let detail = format!("{}  (no file changes)", commit_label(commit));
+                detail_lines(&[detail.as_str()], width, height)
+            }
+            None => detail_lines(&["changed files"], width, height),
+        }
+    }
+
+    fn prepare_file_list_item(
+        &mut self,
+        state: &AppState,
+        item: FileListItem,
+        width: usize,
+        selected: bool,
+    ) -> Result<PreparedFileListItem, FrameLinesError> {
+        let structure = state.document().structure();
+        let (commit_id, entry) = match item {
+            FileListItem::File(file_id) => {
+                let file = self
+                    .file_reader
+                    .read_file(structure, file_id)?
+                    .ok_or(FrameLinesError::MissingFile { file_id })?;
+                (
+                    file.commit_id,
+                    FileListRow {
+                        text: file_list_entry(file, width),
+                        role: SemanticRole::Plain,
+                        selected,
+                    },
+                )
+            }
+            FileListItem::EmptyCommit(commit_id) => (
+                commit_id,
+                FileListRow {
+                    text: fit_end("  (no file changes)", width),
+                    role: SemanticRole::Dim,
+                    selected,
+                },
+            ),
+        };
+        let commit = self
+            .commit_reader
+            .read_commit(structure, commit_id)?
+            .ok_or(FrameLinesError::MissingCommit { commit_id })?;
+        if matches!(item, FileListItem::EmptyCommit(_))
+            && (!commit.finalized || commit.files.count() != 0)
+        {
+            return Err(FrameLinesError::MissingCommit { commit_id });
+        }
+        Ok(PreparedFileListItem {
+            commit_id,
+            header: FileListRow {
+                text: fit_end(&commit_label(commit), width),
+                role: SemanticRole::CommitHeader,
+                selected: false,
+            },
+            entry,
+        })
+    }
+
+    fn load_unfiltered_file_list_rows(
+        &mut self,
+        state: &AppState,
+        mut file_list: FileListFrame,
+        selected_item: Option<FileListItem>,
+        width: usize,
+        entry_limit: usize,
+    ) -> Result<FrameLines, FrameLinesError> {
+        let Some(selected_item) = selected_item else {
+            let text = if file_list.loading {
+                "(loading files…)"
+            } else {
+                "(no matching files)"
+            };
+            let _ = push_file_list_row(
+                &mut file_list,
+                FileListRow {
+                    text: fit_end(text, width),
+                    role: SemanticRole::Dim,
+                    selected: false,
+                },
+            );
+            return finish_file_list_frame(file_list);
+        };
+
+        let selected = self.prepare_file_list_item(state, selected_item, width, true)?;
+        let mut first_item = selected_item;
+        let mut last_item = selected_item;
+        let mut first_commit = selected.commit_id;
+        let mut last_commit = selected.commit_id;
+        install_selected_file_list_item(&mut file_list, selected)?;
+
+        let row_limit = entry_limit.clamp(2, MAX_FRAME_LINE_ENTRIES);
+        let mut before_complete = false;
+        let mut after_complete = false;
+        while file_list.overlay_rows.len() < row_limit && !(before_complete && after_complete) {
+            let mut added = false;
+            if !before_complete {
+                match previous_unfiltered_file_list_item(
+                    &mut self.file_metadata_reader,
+                    state.document().structure(),
+                    first_item,
+                )? {
+                    Some(previous) => {
+                        let prepared =
+                            self.prepare_file_list_item(state, previous, width, false)?;
+                        let commit_id = prepared.commit_id;
+                        if insert_prepared_file_list_item(
+                            &mut file_list,
+                            prepared,
+                            first_commit,
+                            true,
+                            row_limit,
+                        ) {
+                            first_item = previous;
+                            first_commit = commit_id;
+                            added = true;
+                        } else {
+                            before_complete = true;
+                        }
+                    }
+                    None => before_complete = true,
+                }
+            }
+            if !after_complete && file_list.overlay_rows.len() < row_limit {
+                match next_unfiltered_file_list_item(
+                    &mut self.file_metadata_reader,
+                    state.document().structure(),
+                    last_item,
+                )? {
+                    Some(next) => {
+                        let prepared = self.prepare_file_list_item(state, next, width, false)?;
+                        let commit_id = prepared.commit_id;
+                        if insert_prepared_file_list_item(
+                            &mut file_list,
+                            prepared,
+                            last_commit,
+                            false,
+                            row_limit,
+                        ) {
+                            last_item = next;
+                            last_commit = commit_id;
+                            added = true;
+                        } else {
+                            after_complete = true;
+                        }
+                    }
+                    None => after_complete = true,
+                }
+            }
+            if !added && (before_complete || after_complete) {
+                break;
+            }
+        }
+        finish_file_list_frame(file_list)
+    }
+
+    fn load_filtered_file_list_rows(
+        &mut self,
+        state: &AppState,
+        mut file_list: FileListFrame,
+        window: &crate::state::FileFilterWindow,
+        selected_index: usize,
+        width: usize,
+        entry_limit: usize,
+    ) -> Result<FrameLines, FrameLinesError> {
+        let selected_file = window.file_ids[selected_index];
+        let selected =
+            self.prepare_file_list_item(state, FileListItem::File(selected_file), width, true)?;
+        let mut first_index = selected_index;
+        let mut last_index = selected_index;
+        let mut first_commit = selected.commit_id;
+        let mut last_commit = selected.commit_id;
+        install_selected_file_list_item(&mut file_list, selected)?;
+
+        let row_limit = entry_limit.clamp(2, MAX_FRAME_LINE_ENTRIES);
+        let mut before_complete = first_index == 0;
+        let mut after_complete = last_index.saturating_add(1) == window.file_ids.len();
+        while file_list.overlay_rows.len() < row_limit && !(before_complete && after_complete) {
+            let mut added = false;
+            if !before_complete {
+                let previous_index = first_index - 1;
+                let prepared = self.prepare_file_list_item(
+                    state,
+                    FileListItem::File(window.file_ids[previous_index]),
+                    width,
+                    false,
+                )?;
+                let commit_id = prepared.commit_id;
+                if insert_prepared_file_list_item(
+                    &mut file_list,
+                    prepared,
+                    first_commit,
+                    true,
+                    row_limit,
+                ) {
+                    first_index = previous_index;
+                    first_commit = commit_id;
+                    before_complete = first_index == 0;
+                    added = true;
+                } else {
+                    before_complete = true;
+                }
+            }
+            if !after_complete && file_list.overlay_rows.len() < row_limit {
+                let next_index = last_index.saturating_add(1);
+                let prepared = self.prepare_file_list_item(
+                    state,
+                    FileListItem::File(window.file_ids[next_index]),
+                    width,
+                    false,
+                )?;
+                let commit_id = prepared.commit_id;
+                if insert_prepared_file_list_item(
+                    &mut file_list,
+                    prepared,
+                    last_commit,
+                    false,
+                    row_limit,
+                ) {
+                    last_index = next_index;
+                    last_commit = commit_id;
+                    after_complete = last_index.saturating_add(1) == window.file_ids.len();
+                    added = true;
+                } else {
+                    after_complete = true;
+                }
+            }
+            if !added && (before_complete || after_complete) {
+                break;
+            }
+        }
+        finish_file_list_frame(file_list)
+    }
+}
+
+impl FrameLines {
     /// Stable IDに対応するfixed line metadataを返す。
     #[must_use]
     pub fn metadata(&self, line_id: LineId) -> Option<DocumentLineMetadata> {
@@ -224,6 +803,8 @@ impl FrameLines {
     pub fn retained_bytes(&self) -> usize {
         retained_frame_index_bytes(self.lines.capacity())
             .saturating_add(retained_weak_match_bytes(&self.lines))
+            .saturating_add(self.sticky_header.capacity())
+            .saturating_add(self.file_list.as_ref().map_or(0, retained_file_list_bytes))
     }
 
     /// Preload中にbounded streaming readerがraw storeから読んだbyte数。
@@ -231,6 +812,123 @@ impl FrameLines {
     pub const fn transient_raw_bytes_read(&self) -> u64 {
         self.transient_raw_bytes_read
     }
+
+    /// Bounded fallback走査に未処理fileがあり、eventを待たず次frameをpreloadする必要があるかを返す。
+    #[must_use]
+    pub const fn needs_follow_up_frame(&self) -> bool {
+        self.fallback_scan_pending
+    }
+}
+
+fn detail_lines(
+    parts: &[&str],
+    width: usize,
+    height: usize,
+) -> Result<Vec<String>, FrameLinesError> {
+    let mut rows = Vec::new();
+    rows.try_reserve(height.min(MAX_FRAME_LINE_ENTRIES))
+        .map_err(|_| FrameLinesError::Allocation { requested: height })?;
+    for_each_detail_line(parts, width, height, |_, row| rows.push(row));
+    Ok(rows)
+}
+
+fn install_selected_file_list_item(
+    file_list: &mut FileListFrame,
+    prepared: PreparedFileListItem,
+) -> Result<(), FrameLinesError> {
+    let PreparedFileListItem { header, entry, .. } = prepared;
+    if push_file_list_rows(file_list, vec![header, entry]) {
+        return Ok(());
+    }
+    Err(FrameLinesError::FrameBudget {
+        requested: MAX_FRAME_RETAINED_BYTES.saturating_add(1),
+        limit: MAX_FRAME_RETAINED_BYTES,
+    })
+}
+
+/// Selectionを含む既存行を先に保持したまま、隣接itemを前後へatomicに挿入する。
+///
+/// 同じcommitのfileは既存headerを共有する。前側へ追加する場合はheaderの直後へfile行を置くため、
+/// 同一commit内を逆向きに広げてもGit順を保つ。
+fn insert_prepared_file_list_item(
+    file_list: &mut FileListFrame,
+    prepared: PreparedFileListItem,
+    adjacent_commit: CommitId,
+    before: bool,
+    row_limit: usize,
+) -> bool {
+    let same_commit = prepared.commit_id == adjacent_commit;
+    let PreparedFileListItem { header, entry, .. } = prepared;
+    let rows = if same_commit {
+        vec![entry]
+    } else {
+        vec![header, entry]
+    };
+    if file_list.overlay_rows.len().saturating_add(rows.len()) > row_limit {
+        return false;
+    }
+    let insert_at = if before {
+        usize::from(same_commit)
+    } else {
+        file_list.overlay_rows.len()
+    };
+    insert_file_list_rows(file_list, insert_at, rows)
+}
+
+fn insert_file_list_rows(
+    file_list: &mut FileListFrame,
+    insert_at: usize,
+    rows: Vec<FileListRow>,
+) -> bool {
+    let previous_len = file_list.overlay_rows.len();
+    let inserted = rows.len();
+    if !push_file_list_rows(file_list, rows) {
+        return false;
+    }
+    file_list.overlay_rows[insert_at..].rotate_right(inserted);
+    debug_assert_eq!(file_list.overlay_rows.len(), previous_len + inserted);
+    true
+}
+
+fn push_file_list_rows(file_list: &mut FileListFrame, rows: Vec<FileListRow>) -> bool {
+    let previous_len = file_list.overlay_rows.len();
+    for row in rows {
+        if !push_file_list_row(file_list, row) {
+            file_list.overlay_rows.truncate(previous_len);
+            file_list.overlay_rows.shrink_to_fit();
+            return false;
+        }
+    }
+    true
+}
+
+fn push_file_list_row(file_list: &mut FileListFrame, row: FileListRow) -> bool {
+    file_list.overlay_rows.push(row);
+    let retained =
+        retained_frame_index_bytes(0).saturating_add(retained_file_list_bytes(file_list));
+    if retained <= MAX_FRAME_RETAINED_BYTES {
+        return true;
+    }
+    file_list.overlay_rows.pop();
+    // `Vec::push`で増えたcapacityもretained budgetに含む。失敗行をpopするだけではcapacityが残るため、
+    // 次frameへ4 MiB超のallocationを渡さないよう失敗時だけ縮める。
+    file_list.overlay_rows.shrink_to_fit();
+    false
+}
+
+fn finish_file_list_frame(file_list: FileListFrame) -> Result<FrameLines, FrameLinesError> {
+    let frame = FrameLines {
+        file_list: Some(file_list),
+        ..FrameLines::default()
+    };
+    let retained = frame.retained_bytes();
+    if retained > MAX_FRAME_RETAINED_BYTES {
+        return Err(FrameLinesError::FrameBudget {
+            requested: retained,
+            limit: MAX_FRAME_RETAINED_BYTES,
+        });
+    }
+    Ok(frame)
 }
 
 fn retained_frame_index_bytes(capacity: usize) -> usize {
@@ -247,6 +945,28 @@ fn retained_weak_match_bytes(lines: &HashMap<LineId, FrameLine>) -> usize {
                 .saturating_mul(std::mem::size_of::<Range<usize>>()),
         )
     })
+}
+
+fn retained_file_list_bytes(file_list: &FileListFrame) -> usize {
+    let detail_rows = file_list
+        .detail_rows
+        .capacity()
+        .saturating_mul(std::mem::size_of::<String>());
+    let detail_text = file_list
+        .detail_rows
+        .iter()
+        .fold(0_usize, |total, row| total.saturating_add(row.capacity()));
+    let overlay_rows = file_list
+        .overlay_rows
+        .capacity()
+        .saturating_mul(std::mem::size_of::<FileListRow>());
+    let overlay_text = file_list.overlay_rows.iter().fold(0_usize, |total, row| {
+        total.saturating_add(row.text.capacity())
+    });
+    detail_rows
+        .saturating_add(detail_text)
+        .saturating_add(overlay_rows)
+        .saturating_add(overlay_text)
 }
 
 const HELP_LINES: [&str; 42] = [
@@ -298,7 +1018,9 @@ const HELP_LINES: [&str; 42] = [
 ///
 /// 呼び出し側は alternate screen の開始・終了と Terminal::draw を所有する。この関数は frame 外へ
 /// 書き込まず、search/filter input 中だけ Ratatui の software cursor 位置を設定する。DecorationSetの
-/// whitespace modeがstateと異なる間はstale intralineだけを隠し、mode非依存のsyntaxは表示を続ける。
+/// Exact document revisionがstateと異なるDecorationSetはset全体を無視する。同じparser lineageでも
+/// open file/hunkのfallback化でline semanticsが変わるため、syntaxだけを後続snapshotへ流用しない。
+/// Revisionが一致し、whitespace modeだけが異なる間はstale intralineを隠してsyntaxは表示する。
 pub fn render(
     frame: &mut Frame<'_>,
     state: &AppState,
@@ -316,6 +1038,12 @@ pub fn render(
         render_too_small(frame, area, theme);
         return;
     }
+    let empty_decorations = DecorationSet::default();
+    let decorations = if decorations.belongs_to(state.document()) {
+        decorations
+    } else {
+        &empty_decorations
+    };
 
     let status_area = Rect::new(
         area.x,
@@ -330,7 +1058,7 @@ pub fn render(
             render_body(frame, content_area, state, theme, decorations, lines);
         }
         Mode::Help { top } => render_help(frame, content_area, *top, theme),
-        Mode::FileList(list) => render_file_list(frame, content_area, state, list, theme),
+        Mode::FileList(_) => render_file_list(frame, content_area, lines.file_list.as_ref(), theme),
     }
     render_status(frame, status_area, state, theme, lines);
 }
@@ -361,9 +1089,8 @@ fn render_body(
         area.width,
         area.height.saturating_sub(1),
     );
-    let header = sticky_header(state, usize::from(header_area.width));
     frame.render_widget(
-        Paragraph::new(header).style(theme.style(SemanticRole::Sticky)),
+        Paragraph::new(lines.sticky_header.as_str()).style(theme.style(SemanticRole::Sticky)),
         header_area,
     );
 
@@ -447,25 +1174,33 @@ fn weak_matches_in_visible_range(
     }
 
     // Full logical lineの先頭から毎frame走査すると、末尾viewportの`.`でも16 MiB分のmatchを辿る。
-    // Visible直前4 KiBだけをlook-behindとして残し、haystack末尾もvisible endへ切る。Weak layerは
-    // current matchの補助表示なので、それより前から始まる巨大matchは省略してmain threadを守る。
+    // Visible直前4 KiBだけをlook-behindとして残す。Weak layerはcurrent matchの補助表示なので、
+    // それより前から始まる巨大matchは省略してmain threadを守る。Regex自体はboundedな
+    // logical line全体に対して評価する。Visual sliceでhaystackを切ると`$`、`\z`、`\b`が
+    // 折り返し位置をlogical end/boundaryと誤認するため、visible end以降のmatchを見つけた時点で止める。
     let mut scan_start = visible
         .start
         .saturating_sub(MAX_WEAK_MATCH_LOOKBEHIND_BYTES);
     while scan_start > 0 && !text.is_char_boundary(scan_start) {
         scan_start -= 1;
     }
-    let mut scan_end = visible.end.min(text.len());
-    while scan_end > 0 && !text.is_char_boundary(scan_end) {
-        scan_end -= 1;
+    let mut visible_end = visible.end.min(text.len());
+    while visible_end > 0 && !text.is_char_boundary(visible_end) {
+        visible_end -= 1;
     }
-    let haystack = &text[..scan_end];
+    if visible.start >= visible_end {
+        return Ok(Vec::new());
+    }
+    let haystack = text;
     let mut cursor = scan_start.min(haystack.len());
     let mut matches = Vec::new();
     while cursor <= haystack.len() && matches.len() < *remaining {
         let Some(found) = compiled.regex().find_at(haystack, cursor) else {
             break;
         };
+        if found.start() >= visible_end {
+            break;
+        }
         if !found.is_empty() && found.end() > visible.start {
             matches
                 .try_reserve(1)
@@ -490,45 +1225,22 @@ fn weak_matches_in_visible_range(
     Ok(matches)
 }
 
-fn sticky_header(state: &AppState, width: usize) -> String {
-    let Some(row) = state.current_row() else {
-        return fit_end("git-ultrapager", width);
-    };
-    if let Some(file_id) = row.file_id
-        && let Some(file) = state.document().file(file_id)
-    {
-        return sticky_file_header(state, file, width);
-    }
-    if let Some(commit_id) = row.commit_id
-        && let Some(commit) = state.document().commit(commit_id)
-    {
-        return fit_end(&commit_label(commit), width);
-    }
-    fit_end("git-ultrapager", width)
-}
-
-fn sticky_file_header(state: &AppState, file: &FileEntry, width: usize) -> String {
-    let occurrence = state
-        .document()
-        .files()
-        .iter()
-        .position(|candidate| candidate.id == file.id)
-        .map_or(1, |index| index + 1);
-    let total = if state.document().is_complete() {
-        state.document().files().len().to_string()
-    } else {
-        "?".to_owned()
-    };
+fn sticky_file_header(
+    file: StoredFileRef<'_>,
+    total: Option<&str>,
+    commit: Option<StoredCommitRef<'_>>,
+    width: usize,
+) -> String {
+    let occurrence = file.id.get().saturating_add(1);
+    let total = total.unwrap_or("?");
     let additions = file
         .additions
         .map_or_else(|| "?".to_owned(), |value| value.to_string());
     let deletions = file
         .deletions
         .map_or_else(|| "?".to_owned(), |value| value.to_string());
-    let commit = (state.document().commits().len() > 1)
-        .then(|| state.document().commit(file.commit_id))
-        .flatten()
-        .and_then(|commit| commit.object_id.as_deref())
+    let commit = commit
+        .and_then(|commit| commit.object_id)
         .map(short_object_id);
     let suffix = commit.map_or_else(
         || format!("  {occurrence}/{total}  +{additions} -{deletions}"),
@@ -544,19 +1256,24 @@ fn sticky_file_header(state: &AppState, file: &FileEntry, width: usize) -> Strin
     format!("{prefix}{path}{suffix}")
 }
 
-fn commit_label(commit: &Commit) -> String {
+fn commit_label(commit: StoredCommitRef<'_>) -> String {
     let identity = match commit.kind {
         CommitKind::WorkingTree => "working tree".to_owned(),
         CommitKind::Commit => commit
             .object_id
-            .as_deref()
             .map(short_object_id)
             .map_or_else(|| "commit".to_owned(), |object| format!("commit {object}")),
     };
-    commit
-        .subject
-        .as_deref()
-        .map_or(identity.clone(), |subject| format!("{identity}  {subject}"))
+    let Some(subject) = commit.subject else {
+        return identity;
+    };
+    let subject_limit = MAX_PATH_SCAN_BYTES.saturating_sub(identity.len().saturating_add(2));
+    let bounded = bounded_prefix(subject, subject_limit);
+    if bounded.len() == subject.len() {
+        format!("{identity}  {bounded}")
+    } else {
+        format!("{identity}  {bounded}…")
+    }
 }
 
 fn short_object_id(object: &str) -> &str {
@@ -1022,8 +1739,7 @@ fn render_help(frame: &mut Frame<'_>, area: Rect, top: usize, theme: &Theme) {
 fn render_file_list(
     frame: &mut Frame<'_>,
     area: Rect,
-    state: &AppState,
-    list: &FileListState,
+    list: Option<&FileListFrame>,
     theme: &Theme,
 ) {
     frame.render_widget(Clear, area);
@@ -1032,34 +1748,45 @@ fn render_file_list(
         area,
     );
 
-    let selected_original = list
-        .filtered_file_indices
-        .get(list.selected_file_index)
-        .copied();
-    let detail_rows = match selected_original.and_then(|index| state.document().files().get(index))
-    {
-        Some(file) => match (&file.old_path, &file.new_path) {
-            (Some(old), Some(new)) if old != new => {
-                render_detail_parts(frame, area, &[old, " → ", new], theme)
-            }
-            (Some(path), _) | (_, Some(path)) => render_detail_parts(frame, area, &[path], theme),
-            (None, None) => render_detail_parts(frame, area, &["(unparsed path)"], theme),
-        },
-        None => render_detail_parts(frame, area, &["changed files"], theme),
+    let Some(list) = list else {
+        frame.render_widget(
+            Paragraph::new(fit_end("(loading files…)", usize::from(area.width)))
+                .style(theme.style(SemanticRole::Dim)),
+            area,
+        );
+        return;
     };
+    for (row, text) in list
+        .detail_rows
+        .iter()
+        .take(usize::from(area.height))
+        .enumerate()
+    {
+        frame.render_widget(
+            Paragraph::new(text.as_str()).style(theme.style(SemanticRole::Sticky)),
+            Rect::new(area.x, area.y.saturating_add(row as u16), area.width, 1),
+        );
+    }
+    let detail_rows = list.detail_rows.len().min(usize::from(area.height));
 
     let list_y = area.y.saturating_add(detail_rows as u16);
     let list_height = area.height.saturating_sub(detail_rows as u16);
-    let overlay_lines = file_overlay_lines(state, list, usize::from(area.width));
-    let selected_line = overlay_lines
+    let selected_line = list
+        .overlay_rows
         .iter()
         .position(|line| line.selected)
         .unwrap_or(0);
     let available = usize::from(list_height);
     let start = selected_line
         .saturating_sub(available / 2)
-        .min(overlay_lines.len().saturating_sub(available));
-    for (screen_row, overlay) in overlay_lines.iter().skip(start).take(available).enumerate() {
+        .min(list.overlay_rows.len().saturating_sub(available));
+    for (screen_row, overlay) in list
+        .overlay_rows
+        .iter()
+        .skip(start)
+        .take(available)
+        .enumerate()
+    {
         let role = if overlay.selected {
             SemanticRole::Selected
         } else {
@@ -1075,20 +1802,6 @@ fn render_file_list(
             ),
         );
     }
-}
-
-fn render_detail_parts(frame: &mut Frame<'_>, area: Rect, parts: &[&str], theme: &Theme) -> usize {
-    for_each_detail_line(
-        parts,
-        usize::from(area.width),
-        usize::from(area.height),
-        |row, text| {
-            frame.render_widget(
-                Paragraph::new(text).style(theme.style(SemanticRole::Sticky)),
-                Rect::new(area.x, area.y.saturating_add(row as u16), area.width, 1),
-            );
-        },
-    )
 }
 
 fn for_each_detail_line(
@@ -1151,81 +1864,9 @@ fn for_each_detail_line(
     emitted
 }
 
-#[derive(Clone, Debug)]
-struct OverlayLine {
-    text: String,
-    role: SemanticRole,
-    selected: bool,
-}
-
-fn file_overlay_lines(state: &AppState, list: &FileListState, width: usize) -> Vec<OverlayLine> {
-    let visible = list
-        .filtered_file_indices
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let selected_original = list
-        .filtered_file_indices
-        .get(list.selected_file_index)
-        .copied();
-    let filtering = list
-        .filter
-        .as_ref()
-        .is_some_and(|filter| !filter.text().is_empty());
-    let mut output = Vec::new();
-
-    for commit in state.document().commits() {
-        let entries = commit
-            .file_ids
-            .iter()
-            .filter_map(|id| {
-                state
-                    .document()
-                    .files()
-                    .iter()
-                    .position(|file| file.id == *id)
-            })
-            .filter(|index| visible.contains(index))
-            .collect::<Vec<_>>();
-        if entries.is_empty() && (filtering || !commit.file_ids.is_empty()) {
-            continue;
-        }
-        output.push(OverlayLine {
-            text: fit_end(&commit_label(commit), width),
-            role: SemanticRole::CommitHeader,
-            selected: false,
-        });
-        if commit.file_ids.is_empty() {
-            output.push(OverlayLine {
-                text: fit_end("  (no file changes)", width),
-                role: SemanticRole::Dim,
-                selected: false,
-            });
-        }
-        for index in entries {
-            if let Some(file) = state.document().files().get(index) {
-                output.push(OverlayLine {
-                    text: file_list_entry(file, width),
-                    role: SemanticRole::Plain,
-                    selected: selected_original == Some(index),
-                });
-            }
-        }
-    }
-
-    if output.is_empty() {
-        output.push(OverlayLine {
-            text: fit_end("(no matching files)", width),
-            role: SemanticRole::Dim,
-            selected: false,
-        });
-    }
-    output
-}
-
-fn file_list_entry(file: &FileEntry, width: usize) -> String {
-    let counts = if matches!(file.status, crate::model::ChangeStatus::Binary) {
-        "binary".to_owned()
+fn file_list_entry(file: StoredFileRef<'_>, width: usize) -> String {
+    let prefix = if matches!(file.status, crate::model::ChangeStatus::Binary) {
+        "  binary ".to_owned()
     } else {
         let additions = file
             .additions
@@ -1233,9 +1874,8 @@ fn file_list_entry(file: &FileEntry, width: usize) -> String {
         let deletions = file
             .deletions
             .map_or_else(|| "?".to_owned(), |value| value.to_string());
-        format!("+{additions} -{deletions}")
+        format!("  {} +{additions} -{deletions} ", file.status.label())
     };
-    let prefix = format!("  {} {counts} ", file.status.label());
     let path_width = width.saturating_sub(display_width(&prefix));
     let path = fit_file_path(file, path_width);
     fit_end(&format!("{prefix}{path}"), width)
@@ -1250,18 +1890,23 @@ fn render_status(
 ) {
     let width = usize::from(area.width);
     match state.mode() {
-        Mode::Search(search) => render_search_prompt(frame, area, state, search, theme),
+        Mode::Search(search) => render_search_prompt(frame, area, state, search, theme, lines),
         Mode::FileList(list) if list.filter.is_some() => {
             if let Some(filter) = list.filter.as_ref() {
-                let suffix = status_suffix(&combined_status(state));
+                let file_status = file_list_status(lines);
+                let status = append_status(&combined_status(state), &file_status);
+                let suffix = status_suffix(&status);
                 render_input_prompt(frame, area, "/", filter, &suffix, theme);
             }
         }
         Mode::FileList(_) => frame.render_widget(
             Paragraph::new(fit_end(
                 &append_status(
-                    "Tab/Esc close  / filter  Enter jump  j/k select",
                     &combined_status(state),
+                    &append_status(
+                        &file_list_status(lines),
+                        "Tab/Esc close  / filter  Enter jump  j/k select",
+                    ),
                 ),
                 width,
             ))
@@ -1270,7 +1915,7 @@ fn render_status(
         ),
         Mode::Help { .. } => frame.render_widget(
             Paragraph::new(fit_end(
-                &append_status("Esc/q/h close  j/k scroll", &combined_status(state)),
+                &append_status(&combined_status(state), "Esc/q/h close  j/k scroll"),
                 width,
             ))
             .style(theme.style(SemanticRole::Status)),
@@ -1284,12 +1929,23 @@ fn render_status(
     }
 }
 
+fn file_list_status(lines: &FrameLines) -> String {
+    lines.file_list.as_ref().map_or_else(String::new, |list| {
+        if list.loading {
+            format!("files:{} loading", list.total_matches)
+        } else {
+            format!("files:{}", list.total_matches)
+        }
+    })
+}
+
 fn render_search_prompt(
     frame: &mut Frame<'_>,
     area: Rect,
     state: &AppState,
     search: &SearchInputState,
     theme: &Theme,
+    lines: &FrameLines,
 ) {
     let prefix = match search.direction {
         crate::search::SearchDirection::Forward => "/",
@@ -1299,10 +1955,31 @@ fn render_search_prompt(
         .search()
         .incremental()
         .and_then(|query| match query.status() {
-            IncrementalQueryStatus::Invalid(error) => Some(format!("  regex: {error}")),
+            IncrementalQueryStatus::Invalid(error) => Some(format!("regex: {error}")),
             IncrementalQueryStatus::Empty | IncrementalQueryStatus::Valid => None,
         });
-    let status = combined_status(state);
+    let preview_status = state
+        .search()
+        .incremental()
+        .and_then(|query| query.displayed_preview())
+        .map(|preview| {
+            let skipped = (preview.skipped_oversized_lines > 0)
+                .then(|| format!("skipped:{}", preview.skipped_oversized_lines));
+            let current = preview
+                .found
+                .as_ref()
+                .map(|found| search_position(lines, found));
+            skipped
+                .into_iter()
+                .chain(current)
+                .collect::<Vec<_>>()
+                .join("  ")
+        })
+        .unwrap_or_default();
+    let status = append_status(
+        &combined_status(state),
+        &append_status(&preview_status, search_activity_status(state)),
+    );
     let suffix = regex_error.map_or_else(
         || status_suffix(&status),
         |error| status_suffix(&append_status(&error, &status)),
@@ -1319,10 +1996,18 @@ fn status_suffix(status: &str) -> String {
 }
 
 fn append_status(base: &str, status: &str) -> String {
-    if status.is_empty() {
-        base.to_owned()
+    match (base.is_empty(), status.is_empty()) {
+        (_, true) => base.to_owned(),
+        (true, false) => status.to_owned(),
+        (false, false) => format!("{base}  {status}"),
+    }
+}
+
+fn search_activity_status(state: &AppState) -> &'static str {
+    if state.is_search_in_flight() || state.search().pending_forward().is_some() {
+        "searching"
     } else {
-        format!("{base}  {status}")
+        ""
     }
 }
 
@@ -1376,21 +2061,25 @@ fn input_window(text: &str, cursor: usize, width: usize) -> InputWindow {
     let cursor = cursor.min(text.len());
     let mut start = cursor;
     let target_left = width.saturating_sub(4).max(1);
-    for (index, grapheme) in text[..cursor].grapheme_indices(true).rev() {
-        let candidate = display_width(&text[index..cursor]);
+    // Unicode graphemeの境界にはcombining mark数の上限がない。入力先頭まで境界を探すと幅0の
+    // queryでscan上限自体を回避できるため、左端だけscalar境界で切り、ellipsisで省略を示す。
+    let left = bounded_suffix(&text[..cursor], MAX_INPUT_WINDOW_SCAN_BYTES);
+    let left_base = cursor.saturating_sub(left.len());
+    let mut left_cells = 0_usize;
+    for (relative, grapheme) in left.grapheme_indices(true).rev() {
+        let candidate = left_cells.saturating_add(display_width(grapheme));
         if candidate > target_left {
             break;
         }
-        start = index;
-        if grapheme.is_empty() {
-            break;
-        }
+        start = left_base + relative;
+        left_cells = candidate;
     }
     let leading = usize::from(start > 0);
     let available = width.saturating_sub(leading);
     let mut end = start;
     let mut used = 0_usize;
-    for (relative, grapheme) in text[start..].grapheme_indices(true) {
+    let scanned = bounded_prefix(&text[start..], MAX_INPUT_WINDOW_SCAN_BYTES);
+    for (relative, grapheme) in scanned.grapheme_indices(true) {
         let grapheme_width = display_width(grapheme);
         if used.saturating_add(grapheme_width) > available {
             break;
@@ -1414,10 +2103,11 @@ fn input_window(text: &str, cursor: usize, width: usize) -> InputWindow {
     if trailing {
         visible.push('…');
     }
-    let cursor_end = cursor.min(end).max(start);
     InputWindow {
         text: fit_end(&visible, width),
-        cursor_cells: leading + display_width(&text[start..cursor_end]),
+        cursor_cells: leading
+            .saturating_add(left_cells)
+            .min(width.saturating_sub(1)),
     }
 }
 
@@ -1447,26 +2137,26 @@ fn body_status(state: &AppState, lines: &FrameLines) -> String {
         WhitespaceChoice::Show => "ws:show",
     };
     let follow = state.is_following().then_some("follow");
-    let pending = state.search().pending_forward().map(|_| "searching");
-    let fallback = state
-        .document()
-        .files()
-        .iter()
-        .any(|file| !file.mode.is_rich())
-        .then_some("fallback");
+    let pending = (!search_activity_status(state).is_empty()).then_some("searching");
+    let fallback = lines.fallback_found.then_some("fallback");
+    let fallback_pending = lines.fallback_scan_pending.then_some("fallback:pending");
     let skipped = (state.search().last_skipped_oversized_lines() > 0)
         .then(|| format!("skipped:{}", state.search().last_skipped_oversized_lines()));
     let current = displayed_current_match(state).map(|found| search_position(lines, found));
-    let mut parts = vec![position, input.to_owned(), whitespace.to_owned()];
-    parts.extend(follow.map(str::to_owned));
-    parts.extend(pending.map(str::to_owned));
-    parts.extend(fallback.map(str::to_owned));
-    parts.extend(skipped);
-    parts.extend(current);
-    parts.extend(state.background_status().map(str::to_owned));
+    // `fit_end`は左側を残すため、操作結果とworker errorを固定情報より前へ置く。狭いterminalでも
+    // unknown key、BOF/EOF、worker failureがhelp文やpositionに押し出されない。
+    let mut parts = Vec::new();
     if !state.status().is_empty() {
         parts.push(state.status().to_owned());
     }
+    parts.extend(state.background_status().map(str::to_owned));
+    parts.extend([position, input.to_owned(), whitespace.to_owned()]);
+    parts.extend(follow.map(str::to_owned));
+    parts.extend(pending.map(str::to_owned));
+    parts.extend(fallback.map(str::to_owned));
+    parts.extend(fallback_pending.map(str::to_owned));
+    parts.extend(skipped);
+    parts.extend(current);
     parts.join("  ")
 }
 
@@ -1477,8 +2167,12 @@ fn search_position(lines: &FrameLines, found: &SearchMatch<crate::model::LineId>
     format!("match {}:{}", found.line_index + 1, column)
 }
 
-fn fit_file_path(file: &FileEntry, width: usize) -> String {
-    match (&file.old_path, &file.new_path) {
+fn fit_file_path(file: StoredFileRef<'_>, width: usize) -> String {
+    fit_file_path_parts(file.old_path, file.new_path, width)
+}
+
+fn fit_file_path_parts(old_path: Option<&str>, new_path: Option<&str>, width: usize) -> String {
+    match (old_path, new_path) {
         (Some(old), Some(new)) if old != new => {
             let separator = " → ";
             let joined_bytes = old
@@ -1648,10 +2342,11 @@ mod tests {
     use super::*;
     use crate::cli::ThemeChoice;
     use crate::decorations::DecorationSet;
-    use crate::model::{ChangeStatus, CommitId, FileId, FileMode, LineSpan};
+    use crate::input::AppendStore;
     use crate::parser::parse_bytes;
     use crate::search::compile_smart_case;
-    use crate::state::{Effect, Event};
+    use crate::state::{Effect, Event, FileFilterGeneration, FileFilterWindow};
+    use crate::storage::{StorageConfig, StructuralStorage};
     use crate::theme::ColorLevel;
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -1692,6 +2387,50 @@ mod tests {
             .unwrap();
     }
 
+    fn load_frame(state: &AppState) -> FrameLines {
+        FrameLoader::new().load(state).unwrap()
+    }
+
+    fn parse_with_storage(
+        input: &[u8],
+        storage: &StructuralStorage,
+    ) -> crate::document::DocumentSnapshot {
+        let raw = AppendStore::new();
+        let mut parser = crate::parser::GitParser::new(raw.clone(), storage).unwrap();
+        let raw_start = raw.append(input).unwrap();
+        parser.push(raw_start, input).unwrap();
+        raw.seal().unwrap();
+        parser.into_document().unwrap()
+    }
+
+    fn append_rich_file(input: &mut String, index: usize) {
+        let path = format!("src/file-{index:05}.rs");
+        input.push_str(&format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
+        ));
+    }
+
+    fn append_empty_commit(input: &mut String, index: usize, subject: &str) {
+        input.push_str(&format!(
+            "commit {index:08x}00000000000000000000000000000000\n\n    {subject}\n"
+        ));
+    }
+
+    fn file_list_state(
+        selected_item: Option<FileListItem>,
+        window: Option<FileFilterWindow>,
+        loading: bool,
+    ) -> FileListState {
+        FileListState {
+            selected_item,
+            selected_file: selected_item.and_then(FileListItem::file_id),
+            window,
+            filter: None,
+            generation: FileFilterGeneration::default(),
+            loading,
+        }
+    }
+
     #[test]
     fn body_renders_sticky_file_and_dual_gutter() {
         let document = parse_bytes(
@@ -1703,7 +2442,7 @@ mod tests {
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
         let decorations =
             DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore).unwrap();
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
         terminal
             .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
@@ -1713,6 +2452,589 @@ mod tests {
         assert!(screen.contains("10     │-old"), "{screen}");
         assert!(screen.contains("10 │+new"), "{screen}");
         assert!(screen.contains("line 1/6"), "{screen}");
+    }
+
+    #[test]
+    fn narrow_overlay_status_keeps_transient_message_before_fixed_help() {
+        let document = parse_bytes(b"plain\n").unwrap();
+        let mut state =
+            AppState::new(Arc::new(document), 30, 6, 4, WhitespaceChoice::Ignore, true).unwrap();
+        state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Char('h'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Char('x'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let lines = load_frame(&state);
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let mut terminal = Terminal::new(TestBackend::new(30, 6)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &state, &theme, &DecorationSet::default(), &lines);
+            })
+            .unwrap();
+        let screen = buffer_text(&terminal);
+
+        assert!(screen.contains("unknown key"), "{screen}");
+    }
+
+    #[test]
+    fn search_status_tracks_current_worker_without_repeating_regex_errors() {
+        let document = parse_bytes(b"plain text\n").unwrap();
+        let mut state = AppState::new(
+            Arc::new(document),
+            120,
+            8,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let effects = state.update(Event::Paste("plain".to_owned())).unwrap();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Search(_)))
+        );
+        assert!(state.is_search_in_flight());
+
+        let lines = load_frame(&state);
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(frame, &state, &theme, &DecorationSet::default(), &lines);
+            })
+            .unwrap();
+        let searching = buffer_text(&terminal);
+        assert!(searching.contains("searching"), "{searching}");
+
+        state.update(Event::Paste("[".to_owned())).unwrap();
+        assert!(!state.is_search_in_flight());
+        assert!(state.status().is_empty());
+        let lines = load_frame(&state);
+        terminal
+            .draw(|frame| {
+                render(frame, &state, &theme, &DecorationSet::default(), &lines);
+            })
+            .unwrap();
+        let invalid = buffer_text(&terminal);
+        assert_eq!(invalid.matches("regex:").count(), 1, "{invalid}");
+        assert!(!invalid.contains("searching"), "{invalid}");
+    }
+
+    #[test]
+    fn committed_search_worker_is_visible_in_body_status() {
+        let document = parse_bytes(b"plain text\n").unwrap();
+        let mut state =
+            AppState::new(Arc::new(document), 80, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
+        state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Char('/'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        state.update(Event::Paste("missing".to_owned())).unwrap();
+        let effects = state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::Search(_)))
+        );
+        assert!(matches!(state.mode(), Mode::Body));
+        assert!(state.is_search_in_flight());
+        assert!(body_status(&state, &load_frame(&state)).contains("searching"));
+    }
+
+    #[test]
+    fn sticky_header_formats_rename_occurrence_and_multi_commit_identity() {
+        let document = parse_bytes(
+            br#"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+    Rename source
+
+diff --git a/old-name.rs b/new-name.rs
+similarity index 100%
+rename from old-name.rs
+rename to new-name.rs
+commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+    Change more files
+
+diff --git a/second.rs b/second.rs
+--- a/second.rs
++++ b/second.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/third.rs b/third.rs
+--- a/third.rs
++++ b/third.rs
+@@ -1 +1 @@
+-old
++new
+"#,
+        )
+        .unwrap();
+        let mut state = AppState::new(
+            Arc::new(document),
+            100,
+            8,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Char('}'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert_eq!(
+            state.current_row().and_then(|row| row.file_id),
+            Some(FileId::new(0))
+        );
+
+        let lines = load_frame(&state);
+        assert!(lines.sticky_header.contains("old-name.rs → new-name.rs"));
+        assert!(lines.sticky_header.contains("1/3"));
+        assert!(lines.sticky_header.contains("@aaaaaaaa"));
+    }
+
+    #[test]
+    fn file_list_preload_keeps_selected_detail_git_order_and_commit_headers() {
+        let document = parse_bytes(
+            br#"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+diff --git a/old.rs b/new.rs
+similarity index 100%
+rename from old.rs
+rename to new.rs
+diff --git a/second.rs b/second.rs
+--- a/second.rs
++++ b/second.rs
+commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    no file changes here
+commit cccccccccccccccccccccccccccccccccccccccc
+diff --git a/third.rs b/third.rs
+--- a/third.rs
++++ b/third.rs
+"#,
+        )
+        .unwrap();
+        let state =
+            AppState::new(Arc::new(document), 80, 9, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let window = FileFilterWindow {
+            total_matches: 3,
+            selected_rank: Some(0),
+            start_rank: 0,
+            file_ids: vec![FileId::new(0), FileId::new(1), FileId::new(2)],
+        };
+        let list = file_list_state(
+            Some(FileListItem::File(FileId::new(0))),
+            Some(window),
+            false,
+        );
+        let mut loader = FrameLoader::new();
+        let lines = loader.load_file_list(&state, &list).unwrap();
+        let frame = lines.file_list.as_ref().unwrap();
+        let detail = frame.detail_rows.join("");
+        let file_rows = frame
+            .overlay_rows
+            .iter()
+            .filter(|row| row.role == SemanticRole::Plain)
+            .collect::<Vec<_>>();
+
+        assert!(detail.contains("old.rs → new.rs"), "{detail}");
+        assert_eq!(frame.total_matches, 3);
+        assert!(!frame.loading);
+        assert_eq!(file_rows.len(), 3);
+        assert!(file_rows[0].selected);
+        assert!(file_rows[0].text.contains("old.rs"));
+        assert!(file_rows[1].text.contains("second.rs"));
+        assert!(file_rows[2].text.contains("third.rs"));
+        assert_eq!(
+            frame
+                .overlay_rows
+                .iter()
+                .filter(|row| row.role == SemanticRole::CommitHeader)
+                .count(),
+            3
+        );
+        assert!(
+            frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("(no file changes)"))
+        );
+    }
+
+    #[test]
+    fn nonempty_file_filter_hides_empty_commit_items() {
+        let document = parse_bytes(
+            br#"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+diff --git a/first.rs b/first.rs
+--- a/first.rs
++++ b/first.rs
+commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    no file changes
+commit cccccccccccccccccccccccccccccccccccccccc
+diff --git a/last.rs b/last.rs
+--- a/last.rs
++++ b/last.rs
+"#,
+        )
+        .unwrap();
+        let state =
+            AppState::new(Arc::new(document), 80, 9, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let window = FileFilterWindow {
+            total_matches: 2,
+            selected_rank: Some(0),
+            start_rank: 0,
+            file_ids: vec![FileId::new(0), FileId::new(1)],
+        };
+        let mut list = file_list_state(
+            Some(FileListItem::File(FileId::new(0))),
+            Some(window),
+            false,
+        );
+        let mut filter = TextInput::default();
+        filter.set("rs");
+        list.filter = Some(filter);
+        let frame = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let rows = &frame.file_list.as_ref().unwrap().overlay_rows;
+
+        assert!(rows.iter().any(|row| row.text.contains("first.rs")));
+        assert!(rows.iter().any(|row| row.text.contains("last.rs")));
+        assert!(!rows.iter().any(|row| row.text.contains("no file changes")));
+    }
+
+    #[test]
+    fn file_list_shows_a_commit_when_the_document_has_no_files() {
+        let document =
+            parse_bytes(b"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n    empty commit\n")
+                .unwrap();
+        let state =
+            AppState::new(Arc::new(document), 80, 7, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let window = FileFilterWindow {
+            total_matches: 0,
+            selected_rank: None,
+            start_rank: 0,
+            file_ids: Vec::new(),
+        };
+        let list = file_list_state(None, Some(window), false);
+        let lines = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let rows = &lines.file_list.as_ref().unwrap().overlay_rows;
+
+        assert!(rows.iter().any(|row| row.text.contains("commit aaaaaaaa")));
+        assert!(
+            rows.iter()
+                .any(|row| row.text.contains("(no file changes)"))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.text.contains("no matching files"))
+        );
+    }
+
+    #[test]
+    fn distant_empty_commit_selection_builds_only_a_local_navigable_window() {
+        let mut input = String::new();
+        for index in 0..30 {
+            append_empty_commit(&mut input, index, &format!("empty {index}"));
+        }
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let state = AppState::new(
+            Arc::new(document),
+            80,
+            10,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let selected = FileListItem::EmptyCommit(CommitId::new(20));
+        let list = file_list_state(
+            Some(selected),
+            Some(FileFilterWindow {
+                total_matches: 0,
+                selected_rank: None,
+                start_rank: 0,
+                file_ids: Vec::new(),
+            }),
+            false,
+        );
+        let frame = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let frame = frame.file_list.as_ref().unwrap();
+
+        assert!(
+            frame.detail_rows.join("").contains("commit 00000014"),
+            "{:?}",
+            frame.detail_rows
+        );
+        assert!(frame.overlay_rows.len() <= 8);
+        assert_eq!(
+            frame.overlay_rows.iter().filter(|row| row.selected).count(),
+            1
+        );
+        assert!(
+            frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("commit 00000014"))
+        );
+        assert!(
+            !frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("commit 00000000"))
+        );
+    }
+
+    #[test]
+    fn empty_commit_selection_inside_a_long_gap_does_not_scan_from_a_file_edge() {
+        let mut input =
+            String::from("commit ffffffff00000000000000000000000000000000\n\n    first file\n\n");
+        append_rich_file(&mut input, 0);
+        for index in 1..26 {
+            append_empty_commit(&mut input, index, &format!("gap {index}"));
+        }
+        input.push_str("commit eeeeeeee00000000000000000000000000000000\n\n    last file\n\n");
+        append_rich_file(&mut input, 1);
+
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let state =
+            AppState::new(Arc::new(document), 72, 9, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let selected = FileListItem::EmptyCommit(CommitId::new(13));
+        let list = file_list_state(selected.into(), None, false);
+        let frame = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let frame = frame.file_list.as_ref().unwrap();
+
+        assert!(frame.detail_rows.join("").contains("commit 0000000d"));
+        assert!(
+            frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.selected && row.text.contains("no file changes"))
+        );
+        assert!(
+            !frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("file-00000.rs") || row.text.contains("file-00001.rs"))
+        );
+    }
+
+    #[test]
+    fn open_zero_file_commit_stays_loading_until_eof_finalizes_its_placeholder() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut parser = crate::parser::GitParser::new(raw.clone(), &storage).unwrap();
+        let input = b"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n\n    still open\n";
+        let raw_start = raw.append(input).unwrap();
+        parser.push(raw_start, input).unwrap();
+
+        let open = parser.snapshot().unwrap();
+        let open_state =
+            AppState::new(Arc::new(open), 70, 8, 4, WhitespaceChoice::Ignore, false).unwrap();
+        let open_frame = FrameLoader::new()
+            .load_file_list(&open_state, &file_list_state(None, None, false))
+            .unwrap();
+        let open_frame = open_frame.file_list.as_ref().unwrap();
+        assert!(open_frame.loading);
+        assert!(
+            open_frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("loading files"))
+        );
+        assert!(
+            !open_frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("no file changes"))
+        );
+
+        raw.seal().unwrap();
+        parser.finish().unwrap();
+        let complete = parser.snapshot().unwrap();
+        let complete_state =
+            AppState::new(Arc::new(complete), 70, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let complete_frame = FrameLoader::new()
+            .load_file_list(&complete_state, &file_list_state(None, None, false))
+            .unwrap();
+        let complete_frame = complete_frame.file_list.as_ref().unwrap();
+        assert!(!complete_frame.loading);
+        assert!(
+            complete_frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.selected && row.text.contains("no file changes"))
+        );
+    }
+
+    #[test]
+    fn trailing_open_zero_commit_keeps_prior_file_window_in_loading_state() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut parser = crate::parser::GitParser::new(raw.clone(), &storage).unwrap();
+        let input = br#"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+diff --git a/ready.rs b/ready.rs
+--- a/ready.rs
++++ b/ready.rs
+commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+    still open
+"#;
+        let raw_start = raw.append(input).unwrap();
+        parser.push(raw_start, input).unwrap();
+
+        let document = parser.snapshot().unwrap();
+        let state = AppState::new(
+            Arc::new(document),
+            70,
+            8,
+            4,
+            WhitespaceChoice::Ignore,
+            false,
+        )
+        .unwrap();
+        let list = file_list_state(
+            Some(FileListItem::File(FileId::new(0))),
+            Some(FileFilterWindow {
+                total_matches: 1,
+                selected_rank: Some(0),
+                start_rank: 0,
+                file_ids: vec![FileId::new(0)],
+            }),
+            false,
+        );
+        let frame = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let frame = frame.file_list.as_ref().unwrap();
+
+        assert!(frame.loading);
+        assert!(
+            frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("ready.rs"))
+        );
+        assert!(
+            !frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("no file changes"))
+        );
+    }
+
+    #[test]
+    fn selected_empty_placeholder_survives_large_subject_frame_clipping() {
+        let mut input = String::new();
+        let subject = "s".repeat(MAX_PATH_SCAN_BYTES);
+        for index in 0..80 {
+            append_empty_commit(&mut input, index, &subject);
+        }
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let state = AppState::new(
+            Arc::new(document),
+            u16::MAX,
+            100,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let selected = FileListItem::EmptyCommit(CommitId::new(40));
+        let list = file_list_state(selected.into(), None, false);
+        let frame = FrameLoader::new().load_file_list(&state, &list).unwrap();
+
+        assert!(frame.retained_bytes() <= MAX_FRAME_RETAINED_BYTES);
+        let file_list = frame.file_list.as_ref().unwrap();
+        assert!(file_list.detail_rows.join("").contains("commit 00000028"));
+        assert!(
+            file_list
+                .overlay_rows
+                .iter()
+                .any(|row| row.selected && row.text.contains("no file changes"))
+        );
+    }
+
+    #[test]
+    fn binary_file_list_entry_does_not_repeat_the_status_label() {
+        let document = parse_bytes(
+            b"diff --git a/image.bin b/image.bin\nBinary files a/image.bin and b/image.bin differ\n",
+        )
+        .unwrap();
+        let state =
+            AppState::new(Arc::new(document), 80, 7, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let window = FileFilterWindow {
+            total_matches: 1,
+            selected_rank: Some(0),
+            start_rank: 0,
+            file_ids: vec![FileId::new(0)],
+        };
+        let list = file_list_state(
+            Some(FileListItem::File(FileId::new(0))),
+            Some(window),
+            false,
+        );
+        let lines = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let row = lines
+            .file_list
+            .as_ref()
+            .unwrap()
+            .overlay_rows
+            .iter()
+            .find(|row| row.role == SemanticRole::Plain)
+            .unwrap();
+        assert!(row.text.contains("binary image.bin"), "{}", row.text);
+        assert!(!row.text.contains("binary binary"), "{}", row.text);
+    }
+
+    #[test]
+    fn file_list_preload_distinguishes_loading_and_no_matches() {
+        let document = parse_bytes(b"plain\n").unwrap();
+        let state =
+            AppState::new(Arc::new(document), 40, 7, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let mut loader = FrameLoader::new();
+
+        let loading = loader
+            .load_file_list(&state, &file_list_state(None, None, true))
+            .unwrap();
+        let loading = loading.file_list.as_ref().unwrap();
+        assert!(loading.loading);
+        assert_eq!(loading.total_matches, 0);
+        assert!(loading.overlay_rows[0].text.contains("loading files"));
+
+        let empty_window = FileFilterWindow {
+            total_matches: 0,
+            selected_rank: None,
+            start_rank: 0,
+            file_ids: Vec::new(),
+        };
+        let empty = loader
+            .load_file_list(&state, &file_list_state(None, Some(empty_window), false))
+            .unwrap();
+        let empty = empty.file_list.as_ref().unwrap();
+        assert!(!empty.loading);
+        assert!(empty.overlay_rows[0].text.contains("no matching files"));
     }
 
     #[test]
@@ -1726,7 +3048,7 @@ mod tests {
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
         let decorations =
             DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Show).unwrap();
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
         terminal
             .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
@@ -1760,7 +3082,7 @@ mod tests {
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor);
         let decorations =
             DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Show).unwrap();
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let mut terminal = Terminal::new(TestBackend::new(11, 16)).unwrap();
         terminal
             .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
@@ -1783,7 +3105,7 @@ mod tests {
             AppState::new(Arc::new(document), 40, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
         apply_search_preview(&mut state, "target");
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor);
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let line_id = state.document().line_id_at(0).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal
@@ -1813,7 +3135,7 @@ mod tests {
         let document = parse_bytes(&input).unwrap();
         let state =
             AppState::new(Arc::new(document), 40, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let line_id = state.document().line_id_at(0).unwrap();
         let metadata = lines.metadata(line_id).unwrap();
 
@@ -1846,7 +3168,7 @@ mod tests {
             AppState::new(Arc::new(document), 40, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
         apply_search_preview(&mut state, "visible");
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor);
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let line_id = state.document().line_id_at(0).unwrap();
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         terminal
@@ -1868,7 +3190,7 @@ mod tests {
     }
 
     #[test]
-    fn frame_preload_rejects_more_than_the_visible_line_cap() {
+    fn tall_terminal_frame_stays_within_viewport_and_frame_bounds() {
         let input = "x\n".repeat(MAX_FRAME_LINE_ENTRIES + 1);
         let document = parse_bytes(input.as_bytes()).unwrap();
         let height = u16::try_from(MAX_FRAME_LINE_ENTRIES + 3).unwrap();
@@ -1882,14 +3204,12 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.visible_rows().len(), MAX_FRAME_LINE_ENTRIES + 1);
-        assert!(matches!(
-            FrameLines::load(&state),
-            Err(FrameLinesError::LineLimit {
-                requested,
-                limit: MAX_FRAME_LINE_ENTRIES,
-            }) if requested == MAX_FRAME_LINE_ENTRIES + 1
-        ));
+        // Viewportの64 MiB cache budgetが先にrow数を抑える。FrameLoaderはそのreachable setだけを
+        // preloadし、独立した5,000件/4 MiB境界内へ収める。
+        assert!(state.visible_rows().len() < MAX_FRAME_LINE_ENTRIES + 1);
+        let frame = FrameLoader::new().load(&state).unwrap();
+        assert!(frame.lines.len() <= MAX_FRAME_LINE_ENTRIES);
+        assert!(frame.retained_bytes() <= MAX_FRAME_RETAINED_BYTES);
     }
 
     #[test]
@@ -1900,13 +3220,258 @@ mod tests {
             let document = parse_bytes(input.as_bytes()).unwrap();
             let state = AppState::new(Arc::new(document), 40, 8, 4, WhitespaceChoice::Ignore, true)
                 .unwrap();
-            FrameLines::load(&state).unwrap().retained_bytes()
+            load_frame(&state).retained_bytes()
         }
 
         let short = retained_for(8);
         let streamed = retained_for(200_000);
         assert_eq!(short, streamed);
         assert!(streamed <= MAX_FRAME_RETAINED_BYTES);
+    }
+
+    #[test]
+    fn oversized_file_window_preloads_only_screen_rows_around_selection() {
+        let mut input = String::new();
+        for index in 0..5_001 {
+            append_rich_file(&mut input, index);
+        }
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let state = AppState::new(
+            Arc::new(document),
+            80,
+            12,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let selected_rank = 2_500_u64;
+        let window = FileFilterWindow {
+            total_matches: 5_001,
+            selected_rank: Some(selected_rank),
+            start_rank: 0,
+            file_ids: (0..5_001).map(FileId::new).collect(),
+        };
+        let list = file_list_state(
+            Some(FileListItem::File(FileId::new(selected_rank))),
+            Some(window),
+            false,
+        );
+        let frame = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let frame = frame.file_list.as_ref().unwrap();
+        let file_rows = frame
+            .overlay_rows
+            .iter()
+            .filter(|row| row.role == SemanticRole::Plain)
+            .collect::<Vec<_>>();
+
+        assert_eq!(file_rows.len(), 9);
+        assert!(frame.overlay_rows[0].role == SemanticRole::CommitHeader);
+        assert!(file_rows.iter().any(|row| row.selected));
+        assert!(file_rows[0].text.contains("file-02496.rs"));
+        assert!(file_rows[8].text.contains("file-02504.rs"));
+        assert_eq!(frame.total_matches, 5_001);
+    }
+
+    #[test]
+    fn file_list_rows_stop_before_the_shared_frame_budget() {
+        let mut file_list = FileListFrame::default();
+        let payload = "x".repeat(MAX_PATH_SCAN_BYTES);
+        let mut accepted = 0_usize;
+        for _ in 0..MAX_FRAME_LINE_ENTRIES {
+            if !push_file_list_row(
+                &mut file_list,
+                FileListRow {
+                    text: payload.clone(),
+                    role: SemanticRole::Plain,
+                    selected: false,
+                },
+            ) {
+                break;
+            }
+            accepted = accepted.saturating_add(1);
+        }
+        assert!(accepted < MAX_FRAME_LINE_ENTRIES);
+
+        let frame = finish_file_list_frame(file_list).unwrap();
+        assert!(frame.retained_bytes() <= MAX_FRAME_RETAINED_BYTES);
+    }
+
+    #[test]
+    fn fallback_scan_advances_by_4096_files_and_resets_for_a_new_document() {
+        let mut input = String::new();
+        for index in 0..4_096 {
+            append_rich_file(&mut input, index);
+        }
+        let path = "src/fallback.rs";
+        input.push_str(&format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ malformed @@\n-old\n+new\n"
+        ));
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let state =
+            AppState::new(Arc::new(document), 60, 7, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let mut loader = FrameLoader::new();
+
+        let first = loader.load(&state).unwrap();
+        assert!(!first.fallback_found);
+        assert!(first.fallback_scan_pending);
+        assert!(first.needs_follow_up_frame());
+        assert_eq!(loader.fallback_cursor, 4_096);
+
+        let second = loader.load(&state).unwrap();
+        assert!(second.fallback_found);
+        assert!(!second.fallback_scan_pending);
+        assert!(!second.needs_follow_up_frame());
+
+        let replacement = parse_bytes(
+            b"diff --git a/rich.rs b/rich.rs\n--- a/rich.rs\n+++ b/rich.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let replacement = AppState::new(
+            Arc::new(replacement),
+            60,
+            7,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let reset = loader.load(&replacement).unwrap();
+        assert!(!reset.fallback_found);
+        assert!(!reset.fallback_scan_pending);
+        assert_eq!(loader.fallback_cursor, 1);
+    }
+
+    #[test]
+    fn offscreen_current_match_uses_byte_column_without_preloading_its_line() {
+        let mut input = (0..20)
+            .map(|index| format!("plain-{index:02}\n"))
+            .collect::<String>();
+        input.push_str("tail\n");
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let mut state =
+            AppState::new(Arc::new(document), 40, 6, 4, WhitespaceChoice::Ignore, true).unwrap();
+        apply_search_preview(&mut state, "plain-15");
+        state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Enter,
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let current = state.search().current_match().cloned().unwrap();
+        assert_eq!(current.byte_range.start, 0);
+        let _ = state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Char('g'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        assert!(
+            !state
+                .visible_rows()
+                .iter()
+                .any(|row| row.line_id == current.line_id)
+        );
+
+        let frame = FrameLoader::new().load(&state).unwrap();
+        assert!(!frame.lines.contains_key(&current.line_id));
+        assert_eq!(frame.current_column(current.line_id), Some(1));
+    }
+
+    #[test]
+    fn exhausted_weak_match_cap_stops_later_visible_line_decodes() {
+        let input = format!(
+            "{}\n{}\n{}\n",
+            "a".repeat(10_000),
+            "b".repeat(10_000),
+            "c".repeat(10_000)
+        );
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let mut state = AppState::new(
+            Arc::new(document),
+            20_000,
+            5,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        apply_search_preview(&mut state, ".");
+        let frame = FrameLoader::new().load(&state).unwrap();
+        let ids = state
+            .visible_rows()
+            .iter()
+            .map(|row| row.line_id)
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids.len(), 3);
+        assert_eq!(frame.weak_matches(ids[0]).len(), 10_000);
+        assert_eq!(frame.weak_matches(ids[1]).len(), 6_384);
+        assert!(frame.weak_matches(ids[2]).is_empty());
+        assert!(frame.transient_raw_bytes_read() < 25_000);
+    }
+
+    #[test]
+    fn file_list_preload_reads_paths_after_structure_and_blob_spill() {
+        let limit = 512 * 1024;
+        let config = StorageConfig::new(limit, 480 * 1024, 256, 4 * 1024).unwrap();
+        let storage = StructuralStorage::with_config(config).unwrap();
+        let mut input = "commit 1111111111111111111111111111111111111111\n".to_owned();
+        for index in 0..800 {
+            let path = format!("spill/{index:04}/component/a-long-source-file-name.rs");
+            input.push_str(&format!(
+                "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+            ));
+        }
+        let document = parse_with_storage(input.as_bytes(), &storage);
+        let state =
+            AppState::new(Arc::new(document), 90, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let selected = FileId::new(799);
+        let window = FileFilterWindow {
+            total_matches: 800,
+            selected_rank: Some(799),
+            start_rank: 799,
+            file_ids: vec![selected],
+        };
+        let list = file_list_state(Some(FileListItem::File(selected)), Some(window), false);
+        let frame = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let frame = frame.file_list.as_ref().unwrap();
+
+        assert!(
+            frame.detail_rows.join("").contains("spill/0799/component"),
+            "{:?}",
+            frame.detail_rows
+        );
+        assert!(
+            frame
+                .overlay_rows
+                .iter()
+                .any(|row| row.text.contains("spill/0799/component"))
+        );
+        assert!(storage.resident_bytes().unwrap().total <= limit);
+    }
+
+    #[test]
+    fn render_does_not_advance_preload_structure_readers() {
+        let document = parse_bytes(
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let state =
+            AppState::new(Arc::new(document), 60, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let mut loader = FrameLoader::new();
+        let lines = loader.load(&state).unwrap();
+        let before = loader.fallback_reader.statistics();
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                render(frame, &state, &theme, &DecorationSet::default(), &lines);
+            })
+            .unwrap();
+
+        assert_eq!(loader.fallback_reader.statistics(), before);
     }
 
     #[test]
@@ -1923,7 +3488,7 @@ mod tests {
         let mut remaining = 3;
         assert_eq!(
             weak_matches_in_visible_range(&crossing, &text, 500..520, &mut remaining).unwrap(),
-            vec![0..520]
+            vec![0..1_000]
         );
 
         let zero_width = compile_smart_case("").unwrap();
@@ -1944,6 +3509,35 @@ mod tests {
     }
 
     #[test]
+    fn weak_matches_preserve_logical_line_anchor_and_word_boundary_semantics() {
+        for pattern in [r"foo$", r"foo\z", r"foo\b"] {
+            let compiled = compile_smart_case(pattern).unwrap();
+            let mut remaining = 3;
+            assert_eq!(
+                weak_matches_in_visible_range(&compiled, "foobar", 0..3, &mut remaining).unwrap(),
+                Vec::<Range<usize>>::new(),
+                "pattern {pattern:?} must not treat a visual slice end as a logical boundary"
+            );
+            assert_eq!(remaining, 3);
+
+            let mut remaining = 3;
+            assert_eq!(
+                weak_matches_in_visible_range(&compiled, "foo", 0..3, &mut remaining).unwrap(),
+                vec![0..3],
+                "pattern {pattern:?} must still match at the logical line end"
+            );
+            assert_eq!(remaining, 2);
+        }
+
+        let word_boundary = compile_smart_case(r"foo\b").unwrap();
+        let mut remaining = 3;
+        assert_eq!(
+            weak_matches_in_visible_range(&word_boundary, "foo bar", 0..3, &mut remaining).unwrap(),
+            vec![0..3]
+        );
+    }
+
+    #[test]
     fn current_search_style_wins_over_syntax_and_intraline_layers() {
         let document = parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let old = 1;\n+let new = 2;\n",
@@ -1955,7 +3549,7 @@ mod tests {
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor);
         let decorations =
             DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore).unwrap();
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
         terminal
             .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
@@ -1969,13 +3563,50 @@ mod tests {
     }
 
     #[test]
+    fn stale_same_lineage_decorations_are_ignored_after_snapshot_fallback() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut parser = crate::parser::GitParser::new(raw.clone(), &storage).unwrap();
+        let input = b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-let old = 1;\n+let new = 2;\n";
+        let start = raw.append(input).unwrap();
+        parser.push(start, input).unwrap();
+        let rich = parser.snapshot().unwrap();
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor);
+        let stale = DecorationSet::compute(&rich, &theme, WhitespaceChoice::Ignore).unwrap();
+        assert!(stale.belongs_to(&rich));
+
+        raw.seal().unwrap();
+        let fallback = parser.into_document().unwrap();
+        assert_eq!(rich.identity(), fallback.identity());
+        assert!(!stale.belongs_to(&fallback));
+        let state =
+            AppState::new(Arc::new(fallback), 60, 9, 4, WhitespaceChoice::Ignore, true).unwrap();
+        let lines = load_frame(&state);
+        let mut stale_terminal = Terminal::new(TestBackend::new(60, 9)).unwrap();
+        stale_terminal
+            .draw(|frame| render(frame, &state, &theme, &stale, &lines))
+            .unwrap();
+        let mut plain_terminal = Terminal::new(TestBackend::new(60, 9)).unwrap();
+        plain_terminal
+            .draw(|frame| {
+                render(frame, &state, &theme, &DecorationSet::default(), &lines);
+            })
+            .unwrap();
+
+        assert_eq!(
+            stale_terminal.backend().buffer(),
+            plain_terminal.backend().buffer()
+        );
+    }
+
+    #[test]
     fn zero_width_match_on_empty_plain_line_gets_a_visible_marker() {
         let document = parse_bytes(b"\n").unwrap();
         let mut state =
             AppState::new(Arc::new(document), 20, 6, 4, WhitespaceChoice::Ignore, true).unwrap();
         apply_search_preview(&mut state, "^$");
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
-        let lines = FrameLines::load(&state).unwrap();
+        let lines = load_frame(&state);
         let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
         terminal
             .draw(|frame| {
@@ -1992,7 +3623,11 @@ mod tests {
             b"diff --git a/a/very/long/old-name.rs b/b/very/long/new-name.rs\nsimilarity index 100%\nrename from a/very/long/old-name.rs\nrename to b/very/long/new-name.rs\n",
         )
         .unwrap();
-        let file = &document.files()[0];
+        let mut reader = StructureReader::new();
+        let file = reader
+            .read_file(document.structure(), FileId::new(0))
+            .unwrap()
+            .unwrap();
         let fitted = fit_file_path(file, 28);
         assert!(fitted.contains("old-name"));
         assert!(fitted.contains("new-name"));
@@ -2004,22 +3639,10 @@ mod tests {
         let prefix = "x".repeat(2 * 1024 * 1024);
         let old_path = format!("{prefix}-old-name.rs");
         let new_path = format!("{prefix}-new-name.rs");
-        let file = FileEntry {
-            id: FileId::new(0),
-            commit_id: CommitId::new(0),
-            old_path: Some(old_path.clone()),
-            new_path: Some(new_path.clone()),
-            status: ChangeStatus::Renamed,
-            mode: FileMode::Rich,
-            span: LineSpan::open(LineId::new(0)),
-            hunk_ids: Vec::new(),
-            additions: Some(0),
-            deletions: Some(0),
-        };
 
         assert!(bounded_basename(&old_path).len() <= MAX_PATH_SCAN_BYTES);
         assert!(bounded_basename(&new_path).len() <= MAX_PATH_SCAN_BYTES);
-        let fitted = fit_file_path(&file, 40);
+        let fitted = fit_file_path_parts(Some(&old_path), Some(&new_path), 40);
         assert!(fitted.contains("old-name"), "{fitted}");
         assert!(fitted.contains("new-name"), "{fitted}");
         assert!(display_width(&fitted) <= 40);
@@ -2048,6 +3671,16 @@ mod tests {
         assert!(window.text.starts_with('…'));
         assert!(window.cursor_cells < 8);
         assert!(display_width(&window.text) <= 8);
+    }
+
+    #[test]
+    fn input_window_bounds_zero_width_text_around_the_cursor() {
+        let text = "\u{200b}".repeat(MAX_INPUT_WINDOW_SCAN_BYTES);
+        let window = input_window(&text, text.len(), 12);
+
+        assert!(window.text.starts_with('…'));
+        assert!(window.text.len() <= MAX_INPUT_WINDOW_SCAN_BYTES + '…'.len_utf8());
+        assert!(window.cursor_cells < 12);
     }
 
     #[test]

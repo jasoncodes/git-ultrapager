@@ -6,13 +6,16 @@
 //! File ID と hunk ID の子一覧は出現順が連続するため、resident `Vec` ではなく先頭 ID と件数を
 //! [`FileIdRange`] / [`HunkIdRange`] に保存する。
 //!
-//! [`StructureSnapshot`] は table ごとの high-water mark と open overlay の owned clone だけを持つ。
+//! [`StructureSnapshot`] は table ごとの high-water mark と open overlay の `Arc` clone だけを持つ。
 //! Snapshot 作成後に同じ builder が record を追加しても、reader は high-water mark 以降を読まない。
 //! 可変長の object ID、subject、path は [`BlobArena`] に1回だけ保存し、[`StructureReader`] が再利用
 //! bufferへ復元する。Disk encoding は Rust の enum discriminant や struct layout に依存しない。
 
 use std::fmt;
+use std::num::NonZeroU64;
+use std::ops::Range;
 use std::str;
+use std::sync::Arc;
 
 use thiserror::Error;
 
@@ -28,9 +31,8 @@ use crate::storage::{
 const OPTIONAL_U64_NONE: u64 = u64::MAX;
 const PACKED_BLOB_BYTES: usize = 24;
 const COMMIT_RECORD_BYTES: usize = 96;
-const FILE_RECORD_BYTES: usize = 120;
+const FILE_RECORD_BYTES: usize = 144;
 const HUNK_RECORD_BYTES: usize = 80;
-const FILE_BOUNDS_RECORD_BYTES: usize = 24;
 
 const BLOB_NONE: u8 = 0;
 const BLOB_EMPTY: u8 = 1;
@@ -72,7 +74,7 @@ pub enum StructureStoreError {
         first: u64,
         count: u64,
     },
-    #[error("closed line span [{start}, {end}) has its end before its start")]
+    #[error("closed line span [{start}, {end}) must have its end after its start")]
     InvalidLineSpan { start: u64, end: u64 },
     #[error(
         "{child_kind} {child_id} starts at {child_start}, before parent {parent_kind} {parent_id} starts at {parent_start}"
@@ -120,8 +122,6 @@ pub enum StructureStoreError {
         expected: u64,
         actual: u64,
     },
-    #[error("file table contains {files} finalized records but bounds table contains {bounds}")]
-    FileBoundsOutOfSync { files: u64, bounds: u64 },
     #[error("{kind} stable ID {id} is outside snapshot high-water mark {high_water}")]
     OutsideSnapshot {
         kind: &'static str,
@@ -167,26 +167,36 @@ pub enum StructureStoreError {
 }
 
 /// Commit が所有する連続 File ID 範囲。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FileIdRange {
-    first: Option<FileId>,
+    start: u64,
     count: u64,
 }
 
 impl FileIdRange {
-    /// 子 file がない空範囲を返す。
+    /// 次のfile IDをcursorとして保持する空範囲を返す。
+    ///
+    /// `start`は親を開始した時点のfile high-water markである。子が0件でもcursorを失わないため、
+    /// no-file commitを後続commitのfile範囲と区別できる。
     #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            first: None,
-            count: 0,
-        }
+    pub const fn empty_at(start: u64) -> Self {
+        Self { start, count: 0 }
+    }
+
+    /// 範囲の挿入cursor。空範囲でも親開始時のchild high-water markを返す。
+    #[must_use]
+    pub const fn start(self) -> u64 {
+        self.start
     }
 
     /// 範囲の先頭 ID。空範囲では `None`。
     #[must_use]
     pub const fn first(self) -> Option<FileId> {
-        self.first
+        if self.count == 0 {
+            None
+        } else {
+            Some(FileId::new(self.start))
+        }
     }
 
     /// 範囲内の file 数。
@@ -197,75 +207,87 @@ impl FileIdRange {
 
     /// Exclusive end。範囲 codec を通過した値では overflow しない。
     #[must_use]
-    pub fn end_exclusive(self) -> u64 {
-        self.first
-            .map_or(0, |first| first.get().saturating_add(self.count))
+    pub const fn end_exclusive(self) -> u64 {
+        self.start.saturating_add(self.count)
     }
 
     /// ID が範囲内かを返す。
     #[must_use]
     pub fn contains(self, id: FileId) -> bool {
-        self.first
-            .is_some_and(|first| id.get() >= first.get() && id.get() < self.end_exclusive())
+        id.get() >= self.start && id.get() < self.end_exclusive()
     }
 
-    fn last(self) -> Option<FileId> {
-        let first = self.first?;
+    /// 範囲末尾のID。空範囲では`None`。
+    #[must_use]
+    pub fn last(self) -> Option<FileId> {
         let offset = self.count.checked_sub(1)?;
-        first.get().checked_add(offset).map(FileId::new)
+        self.start.checked_add(offset).map(FileId::new)
+    }
+
+    /// 0始まりoffsetのID。範囲外では`None`。
+    #[must_use]
+    pub fn get(self, offset: u64) -> Option<FileId> {
+        (offset < self.count)
+            .then_some(offset)
+            .and_then(|offset| self.start.checked_add(offset))
+            .map(FileId::new)
+    }
+
+    /// Stable ID順のiterator。
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = FileId> {
+        (self.start..self.end_exclusive()).map(FileId::new)
     }
 
     fn push(&mut self, id: FileId) -> Result<(), StructureStoreError> {
         validate_id("file", id.get())?;
-        match self.first {
-            None => {
-                self.first = Some(id);
-                self.count = 1;
-            }
-            Some(first) => {
-                let expected = checked_range_end("file", first.get(), self.count)?;
-                if id.get() != expected {
-                    return Err(StructureStoreError::AppendIdentityMismatch {
-                        kind: "file child",
-                        expected,
-                        actual: id.get(),
-                    });
-                }
-                self.count =
-                    self.count
-                        .checked_add(1)
-                        .ok_or(StructureStoreError::IdRangeOverflow {
-                            kind: "file",
-                            first: first.get(),
-                            count: self.count,
-                        })?;
-            }
+        let expected = checked_range_end("file", self.start, self.count)?;
+        if id.get() != expected {
+            return Err(StructureStoreError::AppendIdentityMismatch {
+                kind: "file child",
+                expected,
+                actual: id.get(),
+            });
         }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(StructureStoreError::IdRangeOverflow {
+                kind: "file",
+                first: self.start,
+                count: self.count,
+            })?;
         validate_file_range(*self)
     }
 }
 
 /// File が所有する連続 Hunk ID 範囲。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HunkIdRange {
-    first: Option<HunkId>,
+    start: u64,
     count: u64,
 }
 
 impl HunkIdRange {
-    /// 子 hunk がない空範囲を返す。
+    /// 次のhunk IDをcursorとして保持する空範囲を返す。
     #[must_use]
-    pub const fn empty() -> Self {
-        Self {
-            first: None,
-            count: 0,
-        }
+    pub const fn empty_at(start: u64) -> Self {
+        Self { start, count: 0 }
+    }
+
+    /// 範囲の挿入cursor。空範囲でも親開始時のchild high-water markを返す。
+    #[must_use]
+    pub const fn start(self) -> u64 {
+        self.start
     }
 
     /// 範囲の先頭 ID。空範囲では `None`。
     #[must_use]
     pub const fn first(self) -> Option<HunkId> {
-        self.first
+        if self.count == 0 {
+            None
+        } else {
+            Some(HunkId::new(self.start))
+        }
     }
 
     /// 範囲内の hunk 数。
@@ -276,50 +298,55 @@ impl HunkIdRange {
 
     /// Exclusive end。範囲 codec を通過した値では overflow しない。
     #[must_use]
-    pub fn end_exclusive(self) -> u64 {
-        self.first
-            .map_or(0, |first| first.get().saturating_add(self.count))
+    pub const fn end_exclusive(self) -> u64 {
+        self.start.saturating_add(self.count)
     }
 
     /// ID が範囲内かを返す。
     #[must_use]
     pub fn contains(self, id: HunkId) -> bool {
-        self.first
-            .is_some_and(|first| id.get() >= first.get() && id.get() < self.end_exclusive())
+        id.get() >= self.start && id.get() < self.end_exclusive()
     }
 
-    fn last(self) -> Option<HunkId> {
-        let first = self.first?;
+    /// 範囲末尾のID。空範囲では`None`。
+    #[must_use]
+    pub fn last(self) -> Option<HunkId> {
         let offset = self.count.checked_sub(1)?;
-        first.get().checked_add(offset).map(HunkId::new)
+        self.start.checked_add(offset).map(HunkId::new)
+    }
+
+    /// 0始まりoffsetのID。範囲外では`None`。
+    #[must_use]
+    pub fn get(self, offset: u64) -> Option<HunkId> {
+        (offset < self.count)
+            .then_some(offset)
+            .and_then(|offset| self.start.checked_add(offset))
+            .map(HunkId::new)
+    }
+
+    /// Stable ID順のiterator。
+    pub fn iter(self) -> impl DoubleEndedIterator<Item = HunkId> {
+        (self.start..self.end_exclusive()).map(HunkId::new)
     }
 
     fn push(&mut self, id: HunkId) -> Result<(), StructureStoreError> {
         validate_id("hunk", id.get())?;
-        match self.first {
-            None => {
-                self.first = Some(id);
-                self.count = 1;
-            }
-            Some(first) => {
-                let expected = checked_range_end("hunk", first.get(), self.count)?;
-                if id.get() != expected {
-                    return Err(StructureStoreError::AppendIdentityMismatch {
-                        kind: "hunk child",
-                        expected,
-                        actual: id.get(),
-                    });
-                }
-                self.count =
-                    self.count
-                        .checked_add(1)
-                        .ok_or(StructureStoreError::IdRangeOverflow {
-                            kind: "hunk",
-                            first: first.get(),
-                            count: self.count,
-                        })?;
-            }
+        let expected = checked_range_end("hunk", self.start, self.count)?;
+        if id.get() != expected {
+            return Err(StructureStoreError::AppendIdentityMismatch {
+                kind: "hunk child",
+                expected,
+                actual: id.get(),
+            });
         }
+        self.count = self
+            .count
+            .checked_add(1)
+            .ok_or(StructureStoreError::IdRangeOverflow {
+                kind: "hunk",
+                first: self.start,
+                count: self.count,
+            })?;
         validate_hunk_range(*self)
     }
 }
@@ -327,9 +354,9 @@ impl HunkIdRange {
 /// File 内の旧側・新側 gutter に現れた最大 source line 番号。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct StructureFileLineBounds {
-    /// 旧側番号を持つlineがまだなければ`None`。File close後はfixed bounds recordへ移る。
+    /// 旧側番号を持つlineがまだなければ`None`。File close後はfixed file recordへ移る。
     pub max_old_line_number: Option<u64>,
-    /// 新側番号を持つlineがまだなければ`None`。File close後はfixed bounds recordへ移る。
+    /// 新側番号を持つlineがまだなければ`None`。File close後はfixed file recordへ移る。
     pub max_new_line_number: Option<u64>,
 }
 
@@ -391,7 +418,7 @@ impl OpenCommit {
 /// Fixed tableへ未確定のまま書かず、snapshotだけへcloneするopen file。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenFile {
-    /// Finalized file tableとbounds tableの次のindexに一致するstable ID。
+    /// Finalized file tableの次のindexに一致するstable ID。
     id: FileId,
     /// Parser lifecycle中にopenな[`OpenCommit`]のID。
     commit_id: CommitId,
@@ -411,12 +438,12 @@ pub struct OpenFile {
     pub additions: Option<u64>,
     /// Rich modeの削除数。Fallbackへ移った時は`None`へ変更する。
     pub deletions: Option<u64>,
-    /// Source line appendに伴って増加し、file recordと同じIDのbounds recordへ移る。
+    /// Source line appendに伴って増加し、file close時にfile recordへ移る。
     pub line_bounds: StructureFileLineBounds,
 }
 
 impl OpenFile {
-    /// Finalized file tableとbounds tableの次のindexに一致するstable ID。
+    /// Finalized file tableの次のindexに一致するstable ID。
     #[must_use]
     pub const fn id(&self) -> FileId {
         self.id
@@ -530,6 +557,20 @@ pub struct StoredCommitMetadata {
     pub finalized: bool,
 }
 
+impl<'a> StoredCommitRef<'a> {
+    /// 可変長文字列の借用を除いたmetadata viewへ変換する。
+    #[must_use]
+    pub const fn metadata(self) -> StoredCommitMetadata {
+        StoredCommitMetadata {
+            id: self.id,
+            kind: self.kind,
+            span: self.span,
+            files: self.files,
+            finalized: self.finalized,
+        }
+    }
+}
+
 /// Finalized record と open overlay を同じ形で読める file view。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StoredFileRef<'a> {
@@ -553,6 +594,8 @@ pub struct StoredFileRef<'a> {
     pub additions: Option<u64>,
     /// Rich modeの削除数。Fallback modeでは`None`。
     pub deletions: Option<u64>,
+    /// 旧側・新側gutterに現れた最大source line番号。
+    pub line_bounds: StructureFileLineBounds,
     /// Fixed tableからdecodeしたviewなら`true`、overlayなら`false`。
     pub finalized: bool,
 }
@@ -562,6 +605,23 @@ impl<'a> StoredFileRef<'a> {
     #[must_use]
     pub fn primary_path(self) -> Option<&'a str> {
         self.new_path.or(self.old_path)
+    }
+
+    /// Path借用を除いたmetadata viewへ変換する。
+    #[must_use]
+    pub const fn metadata(self) -> StoredFileMetadata {
+        StoredFileMetadata {
+            id: self.id,
+            commit_id: self.commit_id,
+            status: self.status,
+            mode: self.mode,
+            span: self.span,
+            hunks: self.hunks,
+            additions: self.additions,
+            deletions: self.deletions,
+            line_bounds: self.line_bounds,
+            finalized: self.finalized,
+        }
     }
 }
 
@@ -587,6 +647,8 @@ pub struct StoredFileMetadata {
     pub additions: Option<u64>,
     /// Rich modeの削除数。Fallback modeでは`None`。
     pub deletions: Option<u64>,
+    /// 旧側・新側gutterに現れた最大source line番号。
+    pub line_bounds: StructureFileLineBounds,
     /// Fixed tableからdecodeしたviewなら`true`、overlayなら`false`。
     pub finalized: bool,
 }
@@ -621,8 +683,17 @@ pub struct StructureSpillStatus {
     pub files: bool,
     /// Hunk tableにdisk extentが存在する。
     pub hunks: bool,
-    /// File bounds tableにdisk extentが存在する。
-    pub file_bounds: bool,
+}
+
+/// Open overlayを含むsnapshot可視件数。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StructureCounts {
+    /// Commit件数。
+    pub commits: u64,
+    /// File件数。
+    pub files: u64,
+    /// Hunk件数。
+    pub hunks: u64,
 }
 
 /// Append成功済みの同種recordの末尾位置。次のsibling開始とparent closeの検証にだけ使う。
@@ -637,11 +708,10 @@ pub struct StructureBuilder {
     commits: SpillTable<CommitRecord>,
     files: SpillTable<FileRecord>,
     hunks: SpillTable<HunkRecord>,
-    file_bounds: SpillTable<FileBoundsRecord>,
     blobs: BlobArena,
-    open_commit: Option<OpenCommit>,
-    open_file: Option<OpenFile>,
-    open_hunk: Option<OpenHunk>,
+    open_commit: Option<Arc<OpenCommit>>,
+    open_file: Option<Arc<OpenFile>>,
+    open_hunk: Option<Arc<OpenHunk>>,
     last_commit: Option<FinalizedSpanEnd>,
     last_file: Option<FinalizedSpanEnd>,
     last_hunk: Option<FinalizedSpanEnd>,
@@ -667,13 +737,12 @@ impl fmt::Debug for StructureBuilder {
 }
 
 impl StructureBuilder {
-    /// Shared 256 MiB ledgerから4つのtableと1つのblob arenaを作る。
+    /// Shared 256 MiB ledgerから3つのtableと1つのblob arenaを作る。
     pub fn new(storage: &StructuralStorage) -> Result<Self, StructureStoreError> {
         Ok(Self {
             commits: storage.table()?,
             files: storage.table()?,
             hunks: storage.table()?,
-            file_bounds: storage.table()?,
             blobs: storage.blob_arena(),
             open_commit: None,
             open_file: None,
@@ -705,22 +774,29 @@ impl StructureBuilder {
         }
         validate_id("line", start.get())?;
         let id = CommitId::new(self.commits.len()?);
+        let file_start = self.files.len()?;
         validate_id("commit", id.get())?;
         validate_sibling_start("commit", id.get(), start.get(), self.last_commit)?;
-        self.open_commit = Some(OpenCommit {
+        self.open_commit = Some(Arc::new(OpenCommit {
             id,
             kind,
             object_id,
             subject: None,
             span: LineSpan::open(start),
-            files: FileIdRange::empty(),
-        });
+            files: FileIdRange::empty_at(file_start),
+        }));
         Ok(id)
+    }
+
+    /// 現在openなcommitのimmutable view。Open commitがなければ`None`。
+    #[must_use]
+    pub fn open_commit(&self) -> Option<&OpenCommit> {
+        self.open_commit.as_deref()
     }
 
     /// 現在openなcommitをparserが更新するためのmutable view。
     pub fn open_commit_mut(&mut self) -> Option<&mut OpenCommit> {
-        self.open_commit.as_mut()
+        self.open_commit.as_mut().map(Arc::make_mut)
     }
 
     /// 現在のcommit配下で次のfileを開始する。
@@ -745,7 +821,7 @@ impl StructureBuilder {
         let previous_file = self.last_file;
         let commit = self
             .open_commit
-            .as_mut()
+            .as_deref()
             .ok_or(StructureStoreError::MissingOpenParent {
                 operation: "begin file",
                 required_kind: "commit",
@@ -760,6 +836,7 @@ impl StructureBuilder {
         }
         validate_id("line", start.get())?;
         let id = FileId::new(self.files.len()?);
+        let hunk_start = self.hunks.len()?;
         validate_id("file", id.get())?;
         validate_child_start(
             "commit",
@@ -773,7 +850,17 @@ impl StructureBuilder {
         let mut next_range = commit.files;
         next_range.push(id)?;
         let initial_count = mode.is_rich().then_some(0);
-        self.open_file = Some(OpenFile {
+        // 入力検証が終わるまでCOWを発生させない。失敗したbeginが既存snapshotとの共有だけを
+        // 解除すると、論理値が同じでも次回snapshotのallocation特性が呼び出し順に依存する。
+        let commit = self
+            .open_commit
+            .as_mut()
+            .ok_or(StructureStoreError::MissingOpenParent {
+                operation: "begin file",
+                required_kind: "commit",
+            })?;
+        Arc::make_mut(commit).files = next_range;
+        self.open_file = Some(Arc::new(OpenFile {
             id,
             commit_id,
             old_path,
@@ -781,18 +868,23 @@ impl StructureBuilder {
             status,
             mode,
             span: LineSpan::open(start),
-            hunks: HunkIdRange::empty(),
+            hunks: HunkIdRange::empty_at(hunk_start),
             additions: initial_count,
             deletions: initial_count,
             line_bounds: StructureFileLineBounds::default(),
-        });
-        commit.files = next_range;
+        }));
         Ok(id)
+    }
+
+    /// 現在openなfileのimmutable view。Open fileがなければ`None`。
+    #[must_use]
+    pub fn open_file(&self) -> Option<&OpenFile> {
+        self.open_file.as_deref()
     }
 
     /// 現在openなfileをparserが更新するためのmutable view。
     pub fn open_file_mut(&mut self) -> Option<&mut OpenFile> {
-        self.open_file.as_mut()
+        self.open_file.as_mut().map(Arc::make_mut)
     }
 
     /// 現在のfile配下で次のhunkを開始する。
@@ -813,7 +905,7 @@ impl StructureBuilder {
         let previous_hunk = self.last_hunk;
         let file = self
             .open_file
-            .as_mut()
+            .as_deref()
             .ok_or(StructureStoreError::MissingOpenParent {
                 operation: "begin hunk",
                 required_kind: "file",
@@ -841,7 +933,15 @@ impl StructureBuilder {
         validate_sibling_start("hunk", id.get(), header_line.get(), previous_hunk)?;
         let mut next_range = file.hunks;
         next_range.push(id)?;
-        self.open_hunk = Some(OpenHunk {
+        let file = self
+            .open_file
+            .as_mut()
+            .ok_or(StructureStoreError::MissingOpenParent {
+                operation: "begin hunk",
+                required_kind: "file",
+            })?;
+        Arc::make_mut(file).hunks = next_range;
+        self.open_hunk = Some(Arc::new(OpenHunk {
             id,
             file_id,
             kind,
@@ -849,29 +949,33 @@ impl StructureBuilder {
             span: LineSpan::open(header_line),
             old_range,
             new_range,
-        });
-        file.hunks = next_range;
+        }));
         Ok(id)
+    }
+
+    /// 現在openなhunkのimmutable view。Open hunkがなければ`None`。
+    #[must_use]
+    pub fn open_hunk(&self) -> Option<&OpenHunk> {
+        self.open_hunk.as_deref()
     }
 
     /// 現在openなhunkをparserが更新するためのmutable view。
     pub fn open_hunk_mut(&mut self) -> Option<&mut OpenHunk> {
-        self.open_hunk.as_mut()
+        self.open_hunk.as_mut().map(Arc::make_mut)
     }
 
     /// Open hunkを閉じ、fixed tableへ1 recordとしてappendする。
     pub fn finish_hunk(&mut self, end_exclusive: u64) -> Result<HunkId, StructureStoreError> {
         self.ensure_healthy()?;
         self.validate_current_overlays()?;
-        let mut hunk = self
+        let hunk = self
             .open_hunk
             .clone()
             .ok_or(StructureStoreError::MissingOpenParent {
                 operation: "finish hunk",
                 required_kind: "hunk",
             })?;
-        hunk.span.end_exclusive = Some(end_exclusive);
-        let record = HunkRecord::from_open(&hunk)?;
+        let record = HunkRecord::from_open(&hunk, end_exclusive)?;
         let expected = hunk.id.get();
         let result = self
             .append_or_poison_hunk(&record)
@@ -888,24 +992,20 @@ impl StructureBuilder {
         Ok(hunk.id)
     }
 
-    /// Open fileと同じIDのboundsを連続tableへappendしてからfileを閉じる。
-    ///
-    /// File recordとbounds recordの2回目のwriteが失敗するとtable間のatomic rollbackはできないため、
-    /// builderをpoisonする。Callerはsnapshotや再試行を行わず、そのI/O errorを上位へ返す。
+    /// Open fileを閉じ、line boundsを含むfixed recordを1件appendする。
     pub fn finish_file(&mut self, end_exclusive: u64) -> Result<FileId, StructureStoreError> {
         self.ensure_healthy()?;
         self.validate_current_overlays()?;
         if let Some(hunk) = self.open_hunk.as_ref() {
             return Err(open_child("finish file", "hunk", hunk.id.get()));
         }
-        let mut file = self
+        let file = self
             .open_file
             .clone()
             .ok_or(StructureStoreError::MissingOpenParent {
                 operation: "finish file",
                 required_kind: "file",
             })?;
-        file.span.end_exclusive = Some(end_exclusive);
         validate_last_child_end(
             "file",
             file.id.get(),
@@ -916,9 +1016,13 @@ impl StructureBuilder {
         )?;
         // Mutable overlayの値をblobへ書く前に検証し、callerが修正できる入力errorではbuilderを
         // poisonしない。ここから先のfailureはblob/tableのappend後かもしれないため再試行できない。
-        let record = FileRecord::from_open(&file, PackedBlobRef::NONE, PackedBlobRef::NONE)?;
-        let bounds = FileBoundsRecord::new(file.id, file.line_bounds)?;
-        let result = self.append_finalized_file(&file, record, bounds);
+        let record = FileRecord::from_open(
+            &file,
+            end_exclusive,
+            PackedBlobRef::NONE,
+            PackedBlobRef::NONE,
+        )?;
+        let result = self.append_finalized_file(&file, record);
         if result.is_err() {
             self.poisoned = true;
         }
@@ -941,14 +1045,13 @@ impl StructureBuilder {
         if let Some(file) = self.open_file.as_ref() {
             return Err(open_child("finish commit", "file", file.id.get()));
         }
-        let mut commit =
-            self.open_commit
-                .clone()
-                .ok_or(StructureStoreError::MissingOpenParent {
-                    operation: "finish commit",
-                    required_kind: "commit",
-                })?;
-        commit.span.end_exclusive = Some(end_exclusive);
+        let commit = self
+            .open_commit
+            .clone()
+            .ok_or(StructureStoreError::MissingOpenParent {
+                operation: "finish commit",
+                required_kind: "commit",
+            })?;
         validate_last_child_end(
             "commit",
             commit.id.get(),
@@ -958,7 +1061,12 @@ impl StructureBuilder {
             self.last_file,
         )?;
         // SpanとID rangeを先に検証し、invalid overlayでblob arenaを進めない。
-        let record = CommitRecord::from_open(&commit, PackedBlobRef::NONE, PackedBlobRef::NONE)?;
+        let record = CommitRecord::from_open(
+            &commit,
+            end_exclusive,
+            PackedBlobRef::NONE,
+            PackedBlobRef::NONE,
+        )?;
         let result = self.append_finalized_commit(&commit, record);
         if result.is_err() {
             self.poisoned = true;
@@ -978,26 +1086,18 @@ impl StructureBuilder {
         let commit_high_water = self.commits.len()?;
         let file_high_water = self.files.len()?;
         let hunk_high_water = self.hunks.len()?;
-        let bounds_high_water = self.file_bounds.len()?;
-        if file_high_water != bounds_high_water {
-            return Err(StructureStoreError::FileBoundsOutOfSync {
-                files: file_high_water,
-                bounds: bounds_high_water,
-            });
-        }
         validate_open_overlay(
             commit_high_water,
             file_high_water,
             hunk_high_water,
-            self.open_commit.as_ref(),
-            self.open_file.as_ref(),
-            self.open_hunk.as_ref(),
+            self.open_commit.as_deref(),
+            self.open_file.as_deref(),
+            self.open_hunk.as_deref(),
         )?;
         Ok(StructureSnapshot {
             commits: self.commits.clone(),
             files: self.files.clone(),
             hunks: self.hunks.clone(),
-            file_bounds: self.file_bounds.clone(),
             blobs: self.blobs.clone(),
             commit_high_water,
             file_high_water,
@@ -1014,7 +1114,16 @@ impl StructureBuilder {
             commits: self.commits.is_spilled()?,
             files: self.files.is_spilled()?,
             hunks: self.hunks.is_spilled()?,
-            file_bounds: self.file_bounds.is_spilled()?,
+        })
+    }
+
+    /// Fixed tableとopen overlayを合算した現在の可視件数を返す。
+    pub fn visible_counts(&self) -> Result<StructureCounts, StructureStoreError> {
+        self.ensure_healthy()?;
+        Ok(StructureCounts {
+            commits: visible_count(self.commits.len()?, self.open_commit.is_some(), "commit")?,
+            files: visible_count(self.files.len()?, self.open_file.is_some(), "file")?,
+            hunks: visible_count(self.hunks.len()?, self.open_hunk.is_some(), "hunk")?,
         })
     }
 
@@ -1030,20 +1139,13 @@ impl StructureBuilder {
         let commit_high_water = self.commits.len()?;
         let file_high_water = self.files.len()?;
         let hunk_high_water = self.hunks.len()?;
-        let bounds_high_water = self.file_bounds.len()?;
-        if file_high_water != bounds_high_water {
-            return Err(StructureStoreError::FileBoundsOutOfSync {
-                files: file_high_water,
-                bounds: bounds_high_water,
-            });
-        }
         validate_open_overlay(
             commit_high_water,
             file_high_water,
             hunk_high_water,
-            self.open_commit.as_ref(),
-            self.open_file.as_ref(),
-            self.open_hunk.as_ref(),
+            self.open_commit.as_deref(),
+            self.open_file.as_deref(),
+            self.open_hunk.as_deref(),
         )
     }
 
@@ -1061,14 +1163,11 @@ impl StructureBuilder {
         &mut self,
         file: &OpenFile,
         mut record: FileRecord,
-        bounds: FileBoundsRecord,
     ) -> Result<(), StructureStoreError> {
         record.old_path = append_optional_blob(&self.blobs, file.old_path.as_deref())?;
         record.new_path = append_optional_blob(&self.blobs, file.new_path.as_deref())?;
         let file_id = self.files.append(&record)?;
-        validate_append_identity("file", file.id.get(), file_id)?;
-        let bounds_id = self.file_bounds.append(&bounds)?;
-        validate_append_identity("file bounds", file.id.get(), bounds_id)
+        validate_append_identity("file", file.id.get(), file_id)
     }
 
     fn append_finalized_commit(
@@ -1089,14 +1188,13 @@ pub struct StructureSnapshot {
     commits: SpillTable<CommitRecord>,
     files: SpillTable<FileRecord>,
     hunks: SpillTable<HunkRecord>,
-    file_bounds: SpillTable<FileBoundsRecord>,
     blobs: BlobArena,
     commit_high_water: u64,
     file_high_water: u64,
     hunk_high_water: u64,
-    open_commit: Option<OpenCommit>,
-    open_file: Option<OpenFile>,
-    open_hunk: Option<OpenHunk>,
+    open_commit: Option<Arc<OpenCommit>>,
+    open_file: Option<Arc<OpenFile>>,
+    open_hunk: Option<Arc<OpenHunk>>,
 }
 
 impl StructureSnapshot {
@@ -1136,22 +1234,70 @@ impl StructureSnapshot {
         self.hunk_high_water + self.open_hunk.is_some() as u64
     }
 
+    /// Open overlayを含む可視件数をoverflow検査付きで返す。
+    pub fn visible_counts(&self) -> Result<StructureCounts, StructureStoreError> {
+        Ok(StructureCounts {
+            commits: visible_count(self.commit_high_water, self.open_commit.is_some(), "commit")?,
+            files: visible_count(self.file_high_water, self.open_file.is_some(), "file")?,
+            hunks: visible_count(self.hunk_high_water, self.open_hunk.is_some(), "hunk")?,
+        })
+    }
+
+    /// Snapshot内の0始まりordinalをstable commit IDへ写す。
+    ///
+    /// Finalized tableに続くopen overlayも1件として数える。Ordinalが可視件数以上なら`None`であり、
+    /// `u64::MAX`を加算しないため境界入力でもoverflowしない。
+    #[must_use]
+    pub const fn commit_id_at(&self, ordinal: u64) -> Option<CommitId> {
+        if ordinal < self.commit_high_water
+            || (ordinal == self.commit_high_water && self.open_commit.is_some())
+        {
+            Some(CommitId::new(ordinal))
+        } else {
+            None
+        }
+    }
+
+    /// Snapshot内の0始まりordinalをstable file IDへ写す。Open overlayも可視件数に含む。
+    #[must_use]
+    pub const fn file_id_at(&self, ordinal: u64) -> Option<FileId> {
+        if ordinal < self.file_high_water
+            || (ordinal == self.file_high_water && self.open_file.is_some())
+        {
+            Some(FileId::new(ordinal))
+        } else {
+            None
+        }
+    }
+
+    /// Snapshot内の0始まりordinalをstable hunk IDへ写す。Open overlayも可視件数に含む。
+    #[must_use]
+    pub const fn hunk_id_at(&self, ordinal: u64) -> Option<HunkId> {
+        if ordinal < self.hunk_high_water
+            || (ordinal == self.hunk_high_water && self.open_hunk.is_some())
+        {
+            Some(HunkId::new(ordinal))
+        } else {
+            None
+        }
+    }
+
     /// Snapshot取得時にopenだったcommit。Table high-water markと同じIDを持つ。
     #[must_use]
-    pub const fn open_commit(&self) -> Option<&OpenCommit> {
-        self.open_commit.as_ref()
+    pub fn open_commit(&self) -> Option<&OpenCommit> {
+        self.open_commit.as_deref()
     }
 
     /// Snapshot取得時にopenだったfile。Table high-water markと同じIDを持つ。
     #[must_use]
-    pub const fn open_file(&self) -> Option<&OpenFile> {
-        self.open_file.as_ref()
+    pub fn open_file(&self) -> Option<&OpenFile> {
+        self.open_file.as_deref()
     }
 
     /// Snapshot取得時にopenだったhunk。Table high-water markと同じIDを持つ。
     #[must_use]
-    pub const fn open_hunk(&self) -> Option<&OpenHunk> {
-        self.open_hunk.as_ref()
+    pub fn open_hunk(&self) -> Option<&OpenHunk> {
+        self.open_hunk.as_deref()
     }
 
     /// File grammarを1件も検出していないsnapshotかを返す。
@@ -1178,6 +1324,19 @@ impl fmt::Debug for StructureSnapshot {
     }
 }
 
+/// Metadata readerがdecodeしたfixed record件数。
+///
+/// Seekの計算量と親metadata再利用をtestから観測するdiagnosticであり、I/O byte数ではない。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StructureReadStats {
+    /// Finalized commit recordをdecodeした回数。Open overlay参照は含めない。
+    pub commit_records: u64,
+    /// Finalized file recordをdecodeした回数。Open overlay参照は含めない。
+    pub file_records: u64,
+    /// Finalized hunk recordをdecodeした回数。Open overlay参照は含めない。
+    pub hunk_records: u64,
+}
+
 /// Fixed recordだけをcaller-owned bufferへdecodeする再利用可能reader。
 ///
 /// Commit subject、object ID、file pathが不要なline参照検証とnavigation向けのreaderであり、
@@ -1189,8 +1348,8 @@ pub struct StructureMetadataReader {
     commit_record: Vec<u8>,
     file_record: Vec<u8>,
     hunk_record: Vec<u8>,
-    bounds_record: Vec<u8>,
     parent_record: Vec<u8>,
+    stats: StructureReadStats,
 }
 
 impl StructureMetadataReader {
@@ -1201,9 +1360,24 @@ impl StructureMetadataReader {
             commit_record: Vec::new(),
             file_record: Vec::new(),
             hunk_record: Vec::new(),
-            bounds_record: Vec::new(),
             parent_record: Vec::new(),
+            stats: StructureReadStats {
+                commit_records: 0,
+                file_records: 0,
+                hunk_records: 0,
+            },
         }
+    }
+
+    /// Reader作成後または直近reset後のfixed-record decode回数を返す。
+    #[must_use]
+    pub const fn statistics(&self) -> StructureReadStats {
+        self.stats
+    }
+
+    /// Decode回数だけを0へ戻し、再利用bufferは保持する。
+    pub fn reset_statistics(&mut self) {
+        self.stats = StructureReadStats::default();
     }
 
     /// Stable commit IDをblob I/Oなしで読む。Snapshot外のIDは`Ok(None)`となる。
@@ -1228,6 +1402,7 @@ impl StructureMetadataReader {
         if id.get() > snapshot.commit_high_water {
             return Ok(None);
         }
+        self.stats.commit_records = self.stats.commit_records.saturating_add(1);
         let Some(record) = snapshot
             .commits
             .get_with_buffer(id.get(), &mut self.commit_record)?
@@ -1256,11 +1431,39 @@ impl StructureMetadataReader {
         snapshot: &StructureSnapshot,
         id: FileId,
     ) -> Result<Option<StoredFileMetadata>, StructureStoreError> {
+        let Some(file) = self.read_file_without_parent(snapshot, id)? else {
+            return Ok(None);
+        };
+        validate_file_parent(snapshot, file.id, file.commit_id, &mut self.parent_record)?;
+        Ok(Some(file))
+    }
+
+    /// Callerが直前に同じsnapshotから読んだ親commitを再利用してfileを読む。
+    ///
+    /// `parent`は同じ`StructureSnapshot`の[`Self::read_commit`]結果でなければならない。この前提を
+    /// 課すことで逐次走査中に親recordを子ごとにdecodeせず、ID・可視世代・child rangeだけを検証する。
+    pub(crate) fn read_file_in_commit(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        id: FileId,
+        parent: StoredCommitMetadata,
+    ) -> Result<Option<StoredFileMetadata>, StructureStoreError> {
+        let Some(file) = self.read_file_without_parent(snapshot, id)? else {
+            return Ok(None);
+        };
+        validate_supplied_commit_parent(snapshot, file.id, file.commit_id, parent)?;
+        Ok(Some(file))
+    }
+
+    fn read_file_without_parent(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        id: FileId,
+    ) -> Result<Option<StoredFileMetadata>, StructureStoreError> {
         if id.get() == snapshot.file_high_water {
             let Some(file) = snapshot.open_file.as_ref().filter(|value| value.id == id) else {
                 return Ok(None);
             };
-            validate_file_parent(snapshot, file.id, file.commit_id, &mut self.parent_record)?;
             return Ok(Some(StoredFileMetadata {
                 id: file.id,
                 commit_id: file.commit_id,
@@ -1270,12 +1473,14 @@ impl StructureMetadataReader {
                 hunks: file.hunks,
                 additions: file.additions,
                 deletions: file.deletions,
+                line_bounds: file.line_bounds,
                 finalized: false,
             }));
         }
         if id.get() > snapshot.file_high_water {
             return Ok(None);
         }
+        self.stats.file_records = self.stats.file_records.saturating_add(1);
         let Some(record) = snapshot
             .files
             .get_with_buffer(id.get(), &mut self.file_record)?
@@ -1284,7 +1489,6 @@ impl StructureMetadataReader {
         };
         validate_identity("file", id.get(), record.id)?;
         let commit_id = CommitId::new(record.commit_id);
-        validate_file_parent(snapshot, id, commit_id, &mut self.parent_record)?;
         validate_child_high_water(
             "file",
             id.get(),
@@ -1300,6 +1504,7 @@ impl StructureMetadataReader {
             hunks: record.hunks,
             additions: record.additions,
             deletions: record.deletions,
+            line_bounds: record.line_bounds,
             finalized: true,
         }))
     }
@@ -1310,11 +1515,39 @@ impl StructureMetadataReader {
         snapshot: &StructureSnapshot,
         id: HunkId,
     ) -> Result<Option<StoredHunk>, StructureStoreError> {
+        let Some(hunk) = self.read_hunk_without_parent(snapshot, id)? else {
+            return Ok(None);
+        };
+        validate_hunk_parent(snapshot, hunk.id, hunk.file_id, &mut self.parent_record)?;
+        Ok(Some(hunk))
+    }
+
+    /// Callerが直前に同じsnapshotから読んだ親fileを再利用してhunkを読む。
+    ///
+    /// `parent`は同じ`StructureSnapshot`の[`Self::read_file`]または
+    /// [`Self::read_file_in_commit`]結果でなければならない。親recordはこの呼び出しではdecodeしない。
+    pub(crate) fn read_hunk_in_file(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        id: HunkId,
+        parent: StoredFileMetadata,
+    ) -> Result<Option<StoredHunk>, StructureStoreError> {
+        let Some(hunk) = self.read_hunk_without_parent(snapshot, id)? else {
+            return Ok(None);
+        };
+        validate_supplied_file_parent(snapshot, hunk.id, hunk.file_id, parent)?;
+        Ok(Some(hunk))
+    }
+
+    fn read_hunk_without_parent(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        id: HunkId,
+    ) -> Result<Option<StoredHunk>, StructureStoreError> {
         if id.get() == snapshot.hunk_high_water {
             let Some(hunk) = snapshot.open_hunk.as_ref().filter(|value| value.id == id) else {
                 return Ok(None);
             };
-            validate_hunk_parent(snapshot, hunk.id, hunk.file_id, &mut self.parent_record)?;
             return Ok(Some(StoredHunk {
                 id: hunk.id,
                 file_id: hunk.file_id,
@@ -1329,6 +1562,7 @@ impl StructureMetadataReader {
         if id.get() > snapshot.hunk_high_water {
             return Ok(None);
         }
+        self.stats.hunk_records = self.stats.hunk_records.saturating_add(1);
         let Some(record) = snapshot
             .hunks
             .get_with_buffer(id.get(), &mut self.hunk_record)?
@@ -1337,7 +1571,6 @@ impl StructureMetadataReader {
         };
         validate_identity("hunk", id.get(), record.id)?;
         let file_id = FileId::new(record.file_id);
-        validate_hunk_parent(snapshot, id, file_id, &mut self.parent_record)?;
         Ok(Some(StoredHunk {
             id,
             file_id,
@@ -1350,31 +1583,282 @@ impl StructureMetadataReader {
         }))
     }
 
-    /// Stable file IDのgutter boundsをblob I/Oなしで返す。Open fileではoverlay値を返す。
-    pub fn read_file_bounds(
+    /// `span.start >= line`となる最初のcommit cursorを返す。末尾ではcommit件数と等しい。
+    pub fn commit_lower_bound(
         &mut self,
         snapshot: &StructureSnapshot,
-        id: FileId,
-    ) -> Result<Option<StructureFileLineBounds>, StructureStoreError> {
-        if id.get() == snapshot.file_high_water {
-            return Ok(snapshot
-                .open_file
-                .as_ref()
-                .filter(|file| file.id == id)
-                .map(|file| file.line_bounds));
-        }
-        if id.get() > snapshot.file_high_water {
-            return Ok(None);
-        }
-        let Some(record) = snapshot
-            .file_bounds
-            .get_with_buffer(id.get(), &mut self.bounds_record)?
-        else {
-            return Ok(None);
-        };
-        validate_identity("file bounds", id.get(), record.file_id)?;
-        Ok(Some(record.bounds))
+        line: u64,
+    ) -> Result<u64, StructureStoreError> {
+        let count = snapshot.visible_counts()?.commits;
+        let mut span_at = |reader: &mut Self, index| reader.commit_span_at(snapshot, index);
+        self.bound_by_start(count, line, false, &mut span_at)
     }
+
+    /// `span.start > line`となる最初のcommit cursorを返す。末尾ではcommit件数と等しい。
+    pub fn commit_upper_bound(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+    ) -> Result<u64, StructureStoreError> {
+        let count = snapshot.visible_counts()?.commits;
+        let mut span_at = |reader: &mut Self, index| reader.commit_span_at(snapshot, index);
+        self.bound_by_start(count, line, true, &mut span_at)
+    }
+
+    /// `span.start >= line`となる最初のfile cursorを返す。末尾ではfile件数と等しい。
+    pub fn file_lower_bound(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+    ) -> Result<u64, StructureStoreError> {
+        let count = snapshot.visible_counts()?.files;
+        let mut span_at = |reader: &mut Self, index| reader.file_span_at(snapshot, index);
+        self.bound_by_start(count, line, false, &mut span_at)
+    }
+
+    /// `span.start > line`となる最初のfile cursorを返す。末尾ではfile件数と等しい。
+    pub fn file_upper_bound(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+    ) -> Result<u64, StructureStoreError> {
+        let count = snapshot.visible_counts()?.files;
+        let mut span_at = |reader: &mut Self, index| reader.file_span_at(snapshot, index);
+        self.bound_by_start(count, line, true, &mut span_at)
+    }
+
+    /// `span.start >= line`となる最初のhunk cursorを返す。末尾ではhunk件数と等しい。
+    pub fn hunk_lower_bound(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+    ) -> Result<u64, StructureStoreError> {
+        let count = snapshot.visible_counts()?.hunks;
+        let mut span_at = |reader: &mut Self, index| reader.hunk_span_at(snapshot, index);
+        self.bound_by_start(count, line, false, &mut span_at)
+    }
+
+    /// `span.start > line`となる最初のhunk cursorを返す。末尾ではhunk件数と等しい。
+    pub fn hunk_upper_bound(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+    ) -> Result<u64, StructureStoreError> {
+        let count = snapshot.visible_counts()?.hunks;
+        let mut span_at = |reader: &mut Self, index| reader.hunk_span_at(snapshot, index);
+        self.bound_by_start(count, line, true, &mut span_at)
+    }
+
+    /// `line`より前に開始する`nth`件目のcommitを返す。`nth=1`が直前である。
+    pub fn nth_commit_before(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+        nth: NonZeroU64,
+    ) -> Result<Option<CommitId>, StructureStoreError> {
+        Ok(self
+            .commit_lower_bound(snapshot, line)?
+            .checked_sub(nth.get())
+            .map(CommitId::new))
+    }
+
+    /// `line`より後に開始する`nth`件目のcommitを返す。`nth=1`が直後である。
+    pub fn nth_commit_after(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+        nth: NonZeroU64,
+    ) -> Result<Option<CommitId>, StructureStoreError> {
+        let count = snapshot.visible_counts()?.commits;
+        Ok(
+            nth_after_cursor(self.commit_upper_bound(snapshot, line)?, count, nth)
+                .map(CommitId::new),
+        )
+    }
+
+    /// `line`より前に開始する`nth`件目のfileを返す。`nth=1`が直前である。
+    pub fn nth_file_before(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+        nth: NonZeroU64,
+    ) -> Result<Option<FileId>, StructureStoreError> {
+        Ok(self
+            .file_lower_bound(snapshot, line)?
+            .checked_sub(nth.get())
+            .map(FileId::new))
+    }
+
+    /// `line`より後に開始する`nth`件目のfileを返す。`nth=1`が直後である。
+    pub fn nth_file_after(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+        nth: NonZeroU64,
+    ) -> Result<Option<FileId>, StructureStoreError> {
+        let count = snapshot.visible_counts()?.files;
+        Ok(nth_after_cursor(self.file_upper_bound(snapshot, line)?, count, nth).map(FileId::new))
+    }
+
+    /// `line`より前に開始する`nth`件目のhunkを返す。`nth=1`が直前である。
+    pub fn nth_hunk_before(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+        nth: NonZeroU64,
+    ) -> Result<Option<HunkId>, StructureStoreError> {
+        Ok(self
+            .hunk_lower_bound(snapshot, line)?
+            .checked_sub(nth.get())
+            .map(HunkId::new))
+    }
+
+    /// `line`より後に開始する`nth`件目のhunkを返す。`nth=1`が直後である。
+    pub fn nth_hunk_after(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        line: u64,
+        nth: NonZeroU64,
+    ) -> Result<Option<HunkId>, StructureStoreError> {
+        let count = snapshot.visible_counts()?.hunks;
+        Ok(nth_after_cursor(self.hunk_upper_bound(snapshot, line)?, count, nth).map(HunkId::new))
+    }
+
+    /// `lines`と交差するcommitの半開cursor範囲を返す。
+    pub fn commits_intersecting(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        lines: Range<u64>,
+    ) -> Result<Range<u64>, StructureStoreError> {
+        let count = snapshot.visible_counts()?.commits;
+        let mut span_at = |reader: &mut Self, index| reader.commit_span_at(snapshot, index);
+        self.intersecting_cursors(count, lines, &mut span_at)
+    }
+
+    /// `lines`と交差するfileをstable ID範囲で返す。空でも挿入cursorを保持する。
+    pub fn files_intersecting(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        lines: Range<u64>,
+    ) -> Result<FileIdRange, StructureStoreError> {
+        let count = snapshot.visible_counts()?.files;
+        let mut span_at = |reader: &mut Self, index| reader.file_span_at(snapshot, index);
+        let cursors = self.intersecting_cursors(count, lines, &mut span_at)?;
+        Ok(FileIdRange {
+            start: cursors.start,
+            count: cursors.end - cursors.start,
+        })
+    }
+
+    /// `lines`と交差するhunkをstable ID範囲で返す。空でも挿入cursorを保持する。
+    pub fn hunks_intersecting(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        lines: Range<u64>,
+    ) -> Result<HunkIdRange, StructureStoreError> {
+        let count = snapshot.visible_counts()?.hunks;
+        let mut span_at = |reader: &mut Self, index| reader.hunk_span_at(snapshot, index);
+        let cursors = self.intersecting_cursors(count, lines, &mut span_at)?;
+        Ok(HunkIdRange {
+            start: cursors.start,
+            count: cursors.end - cursors.start,
+        })
+    }
+
+    fn commit_span_at(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        index: u64,
+    ) -> Result<LineSpan, StructureStoreError> {
+        self.read_commit(snapshot, CommitId::new(index))?
+            .map(|value| value.span)
+            .ok_or(StructureStoreError::OutsideSnapshot {
+                kind: "commit",
+                id: index,
+                high_water: snapshot.commit_count(),
+            })
+    }
+
+    fn file_span_at(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        index: u64,
+    ) -> Result<LineSpan, StructureStoreError> {
+        self.read_file_without_parent(snapshot, FileId::new(index))?
+            .map(|value| value.span)
+            .ok_or(StructureStoreError::OutsideSnapshot {
+                kind: "file",
+                id: index,
+                high_water: snapshot.file_count(),
+            })
+    }
+
+    fn hunk_span_at(
+        &mut self,
+        snapshot: &StructureSnapshot,
+        index: u64,
+    ) -> Result<LineSpan, StructureStoreError> {
+        self.read_hunk_without_parent(snapshot, HunkId::new(index))?
+            .map(|value| value.span)
+            .ok_or(StructureStoreError::OutsideSnapshot {
+                kind: "hunk",
+                id: index,
+                high_water: snapshot.hunk_count(),
+            })
+    }
+
+    fn bound_by_start<F>(
+        &mut self,
+        count: u64,
+        line: u64,
+        strict: bool,
+        span_at: &mut F,
+    ) -> Result<u64, StructureStoreError>
+    where
+        F: FnMut(&mut Self, u64) -> Result<LineSpan, StructureStoreError>,
+    {
+        let mut low = 0;
+        let mut high = count;
+        while low < high {
+            let middle = low + (high - low) / 2;
+            let start = span_at(self, middle)?.start.get();
+            if start < line || (strict && start == line) {
+                low = middle + 1;
+            } else {
+                high = middle;
+            }
+        }
+        Ok(low)
+    }
+
+    fn intersecting_cursors<F>(
+        &mut self,
+        count: u64,
+        lines: Range<u64>,
+        span_at: &mut F,
+    ) -> Result<Range<u64>, StructureStoreError>
+    where
+        F: FnMut(&mut Self, u64) -> Result<LineSpan, StructureStoreError>,
+    {
+        let mut start = self.bound_by_start(count, lines.start, false, span_at)?;
+        if lines.is_empty() {
+            return Ok(start..start);
+        }
+        if start > 0 {
+            let previous = span_at(self, start - 1)?;
+            if previous.end_exclusive.is_none_or(|end| end > lines.start) {
+                start -= 1;
+            }
+        }
+        let end = self.bound_by_start(count, lines.end, false, span_at)?;
+        Ok(start..end.max(start))
+    }
+}
+
+fn nth_after_cursor(cursor: u64, count: u64, nth: NonZeroU64) -> Option<u64> {
+    cursor
+        .checked_add(nth.get() - 1)
+        .filter(|index| *index < count)
 }
 
 /// Fixed recordとblob stringをcaller-owned bufferへdecodeする再利用可能reader。
@@ -1386,7 +1870,6 @@ pub struct StructureReader {
     commit_record: Vec<u8>,
     file_record: Vec<u8>,
     hunk_record: Vec<u8>,
-    bounds_record: Vec<u8>,
     parent_record: Vec<u8>,
     first_string: Vec<u8>,
     second_string: Vec<u8>,
@@ -1400,7 +1883,6 @@ impl StructureReader {
             commit_record: Vec::new(),
             file_record: Vec::new(),
             hunk_record: Vec::new(),
-            bounds_record: Vec::new(),
             parent_record: Vec::new(),
             first_string: Vec::new(),
             second_string: Vec::new(),
@@ -1481,6 +1963,7 @@ impl StructureReader {
                 hunks: file.hunks,
                 additions: file.additions,
                 deletions: file.deletions,
+                line_bounds: file.line_bounds,
                 finalized: false,
             }));
         }
@@ -1517,6 +2000,75 @@ impl StructureReader {
             hunks: record.hunks,
             additions: record.additions,
             deletions: record.deletions,
+            line_bounds: record.line_bounds,
+            finalized: true,
+        }))
+    }
+
+    /// Callerが同じsnapshotから読んだ親commit metadataを再利用してfileを読む。
+    ///
+    /// `parent`は[`Self::read_commit`]の戻り値を[`StoredCommitRef::metadata`]で変換した値でなければ
+    /// ならない。Parent tableを再decodeしないため、同一commit内のfile逐次走査に使う。
+    pub(crate) fn read_file_in_commit<'a>(
+        &'a mut self,
+        snapshot: &'a StructureSnapshot,
+        id: FileId,
+        parent: StoredCommitMetadata,
+    ) -> Result<Option<StoredFileRef<'a>>, StructureStoreError> {
+        if id.get() == snapshot.file_high_water {
+            let Some(file) = snapshot.open_file.as_ref().filter(|value| value.id == id) else {
+                return Ok(None);
+            };
+            validate_supplied_commit_parent(snapshot, file.id, file.commit_id, parent)?;
+            return Ok(Some(StoredFileRef {
+                id: file.id,
+                commit_id: file.commit_id,
+                old_path: file.old_path.as_deref(),
+                new_path: file.new_path.as_deref(),
+                status: file.status,
+                mode: file.mode,
+                span: file.span,
+                hunks: file.hunks,
+                additions: file.additions,
+                deletions: file.deletions,
+                line_bounds: file.line_bounds,
+                finalized: false,
+            }));
+        }
+        if id.get() > snapshot.file_high_water {
+            return Ok(None);
+        }
+        let Some(record) = snapshot
+            .files
+            .get_with_buffer(id.get(), &mut self.file_record)?
+        else {
+            return Ok(None);
+        };
+        validate_identity("file", id.get(), record.id)?;
+        let commit_id = CommitId::new(record.commit_id);
+        validate_supplied_commit_parent(snapshot, id, commit_id, parent)?;
+        validate_child_high_water(
+            "file",
+            id.get(),
+            record.hunks.end_exclusive(),
+            snapshot.hunk_count(),
+        )?;
+        read_optional_blob(&snapshot.blobs, record.old_path, &mut self.first_string)?;
+        read_optional_blob(&snapshot.blobs, record.new_path, &mut self.second_string)?;
+        let old_path = optional_utf8(record.old_path, &self.first_string, "old path")?;
+        let new_path = optional_utf8(record.new_path, &self.second_string, "new path")?;
+        Ok(Some(StoredFileRef {
+            id,
+            commit_id,
+            old_path,
+            new_path,
+            status: record.status,
+            mode: record.mode,
+            span: record.span.as_line_span(),
+            hunks: record.hunks,
+            additions: record.additions,
+            deletions: record.deletions,
+            line_bounds: record.line_bounds,
             finalized: true,
         }))
     }
@@ -1567,30 +2119,61 @@ impl StructureReader {
         }))
     }
 
-    /// Stable file IDのgutter boundsを返す。Open fileではoverlay値を返す。
-    pub fn read_file_bounds(
+    /// Callerが同じsnapshotから読んだ親file metadataを再利用してhunkを読む。
+    ///
+    /// `parent`は[`Self::read_file`]または[`Self::read_file_in_commit`]の戻り値を
+    /// [`StoredFileRef::metadata`]で変換した値でなければならない。Parent tableはdecodeしない。
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "同一snapshotの親metadataを再利用するcrate内境界として保持する"
+        )
+    )]
+    pub(crate) fn read_hunk_in_file(
         &mut self,
         snapshot: &StructureSnapshot,
-        id: FileId,
-    ) -> Result<Option<StructureFileLineBounds>, StructureStoreError> {
-        if id.get() == snapshot.file_high_water {
-            return Ok(snapshot
-                .open_file
-                .as_ref()
-                .filter(|file| file.id == id)
-                .map(|file| file.line_bounds));
+        id: HunkId,
+        parent: StoredFileMetadata,
+    ) -> Result<Option<StoredHunk>, StructureStoreError> {
+        if id.get() == snapshot.hunk_high_water {
+            let Some(hunk) = snapshot.open_hunk.as_ref().filter(|value| value.id == id) else {
+                return Ok(None);
+            };
+            validate_supplied_file_parent(snapshot, hunk.id, hunk.file_id, parent)?;
+            return Ok(Some(StoredHunk {
+                id: hunk.id,
+                file_id: hunk.file_id,
+                kind: hunk.kind,
+                header_line: hunk.header_line,
+                span: hunk.span,
+                old_range: hunk.old_range,
+                new_range: hunk.new_range,
+                finalized: false,
+            }));
         }
-        if id.get() > snapshot.file_high_water {
+        if id.get() > snapshot.hunk_high_water {
             return Ok(None);
         }
         let Some(record) = snapshot
-            .file_bounds
-            .get_with_buffer(id.get(), &mut self.bounds_record)?
+            .hunks
+            .get_with_buffer(id.get(), &mut self.hunk_record)?
         else {
             return Ok(None);
         };
-        validate_identity("file bounds", id.get(), record.file_id)?;
-        Ok(Some(record.bounds))
+        validate_identity("hunk", id.get(), record.id)?;
+        let file_id = FileId::new(record.file_id);
+        validate_supplied_file_parent(snapshot, id, file_id, parent)?;
+        Ok(Some(StoredHunk {
+            id,
+            file_id,
+            kind: record.kind,
+            header_line: LineId::new(record.header_line),
+            span: record.span.as_line_span(),
+            old_range: record.old_range,
+            new_range: record.new_range,
+            finalized: true,
+        }))
     }
 }
 
@@ -1601,12 +2184,9 @@ struct ClosedLineSpan {
 }
 
 impl ClosedLineSpan {
-    fn from_open(kind: &'static str, id: u64, span: LineSpan) -> Result<Self, StructureStoreError> {
+    fn close(span: LineSpan, end_exclusive: u64) -> Result<Self, StructureStoreError> {
         validate_id("line", span.start.get())?;
-        let end_exclusive = span
-            .end_exclusive
-            .ok_or(StructureStoreError::UnclosedSpan { kind, id })?;
-        if end_exclusive < span.start.get() {
+        if end_exclusive <= span.start.get() {
             return Err(StructureStoreError::InvalidLineSpan {
                 start: span.start.get(),
                 end: end_exclusive,
@@ -1727,6 +2307,7 @@ struct CommitRecord {
 impl CommitRecord {
     fn from_open(
         commit: &OpenCommit,
+        end_exclusive: u64,
         object_id: PackedBlobRef,
         subject: PackedBlobRef,
     ) -> Result<Self, StructureStoreError> {
@@ -1735,7 +2316,7 @@ impl CommitRecord {
         Ok(Self {
             id: commit.id.get(),
             kind: commit.kind,
-            span: ClosedLineSpan::from_open("commit", commit.id.get(), commit.span)?,
+            span: ClosedLineSpan::close(commit.span, end_exclusive)?,
             files: commit.files,
             object_id,
             subject,
@@ -1801,11 +2382,13 @@ struct FileRecord {
     new_path: PackedBlobRef,
     status: ChangeStatus,
     mode: FileMode,
+    line_bounds: StructureFileLineBounds,
 }
 
 impl FileRecord {
     fn from_open(
         file: &OpenFile,
+        end_exclusive: u64,
         old_path: PackedBlobRef,
         new_path: PackedBlobRef,
     ) -> Result<Self, StructureStoreError> {
@@ -1814,11 +2397,19 @@ impl FileRecord {
         validate_hunk_range(file.hunks)?;
         validate_optional_u64("additions", file.additions)?;
         validate_optional_u64("deletions", file.deletions)?;
+        validate_optional_u64(
+            "maximum old line number",
+            file.line_bounds.max_old_line_number,
+        )?;
+        validate_optional_u64(
+            "maximum new line number",
+            file.line_bounds.max_new_line_number,
+        )?;
         validate_file_counts(file.id.get(), file.mode, file.additions, file.deletions)?;
         Ok(Self {
             id: file.id.get(),
             commit_id: file.commit_id.get(),
-            span: ClosedLineSpan::from_open("file", file.id.get(), file.span)?,
+            span: ClosedLineSpan::close(file.span, end_exclusive)?,
             hunks: file.hunks,
             additions: file.additions,
             deletions: file.deletions,
@@ -1826,6 +2417,7 @@ impl FileRecord {
             new_path,
             status: file.status,
             mode: file.mode,
+            line_bounds: file.line_bounds,
         })
     }
 }
@@ -1846,6 +2438,14 @@ impl FixedRecord for FileRecord {
         validate_optional_codec(self.additions, "additions uses reserved sentinel")?;
         validate_optional_codec(self.deletions, "deletions uses reserved sentinel")?;
         validate_file_counts_codec(self.mode, self.additions, self.deletions)?;
+        validate_optional_codec(
+            self.line_bounds.max_old_line_number,
+            "maximum old line uses reserved sentinel",
+        )?;
+        validate_optional_codec(
+            self.line_bounds.max_new_line_number,
+            "maximum new line uses reserved sentinel",
+        )?;
         output.fill(0);
         put_u64(output, 0, self.id)?;
         put_u64(output, 8, self.commit_id)?;
@@ -1858,12 +2458,22 @@ impl FixedRecord for FileRecord {
         self.new_path.encode(&mut output[88..112])?;
         output[112] = encode_change_status(self.status);
         output[113] = encode_file_mode(self.mode);
-        Ok(())
+        put_u64(
+            output,
+            120,
+            encode_optional_u64(self.line_bounds.max_old_line_number),
+        )?;
+        put_u64(
+            output,
+            128,
+            encode_optional_u64(self.line_bounds.max_new_line_number),
+        )
     }
 
     fn decode(input: &[u8]) -> Result<Self, RecordCodecError> {
         require_width(input, Self::ENCODED_LEN, "invalid file record input width")?;
         require_zero(&input[114..120], "non-zero file reserved bytes")?;
+        require_zero(&input[136..144], "non-zero file trailing reserved bytes")?;
         let value = Self {
             id: get_u64(input, 0)?,
             commit_id: get_u64(input, 8)?,
@@ -1878,11 +2488,23 @@ impl FixedRecord for FileRecord {
             new_path: PackedBlobRef::decode(&input[88..112])?,
             status: decode_change_status(input[112])?,
             mode: decode_file_mode(input[113])?,
+            line_bounds: StructureFileLineBounds {
+                max_old_line_number: decode_optional_u64(get_u64(input, 120)?),
+                max_new_line_number: decode_optional_u64(get_u64(input, 128)?),
+            },
         };
         validate_id_codec(value.id, "file ID uses reserved sentinel")?;
         validate_id_codec(value.commit_id, "commit ID uses reserved sentinel")?;
         validate_closed_span_codec(value.span)?;
         validate_file_counts_codec(value.mode, value.additions, value.deletions)?;
+        validate_optional_codec(
+            value.line_bounds.max_old_line_number,
+            "maximum old line uses reserved sentinel",
+        )?;
+        validate_optional_codec(
+            value.line_bounds.max_new_line_number,
+            "maximum new line uses reserved sentinel",
+        )?;
         Ok(value)
     }
 }
@@ -1899,7 +2521,7 @@ struct HunkRecord {
 }
 
 impl HunkRecord {
-    fn from_open(hunk: &OpenHunk) -> Result<Self, StructureStoreError> {
+    fn from_open(hunk: &OpenHunk, end_exclusive: u64) -> Result<Self, StructureStoreError> {
         validate_id("hunk", hunk.id.get())?;
         validate_id("file", hunk.file_id.get())?;
         validate_id("line", hunk.header_line.get())?;
@@ -1908,7 +2530,7 @@ impl HunkRecord {
             id: hunk.id.get(),
             file_id: hunk.file_id.get(),
             header_line: hunk.header_line.get(),
-            span: ClosedLineSpan::from_open("hunk", hunk.id.get(), hunk.span)?,
+            span: ClosedLineSpan::close(hunk.span, end_exclusive)?,
             kind: hunk.kind,
             old_range: hunk.old_range,
             new_range: hunk.new_range,
@@ -1987,73 +2609,6 @@ impl FixedRecord for HunkRecord {
                 "hunk header line does not match span start",
             ));
         }
-        Ok(value)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FileBoundsRecord {
-    file_id: u64,
-    bounds: StructureFileLineBounds,
-}
-
-impl FileBoundsRecord {
-    fn new(file_id: FileId, bounds: StructureFileLineBounds) -> Result<Self, StructureStoreError> {
-        validate_id("file", file_id.get())?;
-        validate_optional_u64("maximum old line number", bounds.max_old_line_number)?;
-        validate_optional_u64("maximum new line number", bounds.max_new_line_number)?;
-        Ok(Self {
-            file_id: file_id.get(),
-            bounds,
-        })
-    }
-}
-
-impl FixedRecord for FileBoundsRecord {
-    const ENCODED_LEN: usize = FILE_BOUNDS_RECORD_BYTES;
-
-    fn encode(&self, output: &mut [u8]) -> Result<(), RecordCodecError> {
-        require_width(
-            output,
-            Self::ENCODED_LEN,
-            "invalid file bounds record output width",
-        )?;
-        validate_id_codec(self.file_id, "file ID uses reserved sentinel")?;
-        validate_optional_codec(
-            self.bounds.max_old_line_number,
-            "maximum old line uses reserved sentinel",
-        )?;
-        validate_optional_codec(
-            self.bounds.max_new_line_number,
-            "maximum new line uses reserved sentinel",
-        )?;
-        put_u64(output, 0, self.file_id)?;
-        put_u64(
-            output,
-            8,
-            encode_optional_u64(self.bounds.max_old_line_number),
-        )?;
-        put_u64(
-            output,
-            16,
-            encode_optional_u64(self.bounds.max_new_line_number),
-        )
-    }
-
-    fn decode(input: &[u8]) -> Result<Self, RecordCodecError> {
-        require_width(
-            input,
-            Self::ENCODED_LEN,
-            "invalid file bounds record input width",
-        )?;
-        let value = Self {
-            file_id: get_u64(input, 0)?,
-            bounds: StructureFileLineBounds {
-                max_old_line_number: decode_optional_u64(get_u64(input, 8)?),
-                max_new_line_number: decode_optional_u64(get_u64(input, 16)?),
-            },
-        };
-        validate_id_codec(value.file_id, "file ID uses reserved sentinel")?;
         Ok(value)
     }
 }
@@ -2273,6 +2828,90 @@ fn validate_hunk_parent(
     Ok(())
 }
 
+fn validate_supplied_commit_parent(
+    snapshot: &StructureSnapshot,
+    file_id: FileId,
+    commit_id: CommitId,
+    parent: StoredCommitMetadata,
+) -> Result<(), StructureStoreError> {
+    let parent_is_visible = if parent.id.get() < snapshot.commit_high_water {
+        parent.finalized
+    } else {
+        parent.id.get() == snapshot.commit_high_water
+            && !parent.finalized
+            && snapshot
+                .open_commit
+                .as_ref()
+                .is_some_and(|commit| commit.id == parent.id)
+    };
+    if parent.id != commit_id || !parent_is_visible {
+        return Err(StructureStoreError::InvalidParent {
+            child_kind: "file",
+            child_id: file_id.get(),
+            parent_kind: "commit",
+            parent_id: commit_id.get(),
+            parent_count: snapshot.commit_count(),
+        });
+    }
+    validate_child_high_water(
+        "commit",
+        parent.id.get(),
+        parent.files.end_exclusive(),
+        snapshot.file_count(),
+    )?;
+    if !parent.files.contains(file_id) {
+        return Err(StructureStoreError::ParentRangeMismatch {
+            parent_kind: "commit",
+            parent_id: parent.id.get(),
+            child_kind: "file",
+            child_id: file_id.get(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_supplied_file_parent(
+    snapshot: &StructureSnapshot,
+    hunk_id: HunkId,
+    file_id: FileId,
+    parent: StoredFileMetadata,
+) -> Result<(), StructureStoreError> {
+    let parent_is_visible = if parent.id.get() < snapshot.file_high_water {
+        parent.finalized
+    } else {
+        parent.id.get() == snapshot.file_high_water
+            && !parent.finalized
+            && snapshot
+                .open_file
+                .as_ref()
+                .is_some_and(|file| file.id == parent.id)
+    };
+    if parent.id != file_id || !parent_is_visible {
+        return Err(StructureStoreError::InvalidParent {
+            child_kind: "hunk",
+            child_id: hunk_id.get(),
+            parent_kind: "file",
+            parent_id: file_id.get(),
+            parent_count: snapshot.file_count(),
+        });
+    }
+    validate_child_high_water(
+        "file",
+        parent.id.get(),
+        parent.hunks.end_exclusive(),
+        snapshot.hunk_count(),
+    )?;
+    if !parent.hunks.contains(hunk_id) {
+        return Err(StructureStoreError::ParentRangeMismatch {
+            parent_kind: "file",
+            parent_id: parent.id.get(),
+            child_kind: "hunk",
+            child_id: hunk_id.get(),
+        });
+    }
+    Ok(())
+}
+
 fn append_optional_blob(
     arena: &BlobArena,
     value: Option<&str>,
@@ -2467,36 +3106,30 @@ fn checked_range_end(
         .ok_or(StructureStoreError::IdRangeOverflow { kind, first, count })
 }
 
+fn visible_count(
+    finalized: u64,
+    has_open: bool,
+    kind: &'static str,
+) -> Result<u64, StructureStoreError> {
+    finalized
+        .checked_add(u64::from(has_open))
+        .ok_or(StructureStoreError::IdRangeOverflow {
+            kind,
+            first: finalized,
+            count: u64::from(has_open),
+        })
+}
+
 fn validate_file_range(range: FileIdRange) -> Result<(), StructureStoreError> {
-    match (range.first, range.count) {
-        (None, 0) => Ok(()),
-        (Some(first), count) if count > 0 => {
-            validate_id("file", first.get())?;
-            let _ = checked_range_end("file", first.get(), count)?;
-            Ok(())
-        }
-        _ => Err(StructureStoreError::IdRangeOverflow {
-            kind: "file",
-            first: range.first.map_or(OPTIONAL_U64_NONE, FileId::get),
-            count: range.count,
-        }),
-    }
+    validate_id("file", range.start)?;
+    let _ = checked_range_end("file", range.start, range.count)?;
+    Ok(())
 }
 
 fn validate_hunk_range(range: HunkIdRange) -> Result<(), StructureStoreError> {
-    match (range.first, range.count) {
-        (None, 0) => Ok(()),
-        (Some(first), count) if count > 0 => {
-            validate_id("hunk", first.get())?;
-            let _ = checked_range_end("hunk", first.get(), count)?;
-            Ok(())
-        }
-        _ => Err(StructureStoreError::IdRangeOverflow {
-            kind: "hunk",
-            first: range.first.map_or(OPTIONAL_U64_NONE, HunkId::get),
-            count: range.count,
-        }),
-    }
+    validate_id("hunk", range.start)?;
+    let _ = checked_range_end("hunk", range.start, range.count)?;
+    Ok(())
 }
 
 fn validate_identity(
@@ -2619,41 +3252,31 @@ fn validate_hunk_ranges_codec(
 
 fn validate_closed_span_codec(span: ClosedLineSpan) -> Result<(), RecordCodecError> {
     validate_id_codec(span.start, "line start uses reserved sentinel")?;
-    if span.end_exclusive < span.start {
-        return Err(RecordCodecError::new("line span end precedes start"));
+    if span.end_exclusive <= span.start {
+        return Err(RecordCodecError::new(
+            "closed line span must contain at least one line",
+        ));
     }
     Ok(())
 }
 
 fn validate_file_range_codec(range: FileIdRange) -> Result<(), RecordCodecError> {
-    validate_encoded_range(
-        range.first.map(FileId::get),
-        range.count,
-        "invalid file child range",
-    )
+    validate_encoded_range(range.start, range.count, "invalid file child range")
 }
 
 fn validate_hunk_range_codec(range: HunkIdRange) -> Result<(), RecordCodecError> {
-    validate_encoded_range(
-        range.first.map(HunkId::get),
-        range.count,
-        "invalid hunk child range",
-    )
+    validate_encoded_range(range.start, range.count, "invalid hunk child range")
 }
 
 fn validate_encoded_range(
-    first: Option<u64>,
+    start: u64,
     count: u64,
     message: &'static str,
 ) -> Result<(), RecordCodecError> {
-    match (first, count) {
-        (None, 0) => Ok(()),
-        (Some(first), count)
-            if first != OPTIONAL_U64_NONE && count > 0 && first.checked_add(count).is_some() =>
-        {
-            Ok(())
-        }
-        _ => Err(RecordCodecError::new(message)),
+    if start != OPTIONAL_U64_NONE && start.checked_add(count).is_some() {
+        Ok(())
+    } else {
+        Err(RecordCodecError::new(message))
     }
 }
 
@@ -2663,18 +3286,13 @@ fn encode_file_range(
     offset: usize,
 ) -> Result<(), RecordCodecError> {
     validate_file_range_codec(range)?;
-    put_u64(
-        output,
-        offset,
-        range.first.map_or(OPTIONAL_U64_NONE, FileId::get),
-    )?;
+    put_u64(output, offset, range.start)?;
     put_u64(output, offset + 8, range.count)
 }
 
 fn decode_file_range(input: &[u8], offset: usize) -> Result<FileIdRange, RecordCodecError> {
-    let first = decode_optional_u64(get_u64(input, offset)?).map(FileId::new);
     let range = FileIdRange {
-        first,
+        start: get_u64(input, offset)?,
         count: get_u64(input, offset + 8)?,
     };
     validate_file_range_codec(range)?;
@@ -2687,18 +3305,13 @@ fn encode_hunk_range(
     offset: usize,
 ) -> Result<(), RecordCodecError> {
     validate_hunk_range_codec(range)?;
-    put_u64(
-        output,
-        offset,
-        range.first.map_or(OPTIONAL_U64_NONE, HunkId::get),
-    )?;
+    put_u64(output, offset, range.start)?;
     put_u64(output, offset + 8, range.count)
 }
 
 fn decode_hunk_range(input: &[u8], offset: usize) -> Result<HunkIdRange, RecordCodecError> {
-    let first = decode_optional_u64(get_u64(input, offset)?).map(HunkId::new);
     let range = HunkIdRange {
-        first,
+        start: get_u64(input, offset)?,
         count: get_u64(input, offset + 8)?,
     };
     validate_hunk_range_codec(range)?;
@@ -2933,6 +3546,13 @@ mod tests {
         assert_eq!(file.primary_path(), Some("src/new.rs"));
         assert_eq!(file.hunks.first(), Some(hunk_id));
         assert!(!file.finalized);
+        assert_eq!(
+            file.line_bounds,
+            StructureFileLineBounds {
+                max_old_line_number: Some(12),
+                max_new_line_number: Some(14),
+            }
+        );
         let hunk = reader.read_hunk(&open, hunk_id).unwrap().unwrap();
         assert_eq!(
             hunk.old_range,
@@ -2942,13 +3562,6 @@ mod tests {
             })
         );
         assert!(!hunk.finalized);
-        assert_eq!(
-            reader.read_file_bounds(&open, file_id).unwrap(),
-            Some(StructureFileLineBounds {
-                max_old_line_number: Some(12),
-                max_new_line_number: Some(14),
-            })
-        );
 
         builder.finish_hunk(6).unwrap();
         builder.finish_file(7).unwrap();
@@ -2966,6 +3579,13 @@ mod tests {
         assert_eq!(file.old_path, Some("src/old.rs"));
         assert_eq!(file.new_path, Some("src/new.rs"));
         assert_eq!(file.status, ChangeStatus::Renamed);
+        assert_eq!(
+            file.line_bounds,
+            StructureFileLineBounds {
+                max_old_line_number: Some(12),
+                max_new_line_number: Some(14),
+            }
+        );
         assert!(file.finalized);
         let hunk = reader.read_hunk(&finalized, hunk_id).unwrap().unwrap();
         assert_eq!(hunk.span.end_exclusive, Some(6));
@@ -2988,16 +3608,16 @@ mod tests {
         assert_eq!(file.hunks.first(), Some(hunk_id));
         assert_eq!(file.mode, FileMode::Rich);
         assert!(!file.finalized);
-        let hunk = reader.read_hunk(&open, hunk_id).unwrap().unwrap();
-        assert_eq!(hunk.file_id, file_id);
-        assert!(!hunk.finalized);
         assert_eq!(
-            reader.read_file_bounds(&open, file_id).unwrap().unwrap(),
+            file.line_bounds,
             StructureFileLineBounds {
                 max_old_line_number: Some(12),
                 max_new_line_number: Some(14),
             }
         );
+        let hunk = reader.read_hunk(&open, hunk_id).unwrap().unwrap();
+        assert_eq!(hunk.file_id, file_id);
+        assert!(!hunk.finalized);
 
         builder.finish_hunk(6).unwrap();
         builder.finish_file(6).unwrap();
@@ -3032,7 +3652,6 @@ mod tests {
         let commits = storage.table::<CommitRecord>().unwrap();
         let files = storage.table::<FileRecord>().unwrap();
         let hunks = storage.table::<HunkRecord>().unwrap();
-        let file_bounds = storage.table::<FileBoundsRecord>().unwrap();
         commits
             .append(&CommitRecord {
                 id: 0,
@@ -3041,10 +3660,7 @@ mod tests {
                     start: 0,
                     end_exclusive: 1,
                 },
-                files: FileIdRange {
-                    first: Some(FileId::new(0)),
-                    count: 1,
-                },
+                files: FileIdRange { start: 0, count: 1 },
                 object_id: PackedBlobRef::NONE,
                 subject: PackedBlobRef::NONE,
             })
@@ -3057,7 +3673,7 @@ mod tests {
                     start: 0,
                     end_exclusive: 1,
                 },
-                hunks: HunkIdRange::empty(),
+                hunks: HunkIdRange::empty_at(0),
                 additions: None,
                 deletions: None,
                 // Arenaにはpage 999がない。Metadata readerがこのfieldへ触れればreadは失敗する。
@@ -3069,18 +3685,13 @@ mod tests {
                 new_path: PackedBlobRef::NONE,
                 status: ChangeStatus::Unknown,
                 mode: FileMode::Malformed,
+                line_bounds: StructureFileLineBounds::default(),
             })
-            .unwrap();
-        file_bounds
-            .append(
-                &FileBoundsRecord::new(FileId::new(0), StructureFileLineBounds::default()).unwrap(),
-            )
             .unwrap();
         let snapshot = StructureSnapshot {
             commits,
             files,
             hunks,
-            file_bounds,
             blobs: storage.blob_arena(),
             commit_high_water: 1,
             file_high_water: 1,
@@ -3453,6 +4064,162 @@ mod tests {
     }
 
     #[test]
+    fn zero_length_close_is_retryable_for_every_structure_kind() {
+        let storage = StructuralStorage::new().unwrap();
+        let mut commit_builder = StructureBuilder::new(&storage).unwrap();
+        let commit = commit_builder
+            .begin_commit(CommitKind::WorkingTree, None, line(5))
+            .unwrap();
+        let error = commit_builder.finish_commit(5).unwrap_err();
+        assert!(matches!(
+            error,
+            StructureStoreError::InvalidLineSpan { start: 5, end: 5 }
+        ));
+        assert_eq!(
+            commit_builder.open_commit().map(OpenCommit::id),
+            Some(commit)
+        );
+        assert!(commit_builder.snapshot().is_ok());
+        assert_eq!(commit_builder.finish_commit(6).unwrap(), commit);
+
+        let storage = StructuralStorage::new().unwrap();
+        let mut file_builder = StructureBuilder::new(&storage).unwrap();
+        let commit = file_builder
+            .begin_commit(CommitKind::WorkingTree, None, line(0))
+            .unwrap();
+        let file = file_builder
+            .begin_file(
+                commit,
+                None,
+                None,
+                ChangeStatus::Unknown,
+                FileMode::Malformed,
+                line(2),
+            )
+            .unwrap();
+        let error = file_builder.finish_file(2).unwrap_err();
+        assert!(matches!(
+            error,
+            StructureStoreError::InvalidLineSpan { start: 2, end: 2 }
+        ));
+        assert_eq!(file_builder.open_file().map(OpenFile::id), Some(file));
+        assert!(file_builder.snapshot().is_ok());
+        assert_eq!(file_builder.finish_file(3).unwrap(), file);
+        file_builder.finish_commit(4).unwrap();
+
+        let storage = StructuralStorage::new().unwrap();
+        let mut hunk_builder = StructureBuilder::new(&storage).unwrap();
+        let commit = hunk_builder
+            .begin_commit(CommitKind::WorkingTree, None, line(0))
+            .unwrap();
+        let file = hunk_builder
+            .begin_file(
+                commit,
+                None,
+                None,
+                ChangeStatus::Unknown,
+                FileMode::Malformed,
+                line(1),
+            )
+            .unwrap();
+        let hunk = hunk_builder
+            .begin_hunk(file, HunkKind::Malformed, line(2), None, None)
+            .unwrap();
+        let error = hunk_builder.finish_hunk(2).unwrap_err();
+        assert!(matches!(
+            error,
+            StructureStoreError::InvalidLineSpan { start: 2, end: 2 }
+        ));
+        assert_eq!(hunk_builder.open_hunk().map(OpenHunk::id), Some(hunk));
+        assert!(hunk_builder.snapshot().is_ok());
+        assert_eq!(hunk_builder.finish_hunk(3).unwrap(), hunk);
+        hunk_builder.finish_file(4).unwrap();
+        hunk_builder.finish_commit(5).unwrap();
+    }
+
+    #[test]
+    fn snapshot_ordinal_mapping_obeys_generation_high_water_marks() {
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = StructureBuilder::new(&storage).unwrap();
+        let empty = builder.snapshot().unwrap();
+        assert_eq!(empty.commit_id_at(0), None);
+        assert_eq!(empty.file_id_at(0), None);
+        assert_eq!(empty.hunk_id_at(0), None);
+        assert_eq!(empty.commit_id_at(u64::MAX), None);
+        assert_eq!(empty.file_id_at(u64::MAX), None);
+        assert_eq!(empty.hunk_id_at(u64::MAX), None);
+        assert!(builder.open_commit().is_none());
+        assert!(builder.open_file().is_none());
+        assert!(builder.open_hunk().is_none());
+
+        let commit0 = builder
+            .begin_commit(CommitKind::WorkingTree, None, line(0))
+            .unwrap();
+        let file0 = builder
+            .begin_file(
+                commit0,
+                None,
+                None,
+                ChangeStatus::Unknown,
+                FileMode::Malformed,
+                line(0),
+            )
+            .unwrap();
+        let hunk0 = builder
+            .begin_hunk(file0, HunkKind::Malformed, line(0), None, None)
+            .unwrap();
+        assert_eq!(builder.open_commit().map(OpenCommit::id), Some(commit0));
+        assert_eq!(builder.open_file().map(OpenFile::id), Some(file0));
+        assert_eq!(builder.open_hunk().map(OpenHunk::id), Some(hunk0));
+        let first_open = builder.snapshot().unwrap();
+        assert_eq!(first_open.commit_id_at(0), Some(commit0));
+        assert_eq!(first_open.file_id_at(0), Some(file0));
+        assert_eq!(first_open.hunk_id_at(0), Some(hunk0));
+        assert_eq!(first_open.commit_id_at(1), None);
+        assert_eq!(first_open.file_id_at(1), None);
+        assert_eq!(first_open.hunk_id_at(1), None);
+
+        builder.finish_hunk(1).unwrap();
+        builder.finish_file(2).unwrap();
+        builder.finish_commit(3).unwrap();
+        let older = builder.snapshot().unwrap();
+        assert_eq!(older.commit_id_at(0), Some(commit0));
+        assert_eq!(older.file_id_at(0), Some(file0));
+        assert_eq!(older.hunk_id_at(0), Some(hunk0));
+
+        let commit1 = builder
+            .begin_commit(CommitKind::WorkingTree, None, line(3))
+            .unwrap();
+        let file1 = builder
+            .begin_file(
+                commit1,
+                None,
+                None,
+                ChangeStatus::Unknown,
+                FileMode::Malformed,
+                line(3),
+            )
+            .unwrap();
+        let hunk1 = builder
+            .begin_hunk(file1, HunkKind::Malformed, line(3), None, None)
+            .unwrap();
+        let current = builder.snapshot().unwrap();
+        assert_eq!(current.commit_id_at(0), Some(commit0));
+        assert_eq!(current.commit_id_at(1), Some(commit1));
+        assert_eq!(current.file_id_at(1), Some(file1));
+        assert_eq!(current.hunk_id_at(1), Some(hunk1));
+        assert_eq!(current.commit_id_at(2), None);
+        assert_eq!(current.file_id_at(2), None);
+        assert_eq!(current.hunk_id_at(2), None);
+        assert_eq!(current.commit_id_at(u64::MAX), None);
+        assert_eq!(current.file_id_at(u64::MAX), None);
+        assert_eq!(current.hunk_id_at(u64::MAX), None);
+        assert_eq!(older.commit_id_at(1), None);
+        assert_eq!(older.file_id_at(1), None);
+        assert_eq!(older.hunk_id_at(1), None);
+    }
+
+    #[test]
     fn tiny_shared_budget_spills_records_and_path_blobs() {
         let limit = 512 * 1024;
         let config = StorageConfig::new(limit, 480 * 1024, 256, 4 * 1024).unwrap();
@@ -3494,7 +4261,7 @@ mod tests {
         builder.finish_commit(801).unwrap();
 
         let spill = builder.spill_status().unwrap();
-        assert!(spill.files || spill.hunks || spill.file_bounds || spill.commits);
+        assert!(spill.files || spill.hunks || spill.commits);
         let snapshot = builder.snapshot().unwrap();
         let last = snapshot.files.get(799).unwrap().unwrap();
         assert_eq!(last.old_path.tag, BLOB_DISK);
@@ -3549,7 +4316,7 @@ mod tests {
                 start: 0,
                 end_exclusive: 1,
             },
-            files: FileIdRange::empty(),
+            files: FileIdRange::empty_at(0),
             object_id: PackedBlobRef::NONE,
             subject: PackedBlobRef::NONE,
         };
@@ -3569,6 +4336,18 @@ mod tests {
         invalid_range[32..40].copy_from_slice(&OPTIONAL_U64_NONE.to_le_bytes());
         invalid_range[40..48].copy_from_slice(&1_u64.to_le_bytes());
         assert!(CommitRecord::decode(&invalid_range).is_err());
+        let mut zero_length = encoded.clone();
+        zero_length[24..32].copy_from_slice(&0_u64.to_le_bytes());
+        assert!(CommitRecord::decode(&zero_length).is_err());
+        let zero_length = CommitRecord {
+            span: ClosedLineSpan {
+                start: 7,
+                end_exclusive: 7,
+            },
+            ..record
+        };
+        let mut zero_length_bytes = vec![0; CommitRecord::ENCODED_LEN];
+        assert!(zero_length.encode(&mut zero_length_bytes).is_err());
         let mut invalid_blob = encoded;
         invalid_blob[48] = BLOB_NONE;
         invalid_blob[64..72].copy_from_slice(&1_u64.to_le_bytes());
@@ -3596,15 +4375,27 @@ mod tests {
     }
 
     #[test]
-    fn bounds_codec_rejects_reserved_optional_value() {
-        let record = FileBoundsRecord {
-            file_id: 0,
-            bounds: StructureFileLineBounds {
+    fn file_codec_rejects_reserved_line_bound() {
+        let record = FileRecord {
+            id: 0,
+            commit_id: 0,
+            span: ClosedLineSpan {
+                start: 0,
+                end_exclusive: 1,
+            },
+            hunks: HunkIdRange::empty_at(0),
+            additions: None,
+            deletions: None,
+            old_path: PackedBlobRef::NONE,
+            new_path: PackedBlobRef::NONE,
+            status: ChangeStatus::Unknown,
+            mode: FileMode::Malformed,
+            line_bounds: StructureFileLineBounds {
                 max_old_line_number: Some(OPTIONAL_U64_NONE),
                 max_new_line_number: None,
             },
         };
-        let mut encoded = vec![0; FileBoundsRecord::ENCODED_LEN];
+        let mut encoded = vec![0; FileRecord::ENCODED_LEN];
         assert!(record.encode(&mut encoded).is_err());
     }
 
@@ -3614,7 +4405,6 @@ mod tests {
         let commits = storage.table::<CommitRecord>().unwrap();
         let files = storage.table::<FileRecord>().unwrap();
         let hunks = storage.table::<HunkRecord>().unwrap();
-        let file_bounds = storage.table::<FileBoundsRecord>().unwrap();
         let file = FileRecord {
             id: 0,
             commit_id: 9,
@@ -3622,25 +4412,20 @@ mod tests {
                 start: 0,
                 end_exclusive: 1,
             },
-            hunks: HunkIdRange::empty(),
+            hunks: HunkIdRange::empty_at(0),
             additions: None,
             deletions: None,
             old_path: PackedBlobRef::NONE,
             new_path: PackedBlobRef::NONE,
             status: ChangeStatus::Unknown,
             mode: FileMode::Malformed,
+            line_bounds: StructureFileLineBounds::default(),
         };
         files.append(&file).unwrap();
-        file_bounds
-            .append(
-                &FileBoundsRecord::new(FileId::new(0), StructureFileLineBounds::default()).unwrap(),
-            )
-            .unwrap();
         let snapshot = StructureSnapshot {
             commits,
             files,
             hunks,
-            file_bounds,
             blobs: storage.blob_arena(),
             commit_high_water: 0,
             file_high_water: 1,
@@ -3667,7 +4452,6 @@ mod tests {
         let commits = storage.table::<CommitRecord>().unwrap();
         let files = storage.table::<FileRecord>().unwrap();
         let hunks = storage.table::<HunkRecord>().unwrap();
-        let file_bounds = storage.table::<FileBoundsRecord>().unwrap();
         commits
             .append(&CommitRecord {
                 id: 0,
@@ -3676,10 +4460,7 @@ mod tests {
                     start: 0,
                     end_exclusive: 3,
                 },
-                files: FileIdRange {
-                    first: Some(FileId::new(0)),
-                    count: 2,
-                },
+                files: FileIdRange { start: 0, count: 2 },
                 object_id: PackedBlobRef::NONE,
                 subject: PackedBlobRef::NONE,
             })
@@ -3692,25 +4473,20 @@ mod tests {
                     start: 1,
                     end_exclusive: 2,
                 },
-                hunks: HunkIdRange::empty(),
+                hunks: HunkIdRange::empty_at(0),
                 additions: None,
                 deletions: None,
                 old_path: PackedBlobRef::NONE,
                 new_path: PackedBlobRef::NONE,
                 status: ChangeStatus::Unknown,
                 mode: FileMode::Malformed,
+                line_bounds: StructureFileLineBounds::default(),
             })
-            .unwrap();
-        file_bounds
-            .append(
-                &FileBoundsRecord::new(FileId::new(0), StructureFileLineBounds::default()).unwrap(),
-            )
             .unwrap();
         let snapshot = StructureSnapshot {
             commits,
             files,
             hunks,
-            file_bounds,
             blobs: storage.blob_arena(),
             commit_high_water: 1,
             file_high_water: 1,
@@ -3740,7 +4516,6 @@ mod tests {
         let commits = storage.table::<CommitRecord>().unwrap();
         let files = storage.table::<FileRecord>().unwrap();
         let hunks = storage.table::<HunkRecord>().unwrap();
-        let file_bounds = storage.table::<FileBoundsRecord>().unwrap();
         commits
             .append(&CommitRecord {
                 id: 0,
@@ -3749,10 +4524,7 @@ mod tests {
                     start: 0,
                     end_exclusive: 4,
                 },
-                files: FileIdRange {
-                    first: Some(FileId::new(0)),
-                    count: 1,
-                },
+                files: FileIdRange { start: 0, count: 1 },
                 object_id: PackedBlobRef::NONE,
                 subject: PackedBlobRef::NONE,
             })
@@ -3765,16 +4537,14 @@ mod tests {
                     start: 1,
                     end_exclusive: 4,
                 },
-                hunks: HunkIdRange {
-                    first: Some(HunkId::new(0)),
-                    count: 2,
-                },
+                hunks: HunkIdRange { start: 0, count: 2 },
                 additions: None,
                 deletions: None,
                 old_path: PackedBlobRef::NONE,
                 new_path: PackedBlobRef::NONE,
                 status: ChangeStatus::Unknown,
                 mode: FileMode::Malformed,
+                line_bounds: StructureFileLineBounds::default(),
             })
             .unwrap();
         hunks
@@ -3791,16 +4561,10 @@ mod tests {
                 new_range: None,
             })
             .unwrap();
-        file_bounds
-            .append(
-                &FileBoundsRecord::new(FileId::new(0), StructureFileLineBounds::default()).unwrap(),
-            )
-            .unwrap();
         let snapshot = StructureSnapshot {
             commits,
             files,
             hunks,
-            file_bounds,
             blobs: storage.blob_arena(),
             commit_high_water: 1,
             file_high_water: 1,
@@ -3822,5 +4586,361 @@ mod tests {
                 high_water: 1,
             }
         ));
+    }
+
+    #[test]
+    fn snapshots_share_open_overlay_allocations_until_copy_on_write() {
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = StructureBuilder::new(&storage).unwrap();
+        begin_sample_tree(&mut builder).unwrap();
+
+        let first = builder.snapshot().unwrap();
+        let second = builder.snapshot().unwrap();
+        assert!(Arc::ptr_eq(
+            builder.open_commit.as_ref().unwrap(),
+            first.open_commit.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            first.open_commit.as_ref().unwrap(),
+            second.open_commit.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            builder.open_file.as_ref().unwrap(),
+            first.open_file.as_ref().unwrap()
+        ));
+        assert!(Arc::ptr_eq(
+            builder.open_hunk.as_ref().unwrap(),
+            first.open_hunk.as_ref().unwrap()
+        ));
+        assert_eq!(
+            builder
+                .open_commit
+                .as_ref()
+                .unwrap()
+                .subject
+                .as_ref()
+                .unwrap()
+                .as_ptr(),
+            first
+                .open_commit()
+                .unwrap()
+                .subject
+                .as_ref()
+                .unwrap()
+                .as_ptr()
+        );
+
+        builder.open_commit_mut().unwrap().subject = Some("updated subject".to_owned());
+        builder.open_file_mut().unwrap().new_path = Some("src/updated.rs".to_owned());
+        builder.open_hunk_mut().unwrap().kind = HunkKind::Malformed;
+
+        assert!(!Arc::ptr_eq(
+            builder.open_commit.as_ref().unwrap(),
+            first.open_commit.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            builder.open_file.as_ref().unwrap(),
+            first.open_file.as_ref().unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            builder.open_hunk.as_ref().unwrap(),
+            first.open_hunk.as_ref().unwrap()
+        ));
+        assert_eq!(
+            first.open_commit().unwrap().subject.as_deref(),
+            Some("subject")
+        );
+        assert_eq!(
+            first.open_file().unwrap().new_path.as_deref(),
+            Some("src/new.rs")
+        );
+        assert_eq!(first.open_hunk().unwrap().kind, HunkKind::Unified);
+    }
+
+    #[test]
+    fn child_ranges_round_trip_empty_nonzero_cursors() {
+        let files = FileIdRange::empty_at(37);
+        let hunks = HunkIdRange::empty_at(91);
+        assert_eq!(files.start(), 37);
+        assert_eq!(files.end_exclusive(), 37);
+        assert_eq!(files.first(), None);
+        assert_eq!(files.last(), None);
+        assert_eq!(files.get(0), None);
+        assert_eq!(files.iter().count(), 0);
+        assert_eq!(hunks.start(), 91);
+        assert_eq!(hunks.end_exclusive(), 91);
+        assert_eq!(hunks.first(), None);
+        assert_eq!(hunks.last(), None);
+        assert_eq!(hunks.get(0), None);
+        assert_eq!(hunks.iter().count(), 0);
+
+        let mut file_bytes = [0; 16];
+        encode_file_range(files, &mut file_bytes, 0).unwrap();
+        assert_eq!(u64::from_le_bytes(file_bytes[0..8].try_into().unwrap()), 37);
+        assert_eq!(decode_file_range(&file_bytes, 0).unwrap(), files);
+        let mut hunk_bytes = [0; 16];
+        encode_hunk_range(hunks, &mut hunk_bytes, 0).unwrap();
+        assert_eq!(u64::from_le_bytes(hunk_bytes[0..8].try_into().unwrap()), 91);
+        assert_eq!(decode_hunk_range(&hunk_bytes, 0).unwrap(), hunks);
+
+        let mut files = files;
+        files.push(FileId::new(37)).unwrap();
+        assert_eq!(files.first(), Some(FileId::new(37)));
+        assert_eq!(files.last(), Some(FileId::new(37)));
+        assert_eq!(files.get(0), Some(FileId::new(37)));
+        assert_eq!(files.iter().collect::<Vec<_>>(), vec![FileId::new(37)]);
+    }
+
+    #[test]
+    fn binary_search_seek_and_intersection_include_open_overlays() {
+        const FINALIZED: u64 = 1_024;
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = StructureBuilder::new(&storage).unwrap();
+        for index in 0..FINALIZED {
+            let start = index * 4;
+            let commit = builder
+                .begin_commit(CommitKind::WorkingTree, None, line(start))
+                .unwrap();
+            let file = builder
+                .begin_file(
+                    commit,
+                    None,
+                    None,
+                    ChangeStatus::Modified,
+                    FileMode::Rich,
+                    line(start),
+                )
+                .unwrap();
+            builder
+                .begin_hunk(
+                    file,
+                    HunkKind::Unified,
+                    line(start),
+                    Some(SourceRange { start, count: 1 }),
+                    Some(SourceRange { start, count: 1 }),
+                )
+                .unwrap();
+            builder.finish_hunk(start + 1).unwrap();
+            builder.finish_file(start + 2).unwrap();
+            builder.finish_commit(start + 3).unwrap();
+        }
+        let open_start = FINALIZED * 4;
+        let open_commit = builder
+            .begin_commit(CommitKind::WorkingTree, None, line(open_start))
+            .unwrap();
+        let open_file = builder
+            .begin_file(
+                open_commit,
+                None,
+                None,
+                ChangeStatus::Modified,
+                FileMode::Rich,
+                line(open_start),
+            )
+            .unwrap();
+        let open_hunk = builder
+            .begin_hunk(
+                open_file,
+                HunkKind::Unified,
+                line(open_start),
+                Some(SourceRange {
+                    start: open_start,
+                    count: 1,
+                }),
+                Some(SourceRange {
+                    start: open_start,
+                    count: 1,
+                }),
+            )
+            .unwrap();
+        let snapshot = builder.snapshot().unwrap();
+        assert_eq!(
+            snapshot.visible_counts().unwrap(),
+            StructureCounts {
+                commits: FINALIZED + 1,
+                files: FINALIZED + 1,
+                hunks: FINALIZED + 1,
+            }
+        );
+
+        let mut reader = StructureMetadataReader::new();
+        let target = 500 * 4;
+        reader.reset_statistics();
+        assert_eq!(reader.file_lower_bound(&snapshot, target).unwrap(), 500);
+        assert!(reader.statistics().file_records <= 11);
+        assert_eq!(reader.file_upper_bound(&snapshot, target).unwrap(), 501);
+        assert_eq!(
+            reader
+                .nth_file_before(&snapshot, target, NonZeroU64::new(1).unwrap())
+                .unwrap(),
+            Some(FileId::new(499))
+        );
+        assert_eq!(
+            reader
+                .nth_file_after(&snapshot, target, NonZeroU64::new(1).unwrap())
+                .unwrap(),
+            Some(FileId::new(501))
+        );
+        assert_eq!(
+            reader
+                .files_intersecting(&snapshot, target..target + 1)
+                .unwrap(),
+            FileIdRange {
+                start: 500,
+                count: 1,
+            }
+        );
+        assert_eq!(
+            reader
+                .files_intersecting(&snapshot, target + 2..target + 4)
+                .unwrap(),
+            FileIdRange::empty_at(501)
+        );
+
+        assert_eq!(
+            reader.commit_lower_bound(&snapshot, open_start).unwrap(),
+            open_commit.get()
+        );
+        assert_eq!(
+            reader.commit_upper_bound(&snapshot, open_start).unwrap(),
+            FINALIZED + 1
+        );
+        assert_eq!(
+            reader.file_lower_bound(&snapshot, open_start).unwrap(),
+            open_file.get()
+        );
+        assert_eq!(
+            reader.hunk_lower_bound(&snapshot, open_start).unwrap(),
+            open_hunk.get()
+        );
+        assert_eq!(
+            reader
+                .commits_intersecting(&snapshot, open_start + 1..open_start + 2)
+                .unwrap(),
+            FINALIZED..FINALIZED + 1
+        );
+        assert_eq!(
+            reader
+                .files_intersecting(&snapshot, open_start + 1..open_start + 2)
+                .unwrap(),
+            FileIdRange {
+                start: FINALIZED,
+                count: 1,
+            }
+        );
+        assert_eq!(
+            reader
+                .hunks_intersecting(&snapshot, open_start + 1..open_start + 2)
+                .unwrap(),
+            HunkIdRange {
+                start: FINALIZED,
+                count: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn non_empty_span_invariant_keeps_intersection_ranges_exact() {
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = StructureBuilder::new(&storage).unwrap();
+        for start in 0..3 {
+            builder
+                .begin_commit(CommitKind::WorkingTree, None, line(start))
+                .unwrap();
+            builder.finish_commit(start + 1).unwrap();
+        }
+        let snapshot = builder.snapshot().unwrap();
+        let mut reader = StructureMetadataReader::new();
+
+        assert_eq!(reader.commits_intersecting(&snapshot, 0..1).unwrap(), 0..1);
+        assert_eq!(reader.commits_intersecting(&snapshot, 1..2).unwrap(), 1..2);
+        assert_eq!(reader.commits_intersecting(&snapshot, 0..3).unwrap(), 0..3);
+        assert_eq!(reader.commits_intersecting(&snapshot, 1..1).unwrap(), 1..1);
+        for id in 0..snapshot.commit_count() {
+            let span = reader
+                .read_commit(&snapshot, CommitId::new(id))
+                .unwrap()
+                .unwrap()
+                .span;
+            assert!(span.end_exclusive.unwrap() > span.start.get());
+        }
+    }
+
+    #[test]
+    fn parent_aware_sequential_reads_do_not_decode_parent_records() {
+        const CHILDREN: u64 = 64;
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = StructureBuilder::new(&storage).unwrap();
+        let commit_id = builder
+            .begin_commit(CommitKind::WorkingTree, None, line(0))
+            .unwrap();
+        for index in 0..CHILDREN {
+            let start = index * 3;
+            let file = builder
+                .begin_file(
+                    commit_id,
+                    None,
+                    None,
+                    ChangeStatus::Modified,
+                    FileMode::Rich,
+                    line(start),
+                )
+                .unwrap();
+            builder
+                .begin_hunk(
+                    file,
+                    HunkKind::Unified,
+                    line(start),
+                    Some(SourceRange { start, count: 1 }),
+                    Some(SourceRange { start, count: 1 }),
+                )
+                .unwrap();
+            builder.finish_hunk(start + 1).unwrap();
+            builder.finish_file(start + 2).unwrap();
+        }
+        builder.finish_commit(CHILDREN * 3).unwrap();
+        let snapshot = builder.snapshot().unwrap();
+
+        let mut reader = StructureMetadataReader::new();
+        let commit = reader.read_commit(&snapshot, commit_id).unwrap().unwrap();
+        reader.reset_statistics();
+        for file_id in commit.files.iter() {
+            let file = reader
+                .read_file_in_commit(&snapshot, file_id, commit)
+                .unwrap()
+                .unwrap();
+            let hunk_id = file.hunks.first().unwrap();
+            let hunk = reader
+                .read_hunk_in_file(&snapshot, hunk_id, file)
+                .unwrap()
+                .unwrap();
+            assert_eq!(hunk.file_id, file_id);
+        }
+        assert_eq!(
+            reader.statistics(),
+            StructureReadStats {
+                commit_records: 0,
+                file_records: CHILDREN,
+                hunk_records: CHILDREN,
+            }
+        );
+
+        let mut reader = StructureReader::new();
+        let commit = reader
+            .read_commit(&snapshot, commit_id)
+            .unwrap()
+            .unwrap()
+            .metadata();
+        let file = reader
+            .read_file_in_commit(&snapshot, FileId::new(0), commit)
+            .unwrap()
+            .unwrap()
+            .metadata();
+        assert!(
+            reader
+                .read_hunk_in_file(&snapshot, HunkId::new(0), file)
+                .unwrap()
+                .is_some()
+        );
     }
 }

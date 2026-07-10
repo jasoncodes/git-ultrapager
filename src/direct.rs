@@ -1,8 +1,9 @@
 //! Alternate screen を使わない direct renderer と共有 visual-row layout。
 //!
-//! `DocumentLayout` は terminal width と tab width から deterministic な visual row を作り、direct
-//! output と interactive viewport が同じ折り返し・gutterを使う。syntax/search/intraline style は
-//! byte span layerとして後から合成するため、ここでは構造 roleとstable IDだけを保持する。
+//! Logical lineごとのlayoutと、上限付きline rangeのdirect outputを所有する。Document全体の
+//! visual rowをmaterializeするAPIは持たず、interactive viewportとdirect writerのどちらも
+//! [`layout_line`]または巨大行のstreaming layoutを使う。syntax/search/intraline styleはbyte span
+//! layerとして後から合成するため、ここでは構造roleとstable IDだけを保持する。
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
@@ -164,7 +165,6 @@ pub struct VisualRow {
 ///
 /// 内部の`Arc`はtab展開済みtextとlogical/rendered span mappingを含む`VisualRow`を共有する。
 /// Viewport cacheが同じline layoutを複数frameから参照しても`String`とmappingを複製しない。
-/// `layout_document`は同じrow生成関数へ自身の連続bufferを渡し、per-lineの`Arc`を作らない。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineLayout {
     rows: Arc<Vec<VisualRow>>,
@@ -188,6 +188,30 @@ impl LineLayout {
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+
+    /// Cache値として保持するrow vector、text、span mappingの実capacityを返す。
+    ///
+    /// Cache keyやLRU bookkeepingはconsumerが加算する。`Arc`のstrong/weak counterと
+    /// heap上の`Vec` headerはこのlayoutが所有するためここで計上する。
+    #[must_use]
+    pub(crate) fn retained_bytes(&self) -> usize {
+        let row_storage = self
+            .rows
+            .capacity()
+            .saturating_mul(std::mem::size_of::<VisualRow>());
+        let payload = self.rows.iter().fold(0_usize, |total, row| {
+            total.saturating_add(row.text.capacity()).saturating_add(
+                row.span_map
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SpanMapping>()),
+            )
+        });
+        std::mem::size_of::<LineLayout>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<Vec<VisualRow>>())
+            .saturating_add(row_storage)
+            .saturating_add(payload)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,76 +226,6 @@ impl SpanMapping {
     #[must_use]
     pub const fn is_tab(&self) -> bool {
         self.tab
-    }
-}
-
-/// Document を特定幅へreflowしたimmutable layout。
-#[derive(Clone, Debug, Default)]
-pub struct DocumentLayout {
-    rows: Vec<VisualRow>,
-    first_row_by_line: HashMap<LineId, usize>,
-    first_row_by_file: HashMap<FileId, usize>,
-    first_row_by_hunk: HashMap<HunkId, usize>,
-    first_row_by_commit: HashMap<CommitId, usize>,
-}
-
-impl DocumentLayout {
-    #[must_use]
-    pub fn rows(&self) -> &[VisualRow] {
-        &self.rows
-    }
-
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.rows.len()
-    }
-
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
-    #[must_use]
-    pub fn row_for_line(&self, id: LineId) -> Option<usize> {
-        self.first_row_by_line.get(&id).copied()
-    }
-
-    #[must_use]
-    pub fn row_for_file(&self, id: FileId) -> Option<usize> {
-        self.first_row_by_file.get(&id).copied()
-    }
-
-    #[must_use]
-    pub fn row_for_hunk(&self, id: HunkId) -> Option<usize> {
-        self.first_row_by_hunk.get(&id).copied()
-    }
-
-    #[must_use]
-    pub fn row_for_commit(&self, id: CommitId) -> Option<usize> {
-        self.first_row_by_commit.get(&id).copied()
-    }
-
-    /// Reflow 前の anchor line とcontent byte offsetを含むrowを探す。
-    #[must_use]
-    pub fn row_for_anchor(&self, line: LineId, byte_offset: usize) -> Option<usize> {
-        let start = self.row_for_line(line)?;
-        let relative_end = self.rows[start..]
-            .iter()
-            .position(|row| row.line_id != line)
-            .unwrap_or(self.rows.len() - start);
-        let rows = &self.rows[start..start + relative_end];
-        rows.iter()
-            .position(|row| {
-                row.content_range.contains(&byte_offset)
-                    || (row.content_range.is_empty() && byte_offset == row.content_range.start)
-            })
-            .map(|relative| start + relative)
-            .or_else(|| {
-                rows.last()
-                    .filter(|row| row.content_range.end == byte_offset)
-                    .map(|_| start + rows.len().saturating_sub(1))
-            })
-            .or(Some(start))
     }
 }
 
@@ -377,11 +331,10 @@ pub fn layout_line(
     })
 }
 
-/// Publicなper-line layoutとdocument-wide layoutが共有する唯一のrow生成経路。
+/// Per-line eager layoutのrow生成経路。
 ///
-/// 呼び出し側が所有する`Vec`へ直接追加するため、`layout_document`はlogical lineごとの一時
-/// `Vec`と`Arc`を作らない。失敗したlineより前に追加済みのrowは残るが、この関数はmodule内
-/// だけで使い、公開APIは失敗時に構築途中のbufferを外へ返さない。
+/// 失敗したlineで追加済みのrowは残るためmodule内だけで使い、公開APIは構築途中の
+/// bufferを外へ返さない。
 fn append_line_rows(
     rows: &mut Vec<VisualRow>,
     line: &DocumentLineRef<'_>,
@@ -430,58 +383,6 @@ fn append_line_rows(
     Ok(())
 }
 
-/// Snapshot全体をstable line ID順にdecodeし、terminal widthへhard-wrapする。
-///
-/// Gutter幅はfile metadataの最大行番号から先に作り、各lineのdecodeには1つのreaderを再利用する。
-/// Geometryの不備、line storeのread failure、snapshot内recordの欠落を[`DocumentLayoutError`]で返す。
-pub fn layout_document(
-    document: &DocumentSnapshot,
-    width: usize,
-    tab_width: usize,
-) -> Result<DocumentLayout, DocumentLayoutError> {
-    // Empty documentでも無効なlayout parameterを成功扱いにしない。これにより入力内容によって
-    // 同じtab幅の成否が変わらず、`layout_line`とfailure contractが揃う。
-    validate_tab_width(tab_width)?;
-    let gutter_specs = file_gutter_specs(document);
-    let mut layout = DocumentLayout::default();
-
-    let mut reader = DocumentLineReader::new();
-    let mut metadata_reader = DocumentLineMetadataReader::new();
-    for index in 0..document.line_count() {
-        let line_id = document
-            .line_id_at(index)
-            .ok_or(DocumentLayoutError::UnavailableLineIndex { index })?;
-        let metadata = metadata_reader
-            .read(document, line_id)?
-            .ok_or(DocumentLayoutError::MissingLine { line_id })?;
-        let gutter = gutter_spec_for_metadata(document, metadata);
-        if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
-            return Err(DocumentLayoutError::StreamingRequired { line_id });
-        }
-        let line = reader
-            .read(document, line_id)?
-            .ok_or(DocumentLayoutError::MissingLine { line_id })?;
-        let row_start = layout.rows.len();
-        layout.first_row_by_line.insert(line.id, row_start);
-        if let Some(id) = line.commit_id {
-            layout.first_row_by_commit.entry(id).or_insert(row_start);
-        }
-        if let Some(id) = line.file_id {
-            layout.first_row_by_file.entry(id).or_insert(row_start);
-        }
-        if let Some(id) = line.hunk_id {
-            layout.first_row_by_hunk.entry(id).or_insert(row_start);
-        }
-
-        let gutter = line
-            .file_id
-            .and_then(|id| gutter_specs.get(&id).copied())
-            .unwrap_or(gutter);
-        append_line_rows(&mut layout.rows, &line, width, tab_width, gutter)?;
-    }
-    Ok(layout)
-}
-
 /// Fixed metadataとgeometryだけで、全文decode前にbounded streaming経路が必要かを返す。
 ///
 /// Raw/displayのどちらかが1 MiBを越えるlineに加え、tabを全byteへ仮定した保守的cell数から
@@ -493,34 +394,92 @@ pub fn line_requires_streaming_layout(
     tab_width: usize,
     gutter: GutterSpec,
 ) -> Result<bool, LayoutError> {
+    let Some(estimated_bytes) =
+        eager_layout_allocation_upper_bound(metadata, width, tab_width, gutter)?
+    else {
+        return Ok(true);
+    };
+    Ok(estimated_bytes > MAX_EAGER_LINE_LAYOUT_BYTES)
+}
+
+/// Fixed metadataだけから、eager decode後のlayout候補が同時保持するbyte数の上限を返す。
+///
+/// Rawまたはescaped textが1 MiBを越える場合は`None`で、callerはdecode前にstreamingへ
+/// 回す。`Some`は全byteをtabとした展開、row/mapping vectorのgrow余白、source gutter、
+/// 構築中のexpanded textと完成rowの共存を含む。Viewportはこの値でstreaming経路を決め、
+/// decode後は[`eager_layout_decoded_allocation_upper_bound`]の狭い上限でlayout allocationを
+/// admissionする。
+pub(crate) fn eager_layout_allocation_upper_bound(
+    metadata: DocumentLineMetadata,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+) -> Result<Option<usize>, LayoutError> {
     validate_tab_width(tab_width)?;
     if is_source_line(metadata.kind) {
         validate_gutter_metadata(metadata, gutter)?;
     }
     let content_width = content_width_for(metadata.kind, width, gutter)?;
     if metadata.exceeds_eager_text_limit(MAX_SYNTAX_LINE_BYTES) {
-        return Ok(true);
+        return Ok(None);
     }
     let Some(display_len) = metadata.display_len.exact() else {
-        return Ok(true);
+        return Ok(None);
     };
     let content_len = display_len.saturating_sub(usize::from(is_source_line(metadata.kind)));
     let estimated_rows = estimated_eager_rows(content_len, content_width, tab_width);
-    let estimated_bytes = estimated_eager_layout_bytes(
+    if estimated_rows > MAX_EAGER_VISUAL_ROWS_PER_LINE {
+        return Ok(None);
+    }
+    Ok(Some(estimated_eager_layout_bytes(
         content_len,
         estimated_rows,
         metadata.kind,
         gutter,
         tab_width,
-    );
-    Ok(estimated_rows > MAX_EAGER_VISUAL_ROWS_PER_LINE
-        || estimated_bytes > MAX_EAGER_LINE_LAYOUT_BYTES)
+    )))
+}
+
+/// Decode済みtextのtab数を使い、eager layout候補が同時保持するbyte数の上限を狭める。
+///
+/// Fixed metadata側は全byteをtabとして安全側へ寄せるため、複数lineを同じframeへ準備すると
+/// old-frame pinとの合計を大きく見積もる。この関数はtabを最大`tab_width`個のASCII spaceへ
+/// 置換した長さを使う。UTF-8 graphemeの表示cell数は元byte数以下なので、この長さから求めた
+/// row数も過小評価にならない。戻り値はtext readerのbounded bufferを含まず、layout allocation
+/// とcache/prepared payloadだけを対象にする。
+pub(crate) fn eager_layout_decoded_allocation_upper_bound(
+    line: &DocumentLineRef<'_>,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+) -> Result<usize, LayoutError> {
+    validate_tab_width(tab_width)?;
+    if is_source_line(line.kind) {
+        validate_gutter(line, gutter)?;
+    }
+    let content_width = content_width_for(line.kind, width, gutter)?;
+    let content = if is_source_line(line.kind) {
+        line.content()
+    } else {
+        line.text
+    };
+    let tab_count = content.bytes().filter(|byte| *byte == b'\t').count();
+    let expanded_bytes = content
+        .len()
+        .saturating_add(tab_count.saturating_mul(tab_width.saturating_sub(1)));
+    let estimated_rows = estimated_eager_rows(expanded_bytes, content_width, 1);
+    Ok(estimated_eager_layout_bytes_from_expanded(
+        expanded_bytes,
+        estimated_rows,
+        line.kind,
+        gutter,
+    ))
 }
 
 /// Startup判定用にvisual row数を`limit`まで数える。
 ///
 /// Logical lineは先頭から順にdecodeするが、row数が`limit`へ達した時点で止める。Auto pagingの
-/// thresholdはterminal高なので、入力全体の`DocumentLayout`や全row textを作らず判定できる。
+/// thresholdはterminal高なので、入力全体のvisual rowやtextを作らず判定できる。
 /// 戻り値が`limit`なら実際のrow数はそれ以上、未満ならsnapshot全体の正確なrow数である。
 pub fn count_rendered_rows_up_to(
     document: &DocumentSnapshot,
@@ -542,7 +501,7 @@ pub fn count_rendered_rows_up_to(
         let metadata = metadata_reader
             .read(document, line_id)?
             .ok_or(DocumentLayoutError::MissingLine { line_id })?;
-        let gutter = gutter_spec_for_metadata(document, metadata);
+        let gutter = gutter_spec_for_metadata(metadata);
         if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
             let remaining = limit.saturating_sub(count);
             let (rows, _) = count_large_line_rows_up_to(
@@ -557,13 +516,7 @@ pub fn count_rendered_rows_up_to(
         let line = reader
             .read(document, line_id)?
             .ok_or(DocumentLayoutError::MissingLine { line_id })?;
-        let rows = layout_line(
-            &line,
-            width,
-            tab_width,
-            gutter_spec_for_line(document, &line),
-        )?
-        .len();
+        let rows = layout_line(&line, width, tab_width, gutter_spec_for_line(&line))?.len();
         count = count.saturating_add(rows).min(limit);
         if count == limit {
             break;
@@ -1468,28 +1421,45 @@ fn estimated_eager_layout_bytes(
     tab_width: usize,
 ) -> usize {
     let expanded_bytes = content_len.saturating_mul(tab_width);
-    // 全byteがtabならinput byteごとに1 mapping、plain textでもwrap境界ごとにmappingが分割される。
-    // ExpandedTextと完成VisualRowがloop中に同時生存するためmapping payloadを2世代分数える。
-    let mapping_count = content_len
+    estimated_eager_layout_bytes_from_expanded(expanded_bytes, row_count, kind, gutter)
+}
+
+fn estimated_eager_layout_bytes_from_expanded(
+    expanded_bytes: usize,
+    row_count: usize,
+    kind: LineKind,
+    gutter: GutterSpec,
+) -> usize {
+    // Tabがrow境界で分かれると同じ1 byteが最大tab_width件のmappingになる。
+    // ExpandedTextと完成VisualRowがloop中に同時生存する。それぞれのVecが
+    // grow余白を持つため、展開後byte数をmapping件数とした2世代×2倍を足す。
+    let mapping_count = expanded_bytes
         .saturating_add(row_count)
         .saturating_add(usize::from(is_source_line(kind)));
     let mapping_bytes = mapping_count
         .saturating_mul(std::mem::size_of::<SpanMapping>())
-        .saturating_mul(2);
-    let row_metadata = row_count.saturating_mul(
-        std::mem::size_of::<VisualRow>()
-            .saturating_add(std::mem::size_of::<crate::text::WrappedSegment>()),
-    );
+        .saturating_mul(4);
+    // `Vec::new()`からの初回pushはVisualRowサイズで4件分を確保する。その後の倍増も
+    // 含め、完成時capacityの上限を`max(4, 2 * row_count)`に置く。
+    let row_capacity = row_count.saturating_mul(2).max(4);
+    let row_metadata = row_capacity
+        .saturating_mul(std::mem::size_of::<VisualRow>())
+        .saturating_add(
+            row_capacity.saturating_mul(std::mem::size_of::<crate::text::WrappedSegment>()),
+        );
     let gutter_bytes = if is_source_line(kind) {
         gutter.old_width() + gutter.new_width() + 6
     } else {
         0
     };
-    expanded_bytes
-        .saturating_mul(2)
+    let rendered_bytes = expanded_bytes.saturating_add(row_count.saturating_mul(gutter_bytes));
+    std::mem::size_of::<LineLayout>()
+        .saturating_add(2 * std::mem::size_of::<usize>())
+        .saturating_add(std::mem::size_of::<Vec<VisualRow>>())
+        .saturating_add(expanded_bytes.saturating_mul(2))
+        .saturating_add(rendered_bytes.saturating_mul(2))
         .saturating_add(mapping_bytes)
         .saturating_add(row_metadata)
-        .saturating_add(row_count.saturating_mul(gutter_bytes))
 }
 
 fn validate_gutter(line: &DocumentLineRef<'_>, gutter: GutterSpec) -> Result<(), LayoutError> {
@@ -1744,24 +1714,8 @@ fn mapping_bounds(mappings: &[SpanMapping]) -> Option<Range<usize>> {
     Some(mappings.first()?.logical.start..mappings.last()?.logical.end)
 }
 
-fn file_gutter_specs(document: &DocumentSnapshot) -> HashMap<FileId, GutterSpec> {
-    // Line scanで最大値を再計算するとlayout前に全text decodeが必要になる。Parserがfile単位で
-    // 保持したboundsだけを読むため、ここはfile数に比例し、line数やraw byte数に依存しない。
-    document
-        .files()
-        .iter()
-        .map(|file| {
-            let bounds = document.file_line_bounds(file.id).unwrap_or_default();
-            let old_width = bounds.max_old_line_number.map_or(0, decimal_width);
-            let new_width = bounds.max_new_line_number.map_or(0, decimal_width);
-            (file.id, GutterSpec::new(old_width, new_width))
-        })
-        .collect()
-}
-
-fn gutter_spec_for_line(document: &DocumentSnapshot, line: &DocumentLineRef<'_>) -> GutterSpec {
-    line.file_id
-        .and_then(|file_id| document.file_line_bounds(file_id))
+fn gutter_spec_for_line(line: &DocumentLineRef<'_>) -> GutterSpec {
+    line.file_line_bounds
         .map(|bounds| {
             GutterSpec::new(
                 bounds.max_old_line_number.map_or(0, decimal_width),
@@ -1771,9 +1725,8 @@ fn gutter_spec_for_line(document: &DocumentSnapshot, line: &DocumentLineRef<'_>)
         .unwrap_or_default()
 }
 
-fn gutter_spec_for_metadata(document: &DocumentSnapshot, line: DocumentLineMetadata) -> GutterSpec {
-    line.file_id
-        .and_then(|file_id| document.file_line_bounds(file_id))
+fn gutter_spec_for_metadata(line: DocumentLineMetadata) -> GutterSpec {
+    line.file_line_bounds
         .map(|bounds| {
             GutterSpec::new(
                 bounds.max_old_line_number.map_or(0, decimal_width),
@@ -1807,15 +1760,6 @@ fn role_for_line(kind: LineKind) -> SemanticRole {
     }
 }
 
-/// Visual rows をTTYへ順に書き、各行の末尾でstyleをresetする。
-pub fn write_direct<W: Write>(
-    writer: &mut W,
-    layout: &DocumentLayout,
-    theme: &Theme,
-) -> io::Result<()> {
-    write_direct_rows(writer, layout.rows(), theme)
-}
-
 /// 選択済みvisual rowだけをTTYへ順に書く。Streaming direct modeはclosed fileまでのrowを渡し、
 /// open fileのgutter/countが確定する前に出力しない。
 pub fn write_direct_rows<'row, W, I>(writer: &mut W, rows: I, theme: &Theme) -> io::Result<()>
@@ -1836,7 +1780,8 @@ where
 /// Precedenceはinteractive rendererと同じく、diff構造、syntax foreground、intraline backgroundの
 /// 順とする。Searchはinteractive stateだけのためdirect outputへは含めない。1つのreaderと1 logical
 /// line分の[`LineLayout`]だけを保持し、範囲より前のtextやvisual rowを再構築しない。Layoutとsnapshotを
-/// 別引数にしないため、同じstable IDを持つ別documentのrowを混在させる経路も作らない。
+/// 別引数にしないため、同じstable IDを持つ別documentのrowを混在させる経路も作らない。Decorationは
+/// exact snapshotへ結び付け、同じbuilderの後続snapshotでfallback化したsource metadataにも流用しない。
 pub fn write_direct_decorated_range<W: Write>(
     writer: &mut W,
     document: &DocumentSnapshot,
@@ -1848,7 +1793,7 @@ pub fn write_direct_decorated_range<W: Write>(
 ) -> Result<(), DirectWriteError> {
     validate_tab_width(tab_width)?;
     if !decorations.belongs_to(document) {
-        return Err(DirectWriteError::DecorationLineageMismatch);
+        return Err(DirectWriteError::DecorationSnapshotMismatch);
     }
     let range_end = line_range.end.min(document.line_count());
     if line_range.start >= range_end {
@@ -1863,7 +1808,7 @@ pub fn write_direct_decorated_range<W: Write>(
         let metadata = metadata_reader
             .read(document, line_id)?
             .ok_or(DirectWriteError::MissingLine { line_id })?;
-        let gutter = gutter_spec_for_metadata(document, metadata);
+        let gutter = gutter_spec_for_metadata(metadata);
         if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
             let mut stream = LargeLineRows::new(document, line_id, width, tab_width, gutter)?;
             let mut previous = None;
@@ -1883,7 +1828,7 @@ pub fn write_direct_decorated_range<W: Write>(
         let line = reader
             .read(document, line_id)?
             .ok_or(DirectWriteError::MissingLine { line_id })?;
-        let gutter = gutter_spec_for_line(document, &line);
+        let gutter = gutter_spec_for_line(&line);
         let line_layout = layout_line(&line, width, tab_width, gutter)?;
         for (row_index, row) in line_layout.rows().iter().enumerate() {
             write_decorated_row(
@@ -2219,7 +2164,7 @@ pub fn write_direct_metadata_lines<W: Write>(
         let metadata = metadata_reader
             .read(document, line_id)?
             .ok_or(DirectWriteError::MissingLine { line_id })?;
-        let gutter = gutter_spec_for_metadata(document, metadata);
+        let gutter = gutter_spec_for_metadata(metadata);
         if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
             let mut stream = LargeLineRows::new(document, line_id, width, tab_width, gutter)?;
             while let Some(row) = stream.next_row()? {
@@ -2253,8 +2198,8 @@ pub enum DirectWriteError {
     Decoration(#[from] DecorationComputeError),
     #[error(transparent)]
     LargeLine(#[from] LargeLineError),
-    #[error("decoration set belongs to a different document lineage")]
-    DecorationLineageMismatch,
+    #[error("decoration set belongs to a different document snapshot")]
+    DecorationSnapshotMismatch,
     #[error("document snapshot does not contain logical line {line_id}")]
     MissingLine { line_id: LineId },
     #[error("document snapshot cannot represent logical line index {index} as a stable ID")]
@@ -2364,7 +2309,9 @@ mod tests {
     use crate::decorations::DecorationSet;
     use crate::document::OwnedDocumentLine;
     use crate::document_store::CHUNKED_LINE_RAW_BYTES;
-    use crate::parser::parse_bytes as parse_snapshot;
+    use crate::input::AppendStore;
+    use crate::parser::{GitParser, parse_bytes as parse_snapshot};
+    use crate::storage::StructuralStorage;
     use crate::theme::ColorLevel;
 
     fn parse_bytes(input: &[u8]) -> DocumentSnapshot {
@@ -2397,6 +2344,7 @@ mod tests {
             hunk_id: None,
             old_line_number: None,
             new_line_number: None,
+            file_line_bounds: None,
             terminated: true,
             raw_len,
             display_len: crate::document::LineDisplayLength::Exact(display_len),
@@ -2412,7 +2360,7 @@ mod tests {
     }
 
     #[test]
-    fn zero_tab_width_is_rejected_for_tab_free_and_empty_documents() {
+    fn zero_tab_width_is_rejected_for_line_and_bounded_count_paths() {
         let document = parse_bytes(b"metadata without tabs\n");
         let expected = LayoutError::InvalidTabWidth { actual: 0 };
         let line = line_with_kind(&document, LineKind::Plain);
@@ -2420,14 +2368,9 @@ mod tests {
             layout_line(&line.as_borrowed(), 80, 0, GutterSpec::MINIMUM).unwrap_err(),
             expected,
         );
-        assert!(matches!(
-            layout_document(&document, 80, 0),
-            Err(DocumentLayoutError::Layout(error)) if error == expected
-        ));
-
         let empty = parse_bytes(b"");
         assert!(matches!(
-            layout_document(&empty, 80, 0),
+            count_rendered_rows_up_to(&empty, 80, 0, 1),
             Err(DocumentLayoutError::Layout(error)) if error == expected
         ));
     }
@@ -2451,7 +2394,7 @@ mod tests {
     }
 
     #[test]
-    fn line_layout_matches_document_layout_for_metadata_source_tabs_and_unicode() {
+    fn line_layout_handles_metadata_source_tabs_and_unicode_without_document_materialization() {
         let document = parse_bytes(
             "ab\t界cd\n\
              diff --git a/a.rs b/a.rs\n\
@@ -2464,26 +2407,14 @@ mod tests {
         );
         let width = 17;
         let tab_width = 4;
-        let whole = layout_document(&document, width, tab_width).unwrap();
-        let gutter_specs = file_gutter_specs(&document);
         let lines = read_lines(&document);
         let mut per_line = Vec::new();
 
         for line in &lines {
-            let gutter = line
-                .file_id
-                .and_then(|id| gutter_specs.get(&id).copied())
-                .unwrap_or_default();
+            let gutter = gutter_spec_for_line(&line.as_borrowed());
             let line_layout = layout_line(&line.as_borrowed(), width, tab_width, gutter).unwrap();
             let cloned = line_layout.clone();
             assert_eq!(line_layout.rows().as_ptr(), cloned.rows().as_ptr());
-
-            let first = whole.row_for_line(line.id).unwrap();
-            let count = whole.rows()[first..]
-                .iter()
-                .take_while(|row| row.line_id == line.id)
-                .count();
-            assert_eq!(line_layout.rows(), &whole.rows()[first..first + count]);
             per_line.push(line_layout);
         }
 
@@ -2521,8 +2452,6 @@ mod tests {
         );
 
         let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
-        let mut whole_output = Vec::new();
-        write_direct(&mut whole_output, &whole, &theme).unwrap();
         let mut per_line_output = Vec::new();
         write_direct_rows(
             &mut per_line_output,
@@ -2532,11 +2461,13 @@ mod tests {
             &theme,
         )
         .unwrap();
-        assert_eq!(per_line_output, whole_output);
+        let rendered = String::from_utf8(crate::ansi::strip_ansi(&per_line_output)).unwrap();
+        assert!(rendered.starts_with("ab  界cd\n"));
+        assert!(rendered.contains(" 98       │-    \n          │ 界abc\n"));
     }
 
     #[test]
-    fn line_layout_reports_the_same_too_narrow_errors_as_document_layout() {
+    fn line_layout_reports_typed_too_narrow_errors() {
         let metadata = parse_bytes(b"metadata\n");
         let metadata_line = line_with_kind(&metadata, LineKind::Plain);
         assert_eq!(
@@ -2551,14 +2482,6 @@ mod tests {
                 required: 1,
             })
         );
-        assert!(matches!(
-            layout_document(&metadata, 0, 4),
-            Err(DocumentLayoutError::Layout(LayoutError::TooNarrow {
-                actual: 0,
-                required: 1,
-            }))
-        ));
-
         let source = parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,0 +12345 @@\n+value\n",
         );
@@ -2571,10 +2494,6 @@ mod tests {
             layout_line(&addition.as_borrowed(), 12, 4, GutterSpec::new(3, 5),).unwrap_err(),
             expected,
         );
-        assert!(matches!(
-            layout_document(&source, 12, 4),
-            Err(DocumentLayoutError::Layout(error)) if error == expected
-        ));
     }
 
     #[test]
@@ -2582,12 +2501,15 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -10,1 +10,1 @@\n-abcdefgh\n+abcdefXY\n",
         );
-        let layout = layout_document(&document, 14, 4).unwrap();
-        let deletion_rows: Vec<&VisualRow> = layout
-            .rows()
-            .iter()
-            .filter(|row| row.role == SemanticRole::Removed)
-            .collect();
+        let deletion = line_with_kind(&document, LineKind::Deletion);
+        let layout = layout_line(
+            &deletion.as_borrowed(),
+            14,
+            4,
+            gutter_spec_for_line(&deletion.as_borrowed()),
+        )
+        .unwrap();
+        let deletion_rows = layout.rows();
         assert!(deletion_rows[0].text.starts_with(" 10     │-"));
         assert!(deletion_rows[1].text.starts_with("        │ "));
     }
@@ -2595,7 +2517,8 @@ mod tests {
     #[test]
     fn metadata_uses_full_width() {
         let document = parse_bytes(b"plain metadata line\n");
-        let layout = layout_document(&document, 8, 4).unwrap();
+        let line = line_with_kind(&document, LineKind::Plain);
+        let layout = layout_line(&line.as_borrowed(), 8, 4, GutterSpec::default()).unwrap();
         assert_eq!(layout.rows()[0].text, "plain me");
         assert_eq!(layout.rows()[1].text, "tadata l");
     }
@@ -2605,12 +2528,15 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -0,0 +1,1 @@\n+\tfoo\n",
         );
-        let layout = layout_document(&document, 12, 4).unwrap();
-        let addition_rows: Vec<&VisualRow> = layout
-            .rows()
-            .iter()
-            .filter(|row| row.role == SemanticRole::Added)
-            .collect();
+        let addition = line_with_kind(&document, LineKind::Addition);
+        let layout = layout_line(
+            &addition.as_borrowed(),
+            12,
+            4,
+            gutter_spec_for_line(&addition.as_borrowed()),
+        )
+        .unwrap();
+        let addition_rows: Vec<&VisualRow> = layout.rows().iter().collect();
 
         let expanded_tab: String = addition_rows
             .iter()
@@ -2634,19 +2560,23 @@ mod tests {
             .concat();
         assert_eq!(rendered_source, "foo");
 
-        let addition = line_with_kind(&document, LineKind::Addition);
-        let row = layout.row_for_anchor(addition.id, 2).unwrap();
+        let row = layout
+            .rows()
+            .iter()
+            .position(|row| row.renders_logical_offset(2))
+            .unwrap();
         assert!(layout.rows()[row].text.ends_with("fo"));
     }
 
     #[test]
     fn colorless_direct_output_still_resets_attributes() {
         let document = parse_bytes(b"hello\n");
-        let layout = layout_document(&document, 80, 4).unwrap();
+        let line = line_with_kind(&document, LineKind::Plain);
+        let layout = layout_line(&line.as_borrowed(), 80, 4, GutterSpec::default()).unwrap();
         let mut output = Vec::new();
-        write_direct(
+        write_direct_rows(
             &mut output,
-            &layout,
+            layout.rows(),
             &Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None),
         )
         .unwrap();
@@ -2694,7 +2624,7 @@ mod tests {
     }
 
     #[test]
-    fn full_document_layout_rejects_raw_huge_display_short_lines_before_decode() {
+    fn metadata_preflight_routes_raw_huge_display_short_lines_to_streaming() {
         let mut input = b"\x1b]title;".to_vec();
         input.extend(std::iter::repeat_n(
             b'x',
@@ -2708,11 +2638,10 @@ mod tests {
             .unwrap();
         assert_eq!(metadata.display_len.exact(), Some(0));
         assert!(metadata.raw_len > MAX_SYNTAX_LINE_BYTES as u64);
-        assert!(matches!(
-            layout_document(&document, 80, 4),
-            Err(DocumentLayoutError::StreamingRequired { line_id })
-                if line_id == LineId::new(0)
-        ));
+        assert!(
+            line_requires_streaming_layout(metadata, 80, 4, gutter_spec_for_metadata(metadata))
+                .unwrap()
+        );
     }
 
     #[test]
@@ -2797,7 +2726,52 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, DirectWriteError::DecorationLineageMismatch));
+        assert!(matches!(
+            error,
+            DirectWriteError::DecorationSnapshotMismatch
+        ));
+    }
+
+    #[test]
+    fn decorated_direct_writer_rejects_later_fallback_snapshot_from_same_lineage() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut parser = GitParser::new(raw.clone(), &storage).unwrap();
+        let input = b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n-let old = 1;\n+let new = 2;\n";
+        let start = raw.append(input).unwrap();
+        let _ = parser.push(start, input).unwrap();
+        let rich = parser.snapshot().unwrap();
+        let deletion = line_with_kind(&rich, LineKind::Deletion);
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::TrueColor);
+        let decorations = DecorationSet::compute(&rich, &theme, WhitespaceChoice::Ignore).unwrap();
+        assert!(decorations.belongs_to(&rich));
+        assert!(decorations.belongs_to(&rich.clone()));
+        assert!(decorations.line(deletion.id).is_some());
+
+        let _ = raw.seal().unwrap();
+        let fallback = parser.into_document().unwrap();
+        let metadata = DocumentLineMetadataReader::new()
+            .read(&fallback, deletion.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.kind, LineKind::Fallback);
+        assert_eq!(rich.identity(), fallback.identity());
+        assert!(!decorations.belongs_to(&fallback));
+
+        let error = write_direct_decorated_range(
+            &mut Vec::new(),
+            &fallback,
+            &decorations,
+            &theme,
+            0..fallback.line_count(),
+            80,
+            4,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            DirectWriteError::DecorationSnapshotMismatch
+        ));
     }
 
     #[test]
@@ -2865,7 +2839,7 @@ mod tests {
             .read(&document, deletion.id)
             .unwrap()
             .unwrap();
-        let gutter = gutter_spec_for_metadata(&document, metadata);
+        let gutter = gutter_spec_for_metadata(metadata);
         assert!(line_requires_streaming_layout(metadata, 11, 4, gutter).unwrap());
         assert!(
             !decorations
@@ -2912,7 +2886,7 @@ mod tests {
                 .as_bytes(),
         );
         let line = line_with_kind(&document, LineKind::Addition);
-        let gutter = gutter_spec_for_line(&document, &line.as_borrowed());
+        let gutter = gutter_spec_for_line(&line.as_borrowed());
         let expected = layout_line(&line.as_borrowed(), 15, 4, gutter).unwrap();
         let mut stream = LargeLineRows::new(&document, line.id, 15, 4, gutter).unwrap();
         let mut actual = Vec::new();
@@ -3136,7 +3110,7 @@ mod tests {
             b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,1 @@\n+\tfoo\n",
         );
         let addition = line_with_kind(&document, LineKind::Addition);
-        let gutter = gutter_spec_for_line(&document, &addition.as_borrowed());
+        let gutter = gutter_spec_for_line(&addition.as_borrowed());
         let window = collect_large_line_row_window(
             &document,
             addition.id,
@@ -3193,7 +3167,7 @@ mod tests {
             b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,1 @@\n+a\t\n",
         );
         let addition = line_with_kind(&document, LineKind::Addition);
-        let gutter = gutter_spec_for_line(&document, &addition.as_borrowed());
+        let gutter = gutter_spec_for_line(&addition.as_borrowed());
         let window = collect_large_line_row_window(
             &document,
             addition.id,
@@ -3221,7 +3195,7 @@ mod tests {
             b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,1 @@\n+a\t\n",
         );
         let addition = line_with_kind(&document, LineKind::Addition);
-        let gutter = gutter_spec_for_line(&document, &addition.as_borrowed());
+        let gutter = gutter_spec_for_line(&addition.as_borrowed());
         let mut navigator = LargeLineNavigator::new(
             &document,
             addition.id,

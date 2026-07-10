@@ -1,10 +1,10 @@
 //! Raw logical-line table と Git structure を同じ high-water mark で公開する document layer。
 //!
 //! [`DocumentBuilder`] は parser thread だけが所有し、line text を保持せず
-//! [`crate::document_store::DocumentLineStore`] へ固定長 metadata を追記する。Commit / file / hunk と
-//! file ごとの最大行番号は copy-on-write の `Arc<Vec<_>>` に置き、[`DocumentSnapshot`] は line table の
-//! high-water mark と各 `Arc` をcloneするだけで取得する。Snapshot取得後の追記や末尾recordの更新は
-//! `Arc::make_mut` で分離され、既にworkerへ渡したsnapshotを書き換えない。
+//! [`crate::document_store::DocumentLineStore`] へ固定長 metadata を追記する。Commit / file / hunk は
+//! [`crate::structure_store::StructureBuilder`] へ追記し、line table とstructure tableの開始・終了位置を
+//! 同じlogical-line high-water markに制限する。[`DocumentSnapshot`] は両tableのimmutable
+//! snapshotだけを持ち、可変長pathやsubjectを件数分materializeしない。
 //!
 //! Raw textの復元はsnapshot自身では行わない。各workerまたはframeが[`DocumentLineReader`]を1つ持ち、
 //! 返された[`DocumentLineRef`]を次のreadまでだけ借用する。複数行を保持する処理は
@@ -21,14 +21,24 @@ use crate::document_store::{
     LogicalLineRecord, RawLineSpan, RawLineTracker,
 };
 use crate::input::AppendStore;
-use crate::model::{Commit, CommitId, FileEntry, FileId, Hunk, HunkId, LineId, LineKind};
+use crate::model::{
+    ChangeStatus, CommitId, CommitKind, FileId, FileMode, HunkId, HunkKind, LineId, LineKind,
+    LineSpan, SourceRange,
+};
 use crate::storage::StructuralStorage;
+use crate::structure_store::{
+    OpenCommit, OpenFile, OpenHunk, StoredFileMetadata, StoredHunk, StructureBuilder,
+    StructureCounts, StructureFileLineBounds, StructureMetadataReader, StructureSnapshot,
+    StructureStoreError,
+};
 
 /// Document snapshotの構築、metadata検証、lazy decodeに失敗した理由。
 #[derive(Debug, Error)]
 pub enum DocumentError {
     #[error(transparent)]
     LineStore(#[from] LineStoreError),
+    #[error(transparent)]
+    StructureStore(#[from] StructureStoreError),
     #[error("logical line count {count} does not fit a stable u64 ID")]
     LineCountOverflow { count: usize },
     #[error("logical line display length {length} does not fit the on-disk u64 field")]
@@ -37,11 +47,6 @@ pub enum DocumentError {
         "document builder expects {expected} logical lines, but its line store contains {actual}"
     )]
     LineStoreOutOfSync { expected: u64, actual: u64 },
-    #[error("document contains {file_count} files but {bounds_count} file line-bound records")]
-    FileBoundsOutOfSync {
-        file_count: usize,
-        bounds_count: usize,
-    },
     #[error(
         "logical line {line_id} references {kind} {referenced_id}, but only {available} records exist"
     )]
@@ -49,32 +54,7 @@ pub enum DocumentError {
         line_id: LineId,
         kind: &'static str,
         referenced_id: u64,
-        available: usize,
-    },
-    #[error(
-        "logical line {line_id} references {kind} {referenced_id}, but that slot stores ID {stored_id}"
-    )]
-    InvalidLineReferenceIdentity {
-        line_id: LineId,
-        kind: &'static str,
-        referenced_id: u64,
-        stored_id: u64,
-    },
-    #[error(
-        "{record_kind} {record_id} references {referenced_kind} {referenced_id}, but only {available} records exist"
-    )]
-    InvalidStructureReference {
-        record_kind: &'static str,
-        record_id: u64,
-        referenced_kind: &'static str,
-        referenced_id: u64,
-        available: usize,
-    },
-    #[error("{kind} slot {expected_id} stores stable ID {stored_id}")]
-    InvalidStructureIdentity {
-        kind: &'static str,
-        expected_id: u64,
-        stored_id: u64,
+        available: u64,
     },
     #[error("logical line {line_id} references file {child_id} without a commit owner")]
     FileWithoutCommit { line_id: LineId, child_id: FileId },
@@ -100,20 +80,49 @@ pub enum DocumentError {
     },
     #[error("logical line {line_id} has a source line number without a file owner")]
     LineNumberWithoutFile { line_id: LineId },
+    #[error(
+        "{operation} requires logical-line high-water mark {expected}, but received boundary {actual}"
+    )]
+    StructureBoundaryMismatch {
+        operation: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    #[error("{operation} requires open {kind} {expected}, but no {kind} is open")]
+    MissingOpenStructure {
+        operation: &'static str,
+        kind: &'static str,
+        expected: u64,
+    },
+    #[error("{operation} requires open {kind} {expected}, but open {kind} is {actual}")]
+    OpenStructureIdentityMismatch {
+        operation: &'static str,
+        kind: &'static str,
+        expected: u64,
+        actual: u64,
+    },
+    #[error(
+        "{kind} {id} span {start}..{end:?} is invalid for document line high-water mark {line_count}"
+    )]
+    InvalidStructureSpan {
+        kind: &'static str,
+        id: u64,
+        start: u64,
+        end: Option<u64>,
+        line_count: u64,
+    },
+    #[error("logical line {line_id} falls outside {kind} {id} span {start}..{end}")]
+    LineOutsideStructureSpan {
+        line_id: LineId,
+        kind: &'static str,
+        id: u64,
+        start: u64,
+        end: u64,
+    },
+    #[error("cannot mark document complete while {kind} {id} is open")]
+    OpenStructureAtCompletion { kind: &'static str, id: u64 },
     #[error("could not allocate {requested} bytes for an owned logical line")]
     OwnedLineAllocation { requested: usize },
-}
-
-/// File内のsource lineを揃えるgutter幅の算出に使う最大行番号。
-///
-/// 値はparserがline metadataをappendした時だけ増加する。Snapshotはfile recordと同じCOW世代の
-/// vectorを保持するため、後続lineで桁数が増えても以前のsnapshotのreflow条件は変わらない。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FileLineBounds {
-    /// File内で旧側gutterへ表示する最大行番号。旧側を消費するlineが未着なら`None`。
-    pub max_old_line_number: Option<u64>,
-    /// File内で新側gutterへ表示する最大行番号。新側を消費するlineが未着なら`None`。
-    pub max_new_line_number: Option<u64>,
 }
 
 /// 1つの[`DocumentBuilder`]から派生したsnapshotを識別するopaque token。
@@ -149,20 +158,38 @@ impl fmt::Debug for DocumentIdentity {
     }
 }
 
-impl FileLineBounds {
-    fn observe(&mut self, old: Option<u64>, new: Option<u64>) {
-        if let Some(number) = old {
-            self.max_old_line_number = Some(
-                self.max_old_line_number
-                    .map_or(number, |current| current.max(number)),
-            );
-        }
-        if let Some(number) = new {
-            self.max_new_line_number = Some(
-                self.max_new_line_number
-                    .map_or(number, |current| current.max(number)),
-            );
-        }
+/// 1回の[`DocumentBuilder::snapshot`]で公開されたsnapshot revisionを識別するtoken。
+///
+/// [`DocumentIdentity`]は同じbuilderから得たappend-only snapshot間でcacheを再利用するために共有する。
+/// 一方、open file/hunkのmodeやgutter boundsは後続snapshotで変わり得るため、その時点のmetadataから
+/// 計算したderived valueにはこのtokenを結び付ける。`DocumentSnapshot::clone`は同じallocationを共有し、
+/// builderが次にsnapshotを取得すると、内容が同じでも別tokenになる。
+#[derive(Clone)]
+pub(crate) struct DocumentRevision(Arc<DocumentRevisionToken>);
+
+#[derive(Debug)]
+struct DocumentRevisionToken;
+
+impl DocumentRevision {
+    fn new() -> Self {
+        Self(Arc::new(DocumentRevisionToken))
+    }
+}
+
+impl PartialEq for DocumentRevision {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for DocumentRevision {}
+
+impl fmt::Debug for DocumentRevision {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_tuple("DocumentRevision")
+            .field(&Arc::as_ptr(&self.0))
+            .finish()
     }
 }
 
@@ -214,6 +241,9 @@ pub struct DocumentLineMetadata {
     pub old_line_number: Option<u64>,
     /// Context/addition lineが消費する新側行番号。それ以外では`None`。
     pub new_line_number: Option<u64>,
+    /// 親fileがrich modeの場合にgutter幅を決めるsnapshot世代の最大行番号。
+    /// File外では`None`、fallback fileでは両側`None`のboundsに正規化する。
+    pub file_line_bounds: Option<StructureFileLineBounds>,
     /// Raw input上で表示対象のLFにより閉じたlineか。最終unterminated lineだけ`false`。
     pub terminated: bool,
     /// ANSI sequenceを含むraw store上のbyte数。Logical-line終端のLF自体は含まない。
@@ -256,6 +286,8 @@ pub struct DocumentLineRef<'a> {
     pub old_line_number: Option<u64>,
     /// Context/addition lineが消費する新側行番号。それ以外では`None`。
     pub new_line_number: Option<u64>,
+    /// Snapshot世代の親file modeを反映したeffective gutter bounds。
+    pub file_line_bounds: Option<StructureFileLineBounds>,
     /// Raw input上で表示対象のLFにより閉じたlineか。
     pub terminated: bool,
 }
@@ -289,6 +321,7 @@ impl<'line> DocumentLineRef<'line> {
             hunk_id: self.hunk_id,
             old_line_number: self.old_line_number,
             new_line_number: self.new_line_number,
+            file_line_bounds: self.file_line_bounds,
             terminated: self.terminated,
         })
     }
@@ -303,7 +336,7 @@ pub struct OwnedDocumentLine {
     pub id: LineId,
     /// ANSI除去とcontrol-byte escapeを終えたowned UTF-8 text。
     pub text: String,
-    /// Parserがrecord append時に確定した表示上のline分類。
+    /// Parser分類をsnapshot世代のparent modeへ正規化した表示上のline分類。
     pub kind: LineKind,
     /// Plain preambleでは`None`。Commit配下では同じsnapshotのcommit ID。
     pub commit_id: Option<CommitId>,
@@ -315,6 +348,8 @@ pub struct OwnedDocumentLine {
     pub old_line_number: Option<u64>,
     /// Context/addition lineが消費する新側行番号。それ以外では`None`。
     pub new_line_number: Option<u64>,
+    /// Snapshot世代の親file modeを反映したeffective gutter bounds。
+    pub file_line_bounds: Option<StructureFileLineBounds>,
     /// Raw input上で表示対象のLFにより閉じたlineか。
     pub terminated: bool,
 }
@@ -332,6 +367,7 @@ impl OwnedDocumentLine {
             hunk_id: self.hunk_id,
             old_line_number: self.old_line_number,
             new_line_number: self.new_line_number,
+            file_line_bounds: self.file_line_bounds,
             terminated: self.terminated,
         }
     }
@@ -345,17 +381,16 @@ impl OwnedDocumentLine {
 
 /// Logical-line high-water markとimmutable structural generationを束ねるcheap snapshot。
 ///
-/// Cloneはraw store/table handleと4つの`Arc<Vec<_>>`だけを増やす。Line textは含まず、後から
-/// builderへappendされたlineは[`Self::line_count`]にもreaderにも現れない。
+/// Cloneはraw line tableとspill-backed structure tableのhandle、最大3件のopen overlayだけを
+/// 増やす。Line textとpath/subjectのowned copyは含まず、後からbuilderへappendされた
+/// recordは[`Self::line_count`]にも[`Self::structure`]にも現れない。
 #[derive(Clone)]
 pub struct DocumentSnapshot {
     identity: DocumentIdentity,
+    revision: DocumentRevision,
     lines: LineSnapshot,
     line_count: usize,
-    commits: Arc<Vec<Commit>>,
-    files: Arc<Vec<FileEntry>>,
-    hunks: Arc<Vec<Hunk>>,
-    file_line_bounds: Arc<Vec<FileLineBounds>>,
+    structure: StructureSnapshot,
     complete: bool,
     trailing_newline: bool,
 }
@@ -365,6 +400,11 @@ impl DocumentSnapshot {
     #[must_use]
     pub fn identity(&self) -> DocumentIdentity {
         self.identity.clone()
+    }
+
+    /// Derived valueがこのsnapshot取得時点のmetadataに結び付いているかを照合するtokenを返す。
+    pub(crate) fn revision(&self) -> DocumentRevision {
+        self.revision.clone()
     }
 
     /// Snapshot取得時点で確定していたlogical-line数を返す。
@@ -394,61 +434,18 @@ impl DocumentSnapshot {
         usize::try_from(id.get()).is_ok_and(|index| index < self.line_count)
     }
 
-    /// Snapshot取得時点のcommit groupをGit出力順で返す。
-    #[must_use]
-    pub fn commits(&self) -> &[Commit] {
-        self.commits.as_slice()
-    }
-
-    /// Snapshot取得時点のfile occurrenceをGit出力順で返す。
-    #[must_use]
-    pub fn files(&self) -> &[FileEntry] {
-        self.files.as_slice()
-    }
-
-    /// Snapshot取得時点のhunkをGit出力順で返す。
-    #[must_use]
-    pub fn hunks(&self) -> &[Hunk] {
-        self.hunks.as_slice()
-    }
-
-    /// Stable IDのcommitを返す。Snapshot外のIDなら`None`。
-    #[must_use]
-    pub fn commit(&self, id: CommitId) -> Option<&Commit> {
-        checked_index(id.get(), self.commits.len())
-            .and_then(|index| self.commits.get(index))
-            .filter(|commit| commit.id == id)
-    }
-
-    /// Stable IDのfile occurrenceを返す。Snapshot外のIDなら`None`。
-    #[must_use]
-    pub fn file(&self, id: FileId) -> Option<&FileEntry> {
-        checked_index(id.get(), self.files.len())
-            .and_then(|index| self.files.get(index))
-            .filter(|file| file.id == id)
-    }
-
-    /// Stable IDのhunkを返す。Snapshot外のIDなら`None`。
-    #[must_use]
-    pub fn hunk(&self, id: HunkId) -> Option<&Hunk> {
-        checked_index(id.get(), self.hunks.len())
-            .and_then(|index| self.hunks.get(index))
-            .filter(|hunk| hunk.id == id)
-    }
-
-    /// File IDに対応する旧/新source lineの最大値をO(1)で返す。
+    /// Commit / file / hunkのimmutable high-water markとopen overlayを返す。
     ///
-    /// Streaming中に蓄積した番号の後でfileがfallbackへdowngradeされたsnapshotでは、gutterを再表示
-    /// しないよう両側`None`のboundsを返す。以前に取得したrich snapshotのboundsは変化しない。
+    /// Pathやsubjectを読むcallerは[`crate::structure_store::StructureReader`]、固定長metadata
+    /// だけを読むcallerは[`StructureMetadataReader`]を自身で再利用する。
     #[must_use]
-    pub fn file_line_bounds(&self, id: FileId) -> Option<FileLineBounds> {
-        let file = self.file(id)?;
-        if !file.mode.is_rich() {
-            return Some(FileLineBounds::default());
-        }
-        checked_index(id.get(), self.file_line_bounds.len())
-            .and_then(|index| self.file_line_bounds.get(index))
-            .copied()
+    pub const fn structure(&self) -> &StructureSnapshot {
+        &self.structure
+    }
+
+    /// Open overlayを含むstructural record件数をoverflow検査付きで返す。
+    pub fn structure_counts(&self) -> Result<StructureCounts, DocumentError> {
+        self.structure.visible_counts().map_err(DocumentError::from)
     }
 
     /// EOF処理とopen spanのcloseが終わったsnapshotかを返す。
@@ -465,8 +462,8 @@ impl DocumentSnapshot {
 
     /// File grammarを1件も検出していないplain pager snapshotかを返す。
     #[must_use]
-    pub fn is_plain(&self) -> bool {
-        self.files.is_empty()
+    pub const fn is_plain(&self) -> bool {
+        self.structure.is_plain()
     }
 
     /// 巨大行decoderへ渡すline-table snapshot。Raw store自体は公開しない。
@@ -480,9 +477,9 @@ impl fmt::Debug for DocumentSnapshot {
         formatter
             .debug_struct("DocumentSnapshot")
             .field("line_count", &self.line_count)
-            .field("commit_count", &self.commits.len())
-            .field("file_count", &self.files.len())
-            .field("hunk_count", &self.hunks.len())
+            .field("commit_count", &self.structure.commit_count())
+            .field("file_count", &self.structure.file_count())
+            .field("hunk_count", &self.structure.hunk_count())
             .field("complete", &self.complete)
             .field("trailing_newline", &self.trailing_newline)
             .finish()
@@ -496,6 +493,7 @@ impl fmt::Debug for DocumentSnapshot {
 #[derive(Debug, Default)]
 pub struct DocumentLineReader {
     decoder: LineDecoder,
+    structure: StructureMetadataReader,
 }
 
 impl DocumentLineReader {
@@ -504,6 +502,7 @@ impl DocumentLineReader {
     pub const fn new() -> Self {
         Self {
             decoder: LineDecoder::new(),
+            structure: StructureMetadataReader::new(),
         }
     }
 
@@ -516,10 +515,11 @@ impl DocumentLineReader {
         document: &DocumentSnapshot,
         line_id: LineId,
     ) -> Result<Option<DocumentLineRef<'a>>, DocumentError> {
-        let Some(decoded) = self.decoder.decode(&document.lines, line_id.get())? else {
+        let Self { decoder, structure } = self;
+        let Some(decoded) = decoder.decode(&document.lines, line_id.get())? else {
             return Ok(None);
         };
-        let metadata = metadata_from_record(document, line_id, decoded.record)?;
+        let metadata = metadata_from_record(document, line_id, decoded.record, structure)?;
         Ok(Some(line_ref(metadata, decoded.text)))
     }
 
@@ -539,6 +539,7 @@ impl DocumentLineReader {
 #[derive(Debug, Default)]
 pub struct DocumentLineMetadataReader {
     record_buffer: Vec<u8>,
+    structure: StructureMetadataReader,
 }
 
 impl DocumentLineMetadataReader {
@@ -547,6 +548,7 @@ impl DocumentLineMetadataReader {
     pub const fn new() -> Self {
         Self {
             record_buffer: Vec::new(),
+            structure: StructureMetadataReader::new(),
         }
     }
 
@@ -562,7 +564,7 @@ impl DocumentLineMetadataReader {
         else {
             return Ok(None);
         };
-        metadata_from_record(document, line_id, record).map(Some)
+        metadata_from_record(document, line_id, record, &mut self.structure).map(Some)
     }
 }
 
@@ -583,10 +585,8 @@ pub(crate) struct DocumentBuilder {
     identity: DocumentIdentity,
     line_store: DocumentLineStore,
     line_count: usize,
-    commits: Arc<Vec<Commit>>,
-    files: Arc<Vec<FileEntry>>,
-    hunks: Arc<Vec<Hunk>>,
-    file_line_bounds: Arc<Vec<FileLineBounds>>,
+    structure: StructureBuilder,
+    structure_reader: StructureMetadataReader,
     complete: bool,
     trailing_newline: bool,
 }
@@ -596,9 +596,7 @@ impl fmt::Debug for DocumentBuilder {
         formatter
             .debug_struct("DocumentBuilder")
             .field("line_count", &self.line_count)
-            .field("commit_count", &self.commits.len())
-            .field("file_count", &self.files.len())
-            .field("hunk_count", &self.hunks.len())
+            .field("structure_counts", &self.structure.visible_counts().ok())
             .field("complete", &self.complete)
             .field("trailing_newline", &self.trailing_newline)
             .finish_non_exhaustive()
@@ -615,10 +613,8 @@ impl DocumentBuilder {
             identity: DocumentIdentity(Arc::new(DocumentIdentityToken)),
             line_store: DocumentLineStore::new(raw, storage)?,
             line_count: 0,
-            commits: Arc::new(Vec::new()),
-            files: Arc::new(Vec::new()),
-            hunks: Arc::new(Vec::new()),
-            file_line_bounds: Arc::new(Vec::new()),
+            structure: StructureBuilder::new(storage)?,
+            structure_reader: StructureMetadataReader::new(),
             complete: false,
             trailing_newline: false,
         })
@@ -634,123 +630,221 @@ impl DocumentBuilder {
         self.line_count
     }
 
-    #[must_use]
-    pub(crate) fn commits(&self) -> &[Commit] {
-        self.commits.as_slice()
+    /// 次にappendするlogical lineのstable IDを返す。
+    pub(crate) fn next_line_id(&self) -> Result<LineId, DocumentError> {
+        Ok(LineId::new(self.line_high_water()?))
     }
 
-    #[must_use]
-    pub(crate) fn files(&self) -> &[FileEntry] {
-        self.files.as_slice()
+    /// Open overlayを含むstructural record件数を返す。Parse deltaはこの値を
+    /// 追記前後で差分化し、spill tableをmaterializeしない。
+    pub(crate) fn structure_counts(&self) -> Result<StructureCounts, DocumentError> {
+        self.structure.visible_counts().map_err(DocumentError::from)
     }
 
-    #[must_use]
-    pub(crate) fn hunks(&self) -> &[Hunk] {
-        self.hunks.as_slice()
+    /// 現在のline high-water markでcommitを開始する。
+    pub(crate) fn begin_commit(
+        &mut self,
+        kind: CommitKind,
+        object_id: Option<String>,
+        start: LineId,
+    ) -> Result<CommitId, DocumentError> {
+        self.validate_boundary("begin commit", start.get())?;
+        self.structure
+            .begin_commit(kind, object_id, start)
+            .map_err(DocumentError::from)
     }
 
-    #[must_use]
-    pub(crate) fn commit(&self, id: CommitId) -> Option<&Commit> {
-        checked_index(id.get(), self.commits.len())
-            .and_then(|index| self.commits.get(index))
-            .filter(|commit| commit.id == id)
-    }
-
-    #[must_use]
-    pub(crate) fn file(&self, id: FileId) -> Option<&FileEntry> {
-        checked_index(id.get(), self.files.len())
-            .and_then(|index| self.files.get(index))
-            .filter(|file| file.id == id)
-    }
-
-    pub(crate) fn commit_mut(&mut self, id: CommitId) -> Option<&mut Commit> {
-        let index = checked_index(id.get(), self.commits.len())?;
-        Arc::make_mut(&mut self.commits)
-            .get_mut(index)
-            .filter(|commit| commit.id == id)
-    }
-
-    pub(crate) fn file_mut(&mut self, id: FileId) -> Option<&mut FileEntry> {
-        let index = checked_index(id.get(), self.files.len())?;
-        Arc::make_mut(&mut self.files)
-            .get_mut(index)
-            .filter(|file| file.id == id)
-    }
-
-    pub(crate) fn hunk_mut(&mut self, id: HunkId) -> Option<&mut Hunk> {
-        let index = checked_index(id.get(), self.hunks.len())?;
-        Arc::make_mut(&mut self.hunks)
-            .get_mut(index)
-            .filter(|hunk| hunk.id == id)
-    }
-
-    /// Commitをappendし、callerが渡したIDとchild listをbuilder所有値へ置き換える。
-    pub(crate) fn push_commit(&mut self, mut commit: Commit) -> CommitId {
-        let id = CommitId::new(self.commits.len() as u64);
-        commit.id = id;
-        commit.file_ids.clear();
-        Arc::make_mut(&mut self.commits).push(commit);
-        id
-    }
-
-    /// Fileをappendし、parent commitのfile listとbounds vectorを同じCOW世代へ更新する。
-    pub(crate) fn push_file(&mut self, mut file: FileEntry) -> Result<FileId, DocumentError> {
-        let id = FileId::new(self.files.len() as u64);
-        let Some(commit_index) = checked_index(file.commit_id.get(), self.commits.len()) else {
-            return Err(DocumentError::InvalidStructureReference {
-                record_kind: "file",
-                record_id: id.get(),
-                referenced_kind: "commit",
-                referenced_id: file.commit_id.get(),
-                available: self.commits.len(),
-            });
-        };
-        if let Some(commit) = self.commits.get(commit_index)
-            && commit.id != file.commit_id
-        {
-            return Err(DocumentError::InvalidStructureIdentity {
+    /// 指定IDが現在のopen commitと一致する場合だけimmutable viewを返す。
+    pub(crate) fn open_commit(&self, id: CommitId) -> Result<&OpenCommit, DocumentError> {
+        let Some(commit) = self.structure.open_commit() else {
+            return Err(DocumentError::MissingOpenStructure {
+                operation: "read commit",
                 kind: "commit",
-                expected_id: file.commit_id.get(),
-                stored_id: commit.id.get(),
-            });
-        }
-        file.id = id;
-        file.hunk_ids.clear();
-        Arc::make_mut(&mut self.files).push(file);
-        Arc::make_mut(&mut self.file_line_bounds).push(FileLineBounds::default());
-        if let Some(commit) = Arc::make_mut(&mut self.commits).get_mut(commit_index) {
-            commit.file_ids.push(id);
-        }
-        Ok(id)
-    }
-
-    /// Hunkをappendし、parent fileのhunk listへ同じstable IDを追加する。
-    pub(crate) fn push_hunk(&mut self, mut hunk: Hunk) -> Result<HunkId, DocumentError> {
-        let id = HunkId::new(self.hunks.len() as u64);
-        let Some(file_index) = checked_index(hunk.file_id.get(), self.files.len()) else {
-            return Err(DocumentError::InvalidStructureReference {
-                record_kind: "hunk",
-                record_id: id.get(),
-                referenced_kind: "file",
-                referenced_id: hunk.file_id.get(),
-                available: self.files.len(),
+                expected: id.get(),
             });
         };
-        if let Some(file) = self.files.get(file_index)
-            && file.id != hunk.file_id
-        {
-            return Err(DocumentError::InvalidStructureIdentity {
-                kind: "file",
-                expected_id: hunk.file_id.get(),
-                stored_id: file.id.get(),
+        if commit.id() != id {
+            return Err(DocumentError::OpenStructureIdentityMismatch {
+                operation: "read commit",
+                kind: "commit",
+                expected: id.get(),
+                actual: commit.id().get(),
             });
         }
-        hunk.id = id;
-        Arc::make_mut(&mut self.hunks).push(hunk);
-        if let Some(file) = Arc::make_mut(&mut self.files).get_mut(file_index) {
-            file.hunk_ids.push(id);
+        Ok(commit)
+    }
+
+    /// 指定IDのopen commitをCOW分離して更新可能にする。
+    pub(crate) fn open_commit_mut(
+        &mut self,
+        id: CommitId,
+    ) -> Result<&mut OpenCommit, DocumentError> {
+        let _ = self.open_commit(id)?;
+        self.structure
+            .open_commit_mut()
+            .ok_or(DocumentError::MissingOpenStructure {
+                operation: "mutate commit",
+                kind: "commit",
+                expected: id.get(),
+            })
+    }
+
+    /// 現在のline high-water markでopen commit配下のfileを開始する。
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn begin_file(
+        &mut self,
+        commit_id: CommitId,
+        old_path: Option<String>,
+        new_path: Option<String>,
+        status: ChangeStatus,
+        mode: FileMode,
+        start: LineId,
+    ) -> Result<FileId, DocumentError> {
+        self.validate_boundary("begin file", start.get())?;
+        let _ = self.open_commit(commit_id)?;
+        self.structure
+            .begin_file(commit_id, old_path, new_path, status, mode, start)
+            .map_err(DocumentError::from)
+    }
+
+    /// 指定IDが現在のopen fileと一致する場合だけimmutable viewを返す。
+    pub(crate) fn open_file(&self, id: FileId) -> Result<&OpenFile, DocumentError> {
+        let Some(file) = self.structure.open_file() else {
+            return Err(DocumentError::MissingOpenStructure {
+                operation: "read file",
+                kind: "file",
+                expected: id.get(),
+            });
+        };
+        if file.id() != id {
+            return Err(DocumentError::OpenStructureIdentityMismatch {
+                operation: "read file",
+                kind: "file",
+                expected: id.get(),
+                actual: file.id().get(),
+            });
         }
-        Ok(id)
+        Ok(file)
+    }
+
+    /// 指定IDのopen fileをCOW分離して更新可能にする。
+    pub(crate) fn open_file_mut(&mut self, id: FileId) -> Result<&mut OpenFile, DocumentError> {
+        let _ = self.open_file(id)?;
+        self.structure
+            .open_file_mut()
+            .ok_or(DocumentError::MissingOpenStructure {
+                operation: "mutate file",
+                kind: "file",
+                expected: id.get(),
+            })
+    }
+
+    /// 現在のline high-water markでopen file配下のhunkを開始する。
+    pub(crate) fn begin_hunk(
+        &mut self,
+        file_id: FileId,
+        kind: HunkKind,
+        header_line: LineId,
+        old_range: Option<SourceRange>,
+        new_range: Option<SourceRange>,
+    ) -> Result<HunkId, DocumentError> {
+        self.validate_boundary("begin hunk", header_line.get())?;
+        let _ = self.open_file(file_id)?;
+        self.structure
+            .begin_hunk(file_id, kind, header_line, old_range, new_range)
+            .map_err(DocumentError::from)
+    }
+
+    /// 指定IDが現在のopen hunkと一致する場合だけimmutable viewを返す。
+    pub(crate) fn open_hunk(&self, id: HunkId) -> Result<&OpenHunk, DocumentError> {
+        let Some(hunk) = self.structure.open_hunk() else {
+            return Err(DocumentError::MissingOpenStructure {
+                operation: "read hunk",
+                kind: "hunk",
+                expected: id.get(),
+            });
+        };
+        if hunk.id() != id {
+            return Err(DocumentError::OpenStructureIdentityMismatch {
+                operation: "read hunk",
+                kind: "hunk",
+                expected: id.get(),
+                actual: hunk.id().get(),
+            });
+        }
+        Ok(hunk)
+    }
+
+    /// 指定IDのopen hunkをCOW分離して更新可能にする。
+    pub(crate) fn open_hunk_mut(&mut self, id: HunkId) -> Result<&mut OpenHunk, DocumentError> {
+        let _ = self.open_hunk(id)?;
+        self.structure
+            .open_hunk_mut()
+            .ok_or(DocumentError::MissingOpenStructure {
+                operation: "mutate hunk",
+                kind: "hunk",
+                expected: id.get(),
+            })
+    }
+
+    /// 指定open hunkを現在のline high-water markで閉じる。
+    pub(crate) fn finish_hunk(
+        &mut self,
+        id: HunkId,
+        end_exclusive: u64,
+    ) -> Result<(), DocumentError> {
+        self.validate_boundary("finish hunk", end_exclusive)?;
+        let _ = self.open_hunk(id)?;
+        let actual = self.structure.finish_hunk(end_exclusive)?;
+        if actual != id {
+            return Err(DocumentError::OpenStructureIdentityMismatch {
+                operation: "finish hunk",
+                kind: "hunk",
+                expected: id.get(),
+                actual: actual.get(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 指定open fileを現在のline high-water markで閉じる。
+    pub(crate) fn finish_file(
+        &mut self,
+        id: FileId,
+        end_exclusive: u64,
+    ) -> Result<(), DocumentError> {
+        self.validate_boundary("finish file", end_exclusive)?;
+        let _ = self.open_file(id)?;
+        let actual = self.structure.finish_file(end_exclusive)?;
+        if actual != id {
+            return Err(DocumentError::OpenStructureIdentityMismatch {
+                operation: "finish file",
+                kind: "file",
+                expected: id.get(),
+                actual: actual.get(),
+            });
+        }
+        Ok(())
+    }
+
+    /// 指定open commitを現在のline high-water markで閉じる。
+    pub(crate) fn finish_commit(
+        &mut self,
+        id: CommitId,
+        end_exclusive: u64,
+    ) -> Result<(), DocumentError> {
+        self.validate_boundary("finish commit", end_exclusive)?;
+        let _ = self.open_commit(id)?;
+        let actual = self.structure.finish_commit(end_exclusive)?;
+        if actual != id {
+            return Err(DocumentError::OpenStructureIdentityMismatch {
+                operation: "finish commit",
+                kind: "commit",
+                expected: id.get(),
+                actual: actual.get(),
+            });
+        }
+        Ok(())
     }
 
     /// Boundary proofとtyped metadataを1つのfixed recordとしてcommitする。
@@ -776,24 +870,34 @@ impl DocumentBuilder {
         if actual != expected {
             return Err(DocumentError::LineStoreOutOfSync { expected, actual });
         }
-        if self.files.len() != self.file_line_bounds.len() {
-            return Err(DocumentError::FileBoundsOutOfSync {
-                file_count: self.files.len(),
-                bounds_count: self.file_line_bounds.len(),
-            });
-        }
         let line_id = LineId::new(expected);
-        validate_line_references(
-            line_id,
-            line.commit_id,
-            line.file_id,
-            line.hunk_id,
-            line.old_line_number,
-            line.new_line_number,
-            &self.commits,
-            &self.files,
-            &self.hunks,
-        )?;
+        {
+            // Validation snapshotはopen overlayのArcを共有する。Line bounds更新まで保持すると
+            // `Arc::make_mut`がpathを含むOpenFile全体を各source lineで複製するため、参照検査を
+            // 終えた時点でscopeを閉じ、後段のmutationを唯一所有のoverlayへ適用する。
+            let structure = self.structure.snapshot()?;
+            validate_line_references(
+                line_id,
+                line.commit_id,
+                line.file_id,
+                line.hunk_id,
+                line.old_line_number,
+                line.new_line_number,
+                &structure,
+                u64::try_from(next_line_count).map_err(|_| DocumentError::LineCountOverflow {
+                    count: next_line_count,
+                })?,
+                &mut self.structure_reader,
+            )?;
+        }
+        if let Some(file_id) = line.file_id
+            && (line.old_line_number.is_some() || line.new_line_number.is_some())
+        {
+            // Boundsはline record append成功後だけ進めるが、更新先のopen overlayは
+            // append前に確定する。Finalized fileへの番号付きlineを許すと、record書き込み後に
+            // bounds更新だけ失敗し、line tableとstructure tableが分離する。
+            let _ = self.open_file(file_id)?;
+        }
         let display_len =
             u64::try_from(line.display_len).map_err(|_| DocumentError::DisplayLengthOverflow {
                 length: line.display_len,
@@ -820,10 +924,10 @@ impl DocumentBuilder {
 
         if let Some(file_id) = line.file_id
             && (line.old_line_number.is_some() || line.new_line_number.is_some())
-            && let Some(index) = checked_index(file_id.get(), self.file_line_bounds.len())
-            && let Some(bounds) = Arc::make_mut(&mut self.file_line_bounds).get_mut(index)
         {
-            bounds.observe(line.old_line_number, line.new_line_number);
+            self.open_file_mut(file_id)?
+                .line_bounds
+                .observe(line.old_line_number, line.new_line_number);
         }
         self.line_count = next_line_count;
         self.trailing_newline = terminated;
@@ -843,27 +947,61 @@ impl DocumentBuilder {
                 actual: lines.len(),
             });
         }
-        if self.files.len() != self.file_line_bounds.len() {
-            return Err(DocumentError::FileBoundsOutOfSync {
-                file_count: self.files.len(),
-                bounds_count: self.file_line_bounds.len(),
-            });
-        }
+        let structure = self.structure.snapshot()?;
+        validate_open_snapshot_spans(&structure, expected)?;
         Ok(DocumentSnapshot {
             identity: self.identity.clone(),
+            revision: DocumentRevision::new(),
             lines,
             line_count: self.line_count,
-            commits: Arc::clone(&self.commits),
-            files: Arc::clone(&self.files),
-            hunks: Arc::clone(&self.hunks),
-            file_line_bounds: Arc::clone(&self.file_line_bounds),
+            structure,
             complete: self.complete,
             trailing_newline: self.trailing_newline,
         })
     }
 
-    pub(crate) fn mark_complete(&mut self) {
+    /// Open structureが残っていないline/structure同期済みdocumentをEOF状態にする。
+    pub(crate) fn mark_complete(&mut self) -> Result<(), DocumentError> {
+        let structure = self.structure.snapshot()?;
+        if let Some(hunk) = structure.open_hunk() {
+            return Err(DocumentError::OpenStructureAtCompletion {
+                kind: "hunk",
+                id: hunk.id().get(),
+            });
+        }
+        if let Some(file) = structure.open_file() {
+            return Err(DocumentError::OpenStructureAtCompletion {
+                kind: "file",
+                id: file.id().get(),
+            });
+        }
+        if let Some(commit) = structure.open_commit() {
+            return Err(DocumentError::OpenStructureAtCompletion {
+                kind: "commit",
+                id: commit.id().get(),
+            });
+        }
+        let _ = self.snapshot()?;
         self.complete = true;
+        Ok(())
+    }
+
+    fn line_high_water(&self) -> Result<u64, DocumentError> {
+        u64::try_from(self.line_count).map_err(|_| DocumentError::LineCountOverflow {
+            count: self.line_count,
+        })
+    }
+
+    fn validate_boundary(&self, operation: &'static str, actual: u64) -> Result<(), DocumentError> {
+        let expected = self.line_high_water()?;
+        if actual != expected {
+            return Err(DocumentError::StructureBoundaryMismatch {
+                operation,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
     }
 }
 
@@ -871,20 +1009,25 @@ fn metadata_from_record(
     document: &DocumentSnapshot,
     line_id: LineId,
     record: LogicalLineRecord,
+    structure_reader: &mut StructureMetadataReader,
 ) -> Result<DocumentLineMetadata, DocumentError> {
     let commit_id = record.commit_id().map(CommitId::new);
     let file_id = record.file_id().map(FileId::new);
     let hunk_id = record.hunk_id().map(HunkId::new);
-    validate_line_references(
+    let line_count =
+        u64::try_from(document.line_count).map_err(|_| DocumentError::LineCountOverflow {
+            count: document.line_count,
+        })?;
+    let validated = validate_line_references(
         line_id,
         commit_id,
         file_id,
         hunk_id,
         record.old_line_number(),
         record.new_line_number(),
-        &document.commits,
-        &document.files,
-        &document.hunks,
+        &document.structure,
+        line_count,
+        structure_reader,
     )?;
     let display_len = if record.display_len_overflowed() {
         LineDisplayLength::Overflowed
@@ -894,12 +1037,10 @@ fn metadata_from_record(
     let mut kind = record.kind();
     let mut old_line_number = record.old_line_number();
     let mut new_line_number = record.new_line_number();
-    let file_is_fallback = file_id
-        .and_then(|id| document.file(id))
-        .is_some_and(|file| !file.mode.is_rich());
-    let hunk_is_fallback = hunk_id
-        .and_then(|id| document.hunk(id))
-        .is_some_and(|hunk| hunk.kind != crate::model::HunkKind::Unified);
+    let file_is_fallback = validated.file.is_some_and(|file| !file.mode.is_rich());
+    let hunk_is_fallback = validated
+        .hunk
+        .is_some_and(|hunk| hunk.kind != HunkKind::Unified);
     if is_source_line(kind) && (file_is_fallback || hunk_is_fallback) {
         // Hunk bodyがstream中はrichでも、EOF時の不足行や後続のunsupported markerでfile全体が
         // fallbackへ変わり得る。Fixed line recordはappend-onlyなので、snapshot世代のparent modeを
@@ -908,6 +1049,13 @@ fn metadata_from_record(
         old_line_number = None;
         new_line_number = None;
     }
+    let file_line_bounds = validated.file.map(|file| {
+        if file.mode.is_rich() {
+            file.line_bounds
+        } else {
+            StructureFileLineBounds::default()
+        }
+    });
     Ok(DocumentLineMetadata {
         id: line_id,
         kind,
@@ -916,6 +1064,7 @@ fn metadata_from_record(
         hunk_id,
         old_line_number,
         new_line_number,
+        file_line_bounds,
         terminated: record.terminated(),
         raw_len: record.raw_end().saturating_sub(record.raw_start()),
         display_len,
@@ -932,8 +1081,15 @@ fn line_ref(metadata: DocumentLineMetadata, text: &str) -> DocumentLineRef<'_> {
         hunk_id: metadata.hunk_id,
         old_line_number: metadata.old_line_number,
         new_line_number: metadata.new_line_number,
+        file_line_bounds: metadata.file_line_bounds,
         terminated: metadata.terminated,
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ValidatedLineStructure {
+    file: Option<StoredFileMetadata>,
+    hunk: Option<StoredHunk>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -944,122 +1100,153 @@ fn validate_line_references(
     hunk_id: Option<HunkId>,
     old_line_number: Option<u64>,
     new_line_number: Option<u64>,
-    commits: &[Commit],
-    files: &[FileEntry],
-    hunks: &[Hunk],
-) -> Result<(), DocumentError> {
-    if let Some(id) = commit_id {
-        validate_line_reference(line_id, "commit", id.get(), commits.len())?;
-        if let Some(commit) =
-            checked_index(id.get(), commits.len()).and_then(|index| commits.get(index))
-            && commit.id != id
-        {
-            return Err(DocumentError::InvalidLineReferenceIdentity {
-                line_id,
-                kind: "commit",
-                referenced_id: id.get(),
-                stored_id: commit.id.get(),
-            });
-        }
-    }
+    structure: &StructureSnapshot,
+    line_count: u64,
+    reader: &mut StructureMetadataReader,
+) -> Result<ValidatedLineStructure, DocumentError> {
+    let counts = structure.visible_counts()?;
+    let commit = if let Some(id) = commit_id {
+        let commit =
+            reader
+                .read_commit(structure, id)?
+                .ok_or(DocumentError::InvalidLineReference {
+                    line_id,
+                    kind: "commit",
+                    referenced_id: id.get(),
+                    available: counts.commits,
+                })?;
+        validate_structure_span("commit", id.get(), commit.span, line_id, line_count)?;
+        Some(commit)
+    } else {
+        None
+    };
+
     let file = if let Some(id) = file_id {
-        validate_line_reference(line_id, "file", id.get(), files.len())?;
-        let index = checked_index(id.get(), files.len());
-        let file = index.and_then(|value| files.get(value));
-        if let Some(file) = file
-            && file.id != id
-        {
-            return Err(DocumentError::InvalidLineReferenceIdentity {
+        let Some(parent) = commit else {
+            return Err(DocumentError::FileWithoutCommit {
+                line_id,
+                child_id: id,
+            });
+        };
+        let file = reader.read_file_in_commit(structure, id, parent)?.ok_or(
+            DocumentError::InvalidLineReference {
                 line_id,
                 kind: "file",
                 referenced_id: id.get(),
-                stored_id: file.id.get(),
+                available: counts.files,
+            },
+        )?;
+        if file.commit_id != parent.id {
+            return Err(DocumentError::FileCommitMismatch {
+                line_id,
+                file_id: id,
+                expected: file.commit_id,
+                actual: parent.id,
             });
         }
-        file
+        validate_structure_span("file", id.get(), file.span, line_id, line_count)?;
+        Some(file)
     } else {
         None
     };
+
     let hunk = if let Some(id) = hunk_id {
-        validate_line_reference(line_id, "hunk", id.get(), hunks.len())?;
-        let index = checked_index(id.get(), hunks.len());
-        let hunk = index.and_then(|value| hunks.get(value));
-        if let Some(hunk) = hunk
-            && hunk.id != id
-        {
-            return Err(DocumentError::InvalidLineReferenceIdentity {
+        let Some(parent) = file else {
+            return Err(DocumentError::HunkWithoutFile {
+                line_id,
+                child_id: id,
+            });
+        };
+        let hunk = reader.read_hunk_in_file(structure, id, parent)?.ok_or(
+            DocumentError::InvalidLineReference {
                 line_id,
                 kind: "hunk",
                 referenced_id: id.get(),
-                stored_id: hunk.id.get(),
+                available: counts.hunks,
+            },
+        )?;
+        if hunk.file_id != parent.id {
+            return Err(DocumentError::HunkFileMismatch {
+                line_id,
+                hunk_id: id,
+                expected: hunk.file_id,
+                actual: parent.id,
             });
         }
-        hunk
+        validate_structure_span("hunk", id.get(), hunk.span, line_id, line_count)?;
+        Some(hunk)
     } else {
         None
     };
 
-    if let Some(file_id) = file_id {
-        let Some(actual_commit) = commit_id else {
-            return Err(DocumentError::FileWithoutCommit {
-                line_id,
-                child_id: file_id,
-            });
-        };
-        if let Some(file) = file
-            && file.commit_id != actual_commit
-        {
-            return Err(DocumentError::FileCommitMismatch {
-                line_id,
-                file_id,
-                expected: file.commit_id,
-                actual: actual_commit,
-            });
-        }
-    }
-    if let Some(hunk_id) = hunk_id {
-        let Some(actual_file) = file_id else {
-            return Err(DocumentError::HunkWithoutFile {
-                line_id,
-                child_id: hunk_id,
-            });
-        };
-        if let Some(hunk) = hunk
-            && hunk.file_id != actual_file
-        {
-            return Err(DocumentError::HunkFileMismatch {
-                line_id,
-                hunk_id,
-                expected: hunk.file_id,
-                actual: actual_file,
-            });
-        }
-    }
     if file_id.is_none() && (old_line_number.is_some() || new_line_number.is_some()) {
         return Err(DocumentError::LineNumberWithoutFile { line_id });
     }
-    Ok(())
+    Ok(ValidatedLineStructure { file, hunk })
 }
 
-fn validate_line_reference(
-    line_id: LineId,
+fn validate_structure_span(
     kind: &'static str,
-    referenced_id: u64,
-    available: usize,
+    id: u64,
+    span: LineSpan,
+    line_id: LineId,
+    line_count: u64,
 ) -> Result<(), DocumentError> {
-    if checked_index(referenced_id, available).is_none() {
-        return Err(DocumentError::InvalidLineReference {
+    let start = span.start.get();
+    let end = span.end_exclusive.unwrap_or(line_count);
+    if start >= end || end > line_count {
+        return Err(DocumentError::InvalidStructureSpan {
+            kind,
+            id,
+            start,
+            end: span.end_exclusive,
+            line_count,
+        });
+    }
+    if line_id.get() < start || line_id.get() >= end {
+        return Err(DocumentError::LineOutsideStructureSpan {
             line_id,
             kind,
-            referenced_id,
-            available,
+            id,
+            start,
+            end,
         });
     }
     Ok(())
 }
 
-fn checked_index(value: u64, len: usize) -> Option<usize> {
-    usize::try_from(value).ok().filter(|index| *index < len)
+fn validate_open_snapshot_spans(
+    structure: &StructureSnapshot,
+    line_count: u64,
+) -> Result<(), DocumentError> {
+    if let Some(commit) = structure.open_commit() {
+        validate_structure_span(
+            "commit",
+            commit.id().get(),
+            commit.span(),
+            commit.span().start,
+            line_count,
+        )?;
+    }
+    if let Some(file) = structure.open_file() {
+        validate_structure_span(
+            "file",
+            file.id().get(),
+            file.span(),
+            file.span().start,
+            line_count,
+        )?;
+    }
+    if let Some(hunk) = structure.open_hunk() {
+        validate_structure_span(
+            "hunk",
+            hunk.id().get(),
+            hunk.span(),
+            hunk.span().start,
+            line_count,
+        )?;
+    }
+    Ok(())
 }
 
 fn is_source_line(kind: LineKind) -> bool {
@@ -1071,63 +1258,69 @@ fn is_source_line(kind: LineKind) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
-    use crate::document_store::LogicalLineMetadata;
+    use crate::document_store::{LogicalLineMetadata, RawLineSpan, RawLineTracker};
     use crate::input::AppendStore;
     use crate::model::{
-        ChangeStatus, Commit, CommitId, CommitKind, FileEntry, FileId, FileMode, Hunk, HunkId,
-        HunkKind, LineId, LineKind, LineSpan, SourceRange,
+        ChangeStatus, CommitId, CommitKind, FileId, FileMode, HunkId, HunkKind, LineId, LineKind,
+        SourceRange,
     };
     use crate::storage::{StorageConfig, StructuralStorage};
+    use crate::structure_store::{StructureFileLineBounds, StructureMetadataReader};
 
     use super::{
-        AppendDocumentLine, DocumentBuilder, DocumentLineMetadataReader, DocumentLineReader,
-        DocumentSnapshot, FileLineBounds, LineDisplayLength,
+        AppendDocumentLine, DocumentBuilder, DocumentError, DocumentLineMetadataReader,
+        DocumentLineReader, DocumentSnapshot, LineDisplayLength,
     };
 
-    fn commit() -> Commit {
-        Commit {
-            id: CommitId::new(0),
-            kind: CommitKind::WorkingTree,
-            object_id: None,
-            subject: None,
-            span: LineSpan::open(LineId::new(0)),
-            file_ids: Vec::new(),
-        }
+    fn begin_rich_structure(
+        builder: &mut DocumentBuilder,
+        start: LineId,
+    ) -> (CommitId, FileId, HunkId) {
+        let commit_id = builder
+            .begin_commit(CommitKind::WorkingTree, None, start)
+            .unwrap();
+        let file_id = builder
+            .begin_file(
+                commit_id,
+                Some("src/lib.rs".to_owned()),
+                Some("src/lib.rs".to_owned()),
+                ChangeStatus::Modified,
+                FileMode::Rich,
+                start,
+            )
+            .unwrap();
+        let hunk_id = builder
+            .begin_hunk(
+                file_id,
+                HunkKind::Unified,
+                start,
+                Some(SourceRange {
+                    start: 10,
+                    count: 2,
+                }),
+                Some(SourceRange {
+                    start: 20,
+                    count: 2,
+                }),
+            )
+            .unwrap();
+        (commit_id, file_id, hunk_id)
     }
 
-    fn file(commit_id: CommitId) -> FileEntry {
-        FileEntry {
-            id: FileId::new(0),
-            commit_id,
-            old_path: Some("src/lib.rs".to_owned()),
-            new_path: Some("src/lib.rs".to_owned()),
-            status: ChangeStatus::Modified,
-            mode: FileMode::Rich,
-            span: LineSpan::open(LineId::new(0)),
-            hunk_ids: Vec::new(),
-            additions: Some(0),
-            deletions: Some(0),
+    fn append_tracked_line(
+        raw: &AppendStore,
+        tracker: &mut RawLineTracker,
+        bytes: &[u8],
+    ) -> RawLineSpan {
+        let start = raw.append(bytes).unwrap();
+        let mut span = None;
+        for (relative, byte) in bytes.iter().copied().enumerate() {
+            span = tracker
+                .observe(start + relative as u64, byte)
+                .unwrap()
+                .or(span);
         }
-    }
-
-    fn hunk(file_id: FileId) -> Hunk {
-        Hunk {
-            id: HunkId::new(0),
-            file_id,
-            kind: HunkKind::Unified,
-            header_line: LineId::new(0),
-            span: LineSpan::open(LineId::new(0)),
-            old_range: Some(SourceRange {
-                start: 10,
-                count: 2,
-            }),
-            new_range: Some(SourceRange {
-                start: 20,
-                count: 2,
-            }),
-        }
+        span.expect("test line must include a displayed newline")
     }
 
     #[test]
@@ -1137,9 +1330,7 @@ mod tests {
         let mut builder = DocumentBuilder::new(raw.clone(), &storage).unwrap();
         let mut tracker = builder.start_line_tracker().unwrap();
 
-        let commit_id = builder.push_commit(commit());
-        let file_id = builder.push_file(file(commit_id)).unwrap();
-        let hunk_id = builder.push_hunk(hunk(file_id)).unwrap();
+        let (commit_id, file_id, hunk_id) = begin_rich_structure(&mut builder, LineId::new(0));
 
         let first_start = raw.append(b" old\n").unwrap();
         let mut first_span = None;
@@ -1166,7 +1357,7 @@ mod tests {
         assert_eq!(first_id, LineId::new(0));
         let earlier = builder.snapshot().unwrap();
 
-        builder.file_mut(file_id).unwrap().additions = Some(1);
+        builder.open_file_mut(file_id).unwrap().additions = Some(1);
         let second_start = raw.append(b"+new\n").unwrap();
         let mut second_span = None;
         for (relative, byte) in b"+new\n".iter().copied().enumerate() {
@@ -1194,28 +1385,30 @@ mod tests {
 
         assert_eq!(earlier.line_count(), 1);
         assert_eq!(later.line_count(), 2);
-        assert_eq!(earlier.files()[0].additions, Some(0));
-        assert_eq!(later.files()[0].additions, Some(1));
-        assert!(Arc::ptr_eq(&earlier.commits, &later.commits));
-        assert!(Arc::ptr_eq(&earlier.hunks, &later.hunks));
-        assert!(!Arc::ptr_eq(&earlier.files, &later.files));
-        assert!(!Arc::ptr_eq(
-            &earlier.file_line_bounds,
-            &later.file_line_bounds
-        ));
+        let mut structure_reader = StructureMetadataReader::new();
+        let earlier_file = structure_reader
+            .read_file(earlier.structure(), file_id)
+            .unwrap()
+            .unwrap();
+        let later_file = structure_reader
+            .read_file(later.structure(), file_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(earlier_file.additions, Some(0));
+        assert_eq!(later_file.additions, Some(1));
         assert_eq!(
-            earlier.file_line_bounds(file_id),
-            Some(FileLineBounds {
+            earlier_file.line_bounds,
+            StructureFileLineBounds {
                 max_old_line_number: Some(10),
                 max_new_line_number: Some(20),
-            })
+            }
         );
         assert_eq!(
-            later.file_line_bounds(file_id),
-            Some(FileLineBounds {
+            later_file.line_bounds,
+            StructureFileLineBounds {
                 max_old_line_number: Some(10),
                 max_new_line_number: Some(99),
-            })
+            }
         );
 
         let mut reader = DocumentLineReader::new();
@@ -1236,15 +1429,87 @@ mod tests {
     }
 
     #[test]
+    fn numbered_line_append_does_not_clone_open_file_paths_for_reference_validation() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = DocumentBuilder::new(raw.clone(), &storage).unwrap();
+        let mut tracker = builder.start_line_tracker().unwrap();
+        // Parserが受け入れる最大級のpathで、行数に比例したCOW copyへ戻らないことをallocation
+        // identityで検査する。Line boundsだけの更新ではpath payloadを置き換える理由がない。
+        let long_path = format!("src/{}", "x".repeat((1 << 20) - 4));
+        let commit_id = builder
+            .begin_commit(CommitKind::WorkingTree, None, LineId::new(0))
+            .unwrap();
+        let file_id = builder
+            .begin_file(
+                commit_id,
+                Some(long_path.clone()),
+                Some(long_path),
+                ChangeStatus::Modified,
+                FileMode::Rich,
+                LineId::new(0),
+            )
+            .unwrap();
+        let hunk_id = builder
+            .begin_hunk(
+                file_id,
+                HunkKind::Unified,
+                LineId::new(0),
+                Some(SourceRange { start: 1, count: 3 }),
+                Some(SourceRange { start: 1, count: 3 }),
+            )
+            .unwrap();
+        let old_path_allocation = builder
+            .open_file(file_id)
+            .unwrap()
+            .old_path
+            .as_deref()
+            .unwrap()
+            .as_ptr();
+        let new_path_allocation = builder
+            .open_file(file_id)
+            .unwrap()
+            .new_path
+            .as_deref()
+            .unwrap()
+            .as_ptr();
+
+        for line_number in 1..=3 {
+            let span = append_tracked_line(&raw, &mut tracker, b" line\n");
+            builder
+                .append_line(
+                    span,
+                    AppendDocumentLine {
+                        display_len: 5,
+                        kind: LineKind::Context,
+                        commit_id: Some(commit_id),
+                        file_id: Some(file_id),
+                        hunk_id: Some(hunk_id),
+                        old_line_number: Some(line_number),
+                        new_line_number: Some(line_number),
+                    },
+                )
+                .unwrap();
+            let open_file = builder.open_file(file_id).unwrap();
+            assert_eq!(
+                open_file.old_path.as_deref().unwrap().as_ptr(),
+                old_path_allocation
+            );
+            assert_eq!(
+                open_file.new_path.as_deref().unwrap().as_ptr(),
+                new_path_allocation
+            );
+        }
+    }
+
+    #[test]
     fn line_reader_returns_typed_borrowed_and_owned_views() {
         let raw = AppendStore::with_memory_limit(0);
         let config = StorageConfig::new(16 * 1024, 16 * 1024, 64, 64).unwrap();
         let storage = StructuralStorage::with_config(config).unwrap();
         let mut builder = DocumentBuilder::new(raw.clone(), &storage).unwrap();
         let mut tracker = builder.start_line_tracker().unwrap();
-        let commit_id = builder.push_commit(commit());
-        let file_id = builder.push_file(file(commit_id)).unwrap();
-        let hunk_id = builder.push_hunk(hunk(file_id)).unwrap();
+        let (commit_id, file_id, hunk_id) = begin_rich_structure(&mut builder, LineId::new(0));
 
         let start = raw.append(b"-old\n").unwrap();
         let mut span = None;
@@ -1268,6 +1533,9 @@ mod tests {
                 },
             )
             .unwrap();
+        builder.finish_hunk(hunk_id, 1).unwrap();
+        builder.finish_file(file_id, 1).unwrap();
+        builder.finish_commit(commit_id, 1).unwrap();
         let snapshot = builder.snapshot().unwrap();
         assert!(builder.line_store.is_spilled().unwrap());
         let mut reader = DocumentLineReader::new();
@@ -1281,6 +1549,13 @@ mod tests {
         assert_eq!(borrowed.hunk_id, Some(hunk_id));
         assert_eq!(borrowed.old_line_number, Some(10));
         assert_eq!(borrowed.new_line_number, None);
+        assert_eq!(
+            borrowed.file_line_bounds,
+            Some(StructureFileLineBounds {
+                max_old_line_number: Some(10),
+                max_new_line_number: None,
+            })
+        );
         assert!(borrowed.terminated);
 
         let owned = reader.read_owned(&snapshot, line_id).unwrap().unwrap();
@@ -1294,17 +1569,14 @@ mod tests {
         assert_eq!(metadata.display_len, LineDisplayLength::Exact(4));
         assert!(!metadata.display_len.exceeds(4));
         assert!(metadata.display_len.exceeds(3));
+        let structure_stats = metadata_reader.structure.statistics();
+        assert_eq!(structure_stats.commit_records, 1);
+        assert_eq!(structure_stats.file_records, 1);
+        assert_eq!(structure_stats.hunk_records, 1);
         let capacity = metadata_reader.record_buffer.capacity();
         assert!(capacity >= crate::document_store::LOGICAL_LINE_RECORD_BYTES);
         let _ = metadata_reader.read(&snapshot, line_id).unwrap();
         assert_eq!(metadata_reader.record_buffer.capacity(), capacity);
-
-        let mut corrupted = snapshot.clone();
-        Arc::make_mut(&mut corrupted.commits)[0].id = CommitId::new(7);
-        let identity_error = DocumentLineReader::new()
-            .read_owned(&corrupted, line_id)
-            .unwrap_err();
-        assert!(identity_error.to_string().contains("stores ID 7"));
     }
 
     #[test]
@@ -1348,9 +1620,7 @@ mod tests {
         let storage = StructuralStorage::new().unwrap();
         let mut builder = DocumentBuilder::new(raw, &storage).unwrap();
         let mut tracker = builder.start_line_tracker().unwrap();
-        let commit_id = builder.push_commit(commit());
-        let file_id = builder.push_file(file(commit_id)).unwrap();
-        let hunk_id = builder.push_hunk(hunk(file_id)).unwrap();
+        let (commit_id, file_id, hunk_id) = begin_rich_structure(&mut builder, LineId::new(0));
 
         // Trackerへはindexed emissionを渡すがraw storeには対応byteをappendしない。Boundary検証が
         // record commit前に失敗し、file boundsだけを進めないことを再現する。
@@ -1376,8 +1646,8 @@ mod tests {
         assert!(error.to_string().contains("raw range"));
         assert_eq!(builder.line_count(), 0);
         assert_eq!(
-            builder.snapshot().unwrap().file_line_bounds(file_id),
-            Some(FileLineBounds::default())
+            builder.open_file(file_id).unwrap().line_bounds,
+            StructureFileLineBounds::default()
         );
     }
 
@@ -1412,12 +1682,10 @@ mod tests {
             .unwrap();
         let snapshot = DocumentSnapshot {
             identity: builder.identity.clone(),
+            revision: super::DocumentRevision::new(),
             lines: builder.line_store.snapshot().unwrap(),
             line_count: 1,
-            commits: Arc::new(Vec::new()),
-            files: Arc::new(Vec::new()),
-            hunks: Arc::new(Vec::new()),
-            file_line_bounds: Arc::new(Vec::new()),
+            structure: builder.structure.snapshot().unwrap(),
             complete: false,
             trailing_newline: true,
         };
@@ -1428,6 +1696,196 @@ mod tests {
         let mut metadata_reader = DocumentLineMetadataReader::new();
         let metadata_error = metadata_reader.read(&snapshot, LineId::new(0)).unwrap_err();
         assert!(metadata_error.to_string().contains("commit 8"));
+    }
+
+    #[test]
+    fn structural_boundaries_are_exact_and_failed_close_keeps_the_open_id() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = DocumentBuilder::new(raw.clone(), &storage).unwrap();
+        let mut tracker = builder.start_line_tracker().unwrap();
+
+        let mismatch = builder
+            .begin_commit(CommitKind::WorkingTree, None, LineId::new(1))
+            .unwrap_err();
+        assert!(matches!(
+            mismatch,
+            DocumentError::StructureBoundaryMismatch {
+                expected: 0,
+                actual: 1,
+                ..
+            }
+        ));
+
+        let commit_id = builder
+            .begin_commit(CommitKind::WorkingTree, None, LineId::new(0))
+            .unwrap();
+        assert!(matches!(
+            builder.snapshot(),
+            Err(DocumentError::InvalidStructureSpan {
+                kind: "commit",
+                id: 0,
+                ..
+            })
+        ));
+        assert!(builder.finish_commit(commit_id, 0).is_err());
+        assert_eq!(builder.open_commit(commit_id).unwrap().id(), commit_id);
+
+        let span = append_tracked_line(&raw, &mut tracker, b"header\n");
+        builder
+            .append_line(
+                span,
+                AppendDocumentLine {
+                    display_len: 6,
+                    kind: LineKind::CommitHeader,
+                    commit_id: Some(commit_id),
+                    file_id: None,
+                    hunk_id: None,
+                    old_line_number: None,
+                    new_line_number: None,
+                },
+            )
+            .unwrap();
+        let wrong_id = builder.finish_commit(CommitId::new(1), 1).unwrap_err();
+        assert!(matches!(
+            wrong_id,
+            DocumentError::OpenStructureIdentityMismatch {
+                expected: 1,
+                actual: 0,
+                ..
+            }
+        ));
+        assert_eq!(builder.open_commit(commit_id).unwrap().id(), commit_id);
+        assert!(matches!(
+            builder.mark_complete(),
+            Err(DocumentError::OpenStructureAtCompletion {
+                kind: "commit",
+                id: 0
+            })
+        ));
+        builder.finish_commit(commit_id, 1).unwrap();
+        builder.mark_complete().unwrap();
+        assert!(builder.snapshot().unwrap().is_complete());
+    }
+
+    #[test]
+    fn fallback_generation_normalizes_source_semantics_and_effective_bounds() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = DocumentBuilder::new(raw.clone(), &storage).unwrap();
+        let mut tracker = builder.start_line_tracker().unwrap();
+        let (commit_id, file_id, hunk_id) = begin_rich_structure(&mut builder, LineId::new(0));
+        let span = append_tracked_line(&raw, &mut tracker, b"+new\n");
+        let line_id = builder
+            .append_line(
+                span,
+                AppendDocumentLine {
+                    display_len: 4,
+                    kind: LineKind::Addition,
+                    commit_id: Some(commit_id),
+                    file_id: Some(file_id),
+                    hunk_id: Some(hunk_id),
+                    old_line_number: None,
+                    new_line_number: Some(20),
+                },
+            )
+            .unwrap();
+        let rich = builder.snapshot().unwrap();
+
+        {
+            let file = builder.open_file_mut(file_id).unwrap();
+            file.mode = FileMode::Malformed;
+            file.additions = None;
+            file.deletions = None;
+        }
+        {
+            let hunk = builder.open_hunk_mut(hunk_id).unwrap();
+            hunk.kind = HunkKind::Malformed;
+            hunk.old_range = None;
+            hunk.new_range = None;
+        }
+        let fallback = builder.snapshot().unwrap();
+
+        let mut reader = DocumentLineMetadataReader::new();
+        let rich_line = reader.read(&rich, line_id).unwrap().unwrap();
+        assert_eq!(rich_line.kind, LineKind::Addition);
+        assert_eq!(rich_line.new_line_number, Some(20));
+        assert_eq!(
+            rich_line.file_line_bounds,
+            Some(StructureFileLineBounds {
+                max_old_line_number: None,
+                max_new_line_number: Some(20),
+            })
+        );
+        let fallback_line = reader.read(&fallback, line_id).unwrap().unwrap();
+        assert_eq!(fallback_line.kind, LineKind::Fallback);
+        assert_eq!(fallback_line.new_line_number, None);
+        assert_eq!(
+            fallback_line.file_line_bounds,
+            Some(StructureFileLineBounds::default())
+        );
+    }
+
+    #[test]
+    fn finalized_empty_child_range_preserves_its_insertion_cursor() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = DocumentBuilder::new(raw.clone(), &storage).unwrap();
+        let mut tracker = builder.start_line_tracker().unwrap();
+        let (first_commit, first_file, first_hunk) =
+            begin_rich_structure(&mut builder, LineId::new(0));
+        let first_span = append_tracked_line(&raw, &mut tracker, b" first\n");
+        builder
+            .append_line(
+                first_span,
+                AppendDocumentLine {
+                    display_len: 6,
+                    kind: LineKind::Context,
+                    commit_id: Some(first_commit),
+                    file_id: Some(first_file),
+                    hunk_id: Some(first_hunk),
+                    old_line_number: Some(10),
+                    new_line_number: Some(20),
+                },
+            )
+            .unwrap();
+        // Rangeの残数はparser所有でありDocumentBuilderはspanだけを検査する。
+        builder.finish_hunk(first_hunk, 1).unwrap();
+        builder.finish_file(first_file, 1).unwrap();
+        builder.finish_commit(first_commit, 1).unwrap();
+
+        let second_commit = builder
+            .begin_commit(
+                CommitKind::Commit,
+                Some("abcdef0".to_owned()),
+                LineId::new(1),
+            )
+            .unwrap();
+        let second_span = append_tracked_line(&raw, &mut tracker, b"commit abcdef0\n");
+        builder
+            .append_line(
+                second_span,
+                AppendDocumentLine {
+                    display_len: 14,
+                    kind: LineKind::CommitHeader,
+                    commit_id: Some(second_commit),
+                    file_id: None,
+                    hunk_id: None,
+                    old_line_number: None,
+                    new_line_number: None,
+                },
+            )
+            .unwrap();
+        builder.finish_commit(second_commit, 2).unwrap();
+        let snapshot = builder.snapshot().unwrap();
+
+        let commit = StructureMetadataReader::new()
+            .read_commit(snapshot.structure(), second_commit)
+            .unwrap()
+            .unwrap();
+        assert_eq!(commit.files.start(), 1);
+        assert_eq!(commit.files.count(), 0);
+        assert_eq!(commit.files.first(), None);
     }
 
     #[test]
@@ -1462,7 +1920,7 @@ mod tests {
             )
             .unwrap();
         let before_complete = builder.snapshot().unwrap();
-        builder.mark_complete();
+        builder.mark_complete().unwrap();
         let complete = builder.snapshot().unwrap();
 
         assert!(!before_complete.is_complete());
@@ -1483,11 +1941,15 @@ mod tests {
         let second = DocumentBuilder::new(AppendStore::new(), &storage).unwrap();
 
         let first_snapshot = first.snapshot().unwrap();
+        let cloned_first_snapshot = first_snapshot.clone();
         let later_first_snapshot = first.snapshot().unwrap();
         let second_snapshot = second.snapshot().unwrap();
 
         assert_eq!(first_snapshot.identity(), later_first_snapshot.identity());
         assert_ne!(first_snapshot.identity(), second_snapshot.identity());
+        assert_eq!(first_snapshot.revision(), cloned_first_snapshot.revision());
+        assert_ne!(first_snapshot.revision(), later_first_snapshot.revision());
+        assert_ne!(first_snapshot.revision(), second_snapshot.revision());
         let mut identities = std::collections::HashSet::new();
         assert!(identities.insert(first_snapshot.identity()));
         assert!(!identities.insert(later_first_snapshot.identity()));

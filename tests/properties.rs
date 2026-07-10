@@ -4,6 +4,7 @@ use git_ultrapager::input::AppendStore;
 use git_ultrapager::model::{Commit, FileEntry, Hunk};
 use git_ultrapager::parser::{GitParser, parse_bytes};
 use git_ultrapager::storage::StructuralStorage;
+use git_ultrapager::structure_store::StructureReader;
 use proptest::prelude::*;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -24,11 +25,64 @@ fn snapshot_value(document: &DocumentSnapshot) -> SnapshotValue {
             reader.read_owned(document, id).unwrap().unwrap()
         })
         .collect();
+    let structure = document.structure();
+    let counts = structure.visible_counts().unwrap();
+    let mut structure_reader = StructureReader::new();
+    let commits = (0..counts.commits)
+        .map(|ordinal| {
+            let id = structure.commit_id_at(ordinal).unwrap();
+            let commit = structure_reader
+                .read_commit(structure, id)
+                .unwrap()
+                .unwrap();
+            Commit {
+                id: commit.id,
+                kind: commit.kind,
+                object_id: commit.object_id.map(str::to_owned),
+                subject: commit.subject.map(str::to_owned),
+                span: commit.span,
+                file_ids: commit.files.iter().collect(),
+            }
+        })
+        .collect();
+    let files = (0..counts.files)
+        .map(|ordinal| {
+            let id = structure.file_id_at(ordinal).unwrap();
+            let file = structure_reader.read_file(structure, id).unwrap().unwrap();
+            FileEntry {
+                id: file.id,
+                commit_id: file.commit_id,
+                old_path: file.old_path.map(str::to_owned),
+                new_path: file.new_path.map(str::to_owned),
+                status: file.status,
+                mode: file.mode,
+                span: file.span,
+                hunk_ids: file.hunks.iter().collect(),
+                additions: file.additions,
+                deletions: file.deletions,
+            }
+        })
+        .collect();
+    let hunks = (0..counts.hunks)
+        .map(|ordinal| {
+            let id = structure.hunk_id_at(ordinal).unwrap();
+            let hunk = structure_reader.read_hunk(structure, id).unwrap().unwrap();
+            Hunk {
+                id: hunk.id,
+                file_id: hunk.file_id,
+                kind: hunk.kind,
+                header_line: hunk.header_line,
+                span: hunk.span,
+                old_range: hunk.old_range,
+                new_range: hunk.new_range,
+            }
+        })
+        .collect();
     SnapshotValue {
         lines,
-        commits: document.commits().to_vec(),
-        files: document.files().to_vec(),
-        hunks: document.hunks().to_vec(),
+        commits,
+        files,
+        hunks,
         complete: document.is_complete(),
         trailing_newline: document.has_trailing_newline(),
     }

@@ -30,7 +30,7 @@ use crate::derived_memory::{
     NEXT_DECORATION_MEMORY_BYTES, PRIORITY_DECORATION_MEMORY_BYTES,
 };
 use crate::document::{
-    DocumentError, DocumentIdentity, DocumentLineMetadata, DocumentLineMetadataReader,
+    DocumentError, DocumentLineMetadata, DocumentLineMetadataReader, DocumentRevision,
     DocumentSnapshot, LineDisplayLength, OwnedDocumentLine,
 };
 use crate::highlight::{
@@ -41,7 +41,11 @@ use crate::intraline::{
     BudgetedIntralineResult, IntralineResult, LinePairDiff, MAX_BLOCK_BYTES, MAX_BLOCK_GRAPHEMES,
     MAX_CHANGED_LINES, MAX_LINE_GRAPHEMES, compute_refs_with_budget,
 };
-use crate::model::{ChangeStatus, FileEntry, Hunk, HunkId, HunkKind, LineId, LineKind};
+use crate::model::{ChangeStatus, CommitId, FileId, HunkId, HunkKind, LineId, LineKind};
+use crate::structure_store::{
+    FileIdRange, StoredFileRef, StoredHunk, StructureMetadataReader, StructureReader,
+    StructureStoreError,
+};
 use crate::text::MAX_SYNTAX_LINE_BYTES;
 use crate::theme::{ColorLevel, Theme};
 
@@ -115,19 +119,21 @@ impl DecorationComputer {
     ) -> Result<DecorationSet, DecorationComputeError> {
         let ledger = DerivedMemoryLedger::new();
         let budget = budget.min(NEXT_DECORATION_MEMORY_BYTES);
+        let mut cursor_reader = StructureMetadataReader::new();
+        let structure_cursor =
+            ScopedStructureCursor::new(document, line_range.as_ref(), &mut cursor_reader)?;
         let scope = DecorationScope {
             budget,
             pool: DerivedMemoryPool::NextDecoration,
             priority_hunk: None,
             only_priority: false,
             line_range,
+            structure_cursor: Some(structure_cursor.clone()),
         };
-        let has_rich_hunk = files_in_scope(document, scope.line_range.as_ref())
-            .iter()
-            .any(|file| file.mode.is_rich() && !file.hunk_ids.is_empty());
+        let has_rich_hunk = scope_has_rich_hunk(document, &structure_cursor, &mut cursor_reader)?;
         if !has_rich_hunk {
             return Ok(DecorationBuilder::new(
-                document.identity(),
+                document.revision(),
                 whitespace,
                 &ledger,
                 scope.pool,
@@ -173,9 +179,13 @@ pub enum DecorationComputeError {
     #[error(transparent)]
     Document(#[from] DocumentError),
     #[error(transparent)]
+    StructureStore(#[from] StructureStoreError),
+    #[error(transparent)]
     BoundedText(#[from] BoundedTextError),
     #[error(transparent)]
     Memory(#[from] DerivedMemoryError),
+    #[error("decoration line boundary {boundary} does not fit the structural u64 index")]
+    LineBoundaryOverflow { boundary: usize },
     #[error("document snapshot does not contain logical line {line_id}")]
     MissingLine { line_id: LineId },
 }
@@ -214,7 +224,7 @@ struct DecorationEntry {
 /// interactive経路では[`BudgetedDecorationSet`]または[`AppliedDecorationSet`]だけが所有する。
 #[derive(Debug, PartialEq, Eq)]
 pub struct DecorationSet {
-    identity: Option<DocumentIdentity>,
+    revision: Option<DocumentRevision>,
     lines: Vec<DecorationEntry>,
     whitespace: WhitespaceChoice,
     approximate_bytes: usize,
@@ -268,29 +278,25 @@ impl DecorationSet {
         scope: DecorationScope,
     ) -> Result<Option<BudgetedDecorationSet>, DecorationComputeError> {
         let mut builder = DecorationBuilder::new(
-            context.document.identity(),
+            context.document.revision(),
             context.whitespace,
             context.ledger,
             scope.pool,
             scope.budget,
         )?;
         let mut readers = DecorationReaders::new(context.ledger)?;
-        let files = files_in_scope(context.document, scope.line_range.as_ref());
-        if !files
-            .iter()
-            .any(|file| file.mode.is_rich() && !file.hunk_ids.is_empty())
-        {
-            return Ok(Some(builder.finish()));
-        }
-        if let SyntaxAvailability::Failed(error) = context.syntax {
-            builder.record_syntax_error(error);
-        }
+        let mut structure_reader = StructureReader::new();
+        let mut metadata_reader = StructureMetadataReader::new();
         if let Some(hunk_id) = scope.priority_hunk {
-            if let Some(hunk) = context.document.hunk(hunk_id)
-                && let Some(file) = context.document.file(hunk.file_id)
+            if let Some(hunk) = metadata_reader.read_hunk(context.document.structure(), hunk_id)?
+                && let Some(file) =
+                    structure_reader.read_file(context.document.structure(), hunk.file_id)?
                 && file.mode.is_rich()
                 && hunk.kind == HunkKind::Unified
             {
+                if let SyntaxAvailability::Failed(error) = context.syntax {
+                    builder.record_syntax_error(error);
+                }
                 match decorate_one_hunk(&mut builder, &context, file, hunk, &mut readers)? {
                     DecorationStep::Continue => {}
                     DecorationStep::Stop => return Ok(Some(builder.finish())),
@@ -303,27 +309,73 @@ impl DecorationSet {
         } else if scope.only_priority {
             return Ok(Some(builder.finish()));
         }
-        'files: for file in files.iter().filter(|file| file.mode.is_rich()) {
+
+        let cursor = match scope.structure_cursor {
+            Some(cursor) => cursor,
+            None => ScopedStructureCursor::new(
+                context.document,
+                scope.line_range.as_ref(),
+                &mut metadata_reader,
+            )?,
+        };
+        let mut syntax_failure_recorded = false;
+        // Commit/hunkはfixed metadata reader、file pathだけStructureReaderへ分離する。同じfileのhunkは
+        // copied parent metadataで検証するため、path borrowを保持したまま親file recordを再decodeしない。
+        'commits: for raw_commit_id in cursor.commits.clone() {
             if (context.cancelled)() {
                 return Ok(None);
             }
-            for hunk_id in &file.hunk_ids {
-                if Some(*hunk_id) == scope.priority_hunk {
-                    continue;
-                }
+            let commit_id = CommitId::new(raw_commit_id);
+            let Some(commit) =
+                metadata_reader.read_commit(context.document.structure(), commit_id)?
+            else {
+                continue;
+            };
+            for file_id in cursor.files_in_commit(commit.files) {
                 if (context.cancelled)() {
                     return Ok(None);
                 }
-                let Some(hunk) = context.document.hunk(*hunk_id) else {
+                let Some(file) = structure_reader.read_file_in_commit(
+                    context.document.structure(),
+                    file_id,
+                    commit,
+                )?
+                else {
                     continue;
                 };
-                if hunk.kind != HunkKind::Unified {
+                if !file.mode.is_rich() || file.hunks.count() == 0 {
                     continue;
                 }
-                match decorate_one_hunk(&mut builder, &context, file, hunk, &mut readers)? {
-                    DecorationStep::Continue => {}
-                    DecorationStep::Stop => break 'files,
-                    DecorationStep::Cancelled => return Ok(None),
+                if !syntax_failure_recorded
+                    && let SyntaxAvailability::Failed(error) = context.syntax
+                {
+                    builder.record_syntax_error(error);
+                    syntax_failure_recorded = true;
+                }
+                let file_metadata = file.metadata();
+                for hunk_id in file.hunks.iter() {
+                    if Some(hunk_id) == scope.priority_hunk {
+                        continue;
+                    }
+                    if (context.cancelled)() {
+                        return Ok(None);
+                    }
+                    let Some(hunk) = metadata_reader.read_hunk_in_file(
+                        context.document.structure(),
+                        hunk_id,
+                        file_metadata,
+                    )?
+                    else {
+                        continue;
+                    };
+                    if hunk.kind != HunkKind::Unified {
+                        continue;
+                    }
+                    match decorate_one_hunk(&mut builder, &context, file, hunk, &mut readers)? {
+                        DecorationStep::Continue => {}
+                        DecorationStep::Stop => break 'commits,
+                        DecorationStep::Cancelled => return Ok(None),
+                    }
                 }
             }
         }
@@ -340,13 +392,13 @@ impl DecorationSet {
             .map(|entry| &entry.decoration)
     }
 
-    /// Derived spanを計算したdocument lineageと一致するかを返す。
+    /// Derived spanを計算したexact document snapshotと一致するかを返す。
     ///
-    /// [`Self::default`]はUI初期化用の未結合setなのでfalseになる。数値上同じ`LineId`を持つ別builderの
-    /// spanをrendererへ流用してはならない。
+    /// [`Self::default`]はUI初期化用の未結合setなのでfalseになる。同じbuilderの後続snapshotでも、
+    /// open file/hunkのfallback化やgutter boundsが変わり得るため一致しない。
     #[must_use]
     pub fn belongs_to(&self, document: &DocumentSnapshot) -> bool {
-        self.identity.as_ref() == Some(&document.identity())
+        self.revision.as_ref() == Some(&document.revision())
     }
 
     /// Decoration spanを1つも保持していないかを返す。
@@ -492,8 +544,8 @@ impl Deref for AppliedDecorationSet {
 fn decorate_one_hunk(
     builder: &mut DecorationBuilder,
     context: &DecorationContext<'_>,
-    file: &FileEntry,
-    hunk: &Hunk,
+    file: StoredFileRef<'_>,
+    hunk: StoredHunk,
     readers: &mut DecorationReaders,
 ) -> Result<DecorationStep, DecorationComputeError> {
     if let SyntaxAvailability::Ready(engine) = context.syntax
@@ -627,37 +679,88 @@ struct DecorationScope {
     only_priority: bool,
     /// `None`はbackground full scan。`Some`はdirect writerが閉じたfile範囲だけを要求する。
     line_range: Option<Range<usize>>,
+    /// Synchronous経路でsyntax初期化判定と本計算に同じseek結果を渡す。Worker経路では未計算。
+    structure_cursor: Option<ScopedStructureCursor>,
 }
 
-/// File spanはGit出力順で重ならないため、2回のpartition_pointで対象sliceへ絞れる。
-/// Pathologicalにfile数が多いdirect streamでも、今回閉じたfileを探すために既出prefixを走査しない。
-fn files_in_scope<'document>(
-    document: &'document DocumentSnapshot,
-    line_range: Option<&Range<usize>>,
-) -> &'document [FileEntry] {
-    let files = document.files();
-    let Some(range) = line_range else {
-        return files;
-    };
-    let first =
-        files.partition_point(|file| file_span_end(file, document.line_count()) <= range.start);
-    let end =
-        files.partition_point(|file| file_span_start(file, document.line_count()) < range.end);
-    files.get(first..end.max(first)).unwrap_or_default()
+/// Logical-line scopeをspill-backed structure tableのcursorへ変換した値。
+///
+/// Commit/file spanはstable ID順に単調なので、範囲付き計算はtable全体をmaterializeせず、各tableの
+/// binary seekで得た半開範囲だけを走査する。File範囲はcommit child範囲との積を取ってから読むため、
+/// line scopeと交差しない同一commit内のfile path blobも復元しない。
+#[derive(Clone, Debug)]
+struct ScopedStructureCursor {
+    commits: Range<u64>,
+    files: Range<u64>,
 }
 
-fn file_span_start(file: &FileEntry, document_len: usize) -> usize {
-    usize::try_from(file.span.start.get())
-        .unwrap_or(document_len)
-        .min(document_len)
+impl ScopedStructureCursor {
+    fn new(
+        document: &DocumentSnapshot,
+        line_range: Option<&Range<usize>>,
+        reader: &mut StructureMetadataReader,
+    ) -> Result<Self, DecorationComputeError> {
+        let counts = document.structure().visible_counts()?;
+        let Some(line_range) = line_range else {
+            return Ok(Self {
+                commits: 0..counts.commits,
+                files: 0..counts.files,
+            });
+        };
+        let start = u64::try_from(line_range.start).map_err(|_| {
+            DecorationComputeError::LineBoundaryOverflow {
+                boundary: line_range.start,
+            }
+        })?;
+        let end = u64::try_from(line_range.end).map_err(|_| {
+            DecorationComputeError::LineBoundaryOverflow {
+                boundary: line_range.end,
+            }
+        })?;
+        let commits = reader.commits_intersecting(document.structure(), start..end)?;
+        let files = reader.files_intersecting(document.structure(), start..end)?;
+        Ok(Self {
+            commits,
+            files: files.start()..files.end_exclusive(),
+        })
+    }
+
+    fn files_in_commit(
+        &self,
+        commit_files: FileIdRange,
+    ) -> impl DoubleEndedIterator<Item = FileId> {
+        let start = self.files.start.max(commit_files.start());
+        let end = self.files.end.min(commit_files.end_exclusive()).max(start);
+        (start..end).map(FileId::new)
+    }
 }
 
-fn file_span_end(file: &FileEntry, document_len: usize) -> usize {
-    file.span
-        .end_exclusive
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(document_len)
-        .min(document_len)
+/// Syntax bundleをloadする前に、対象範囲へrich unified候補があるかをmetadataだけで判定する。
+///
+/// Caller-owned readerを使い、commitをscope内で1回、fileを親metadata付きで1回ずつ読む。Path blobと
+/// hunk recordは触らず、最初のrich fileで終了する。
+fn scope_has_rich_hunk(
+    document: &DocumentSnapshot,
+    cursor: &ScopedStructureCursor,
+    reader: &mut StructureMetadataReader,
+) -> Result<bool, DecorationComputeError> {
+    for raw_commit_id in cursor.commits.clone() {
+        let Some(commit) =
+            reader.read_commit(document.structure(), CommitId::new(raw_commit_id))?
+        else {
+            continue;
+        };
+        for file_id in cursor.files_in_commit(commit.files) {
+            let Some(file) = reader.read_file_in_commit(document.structure(), file_id, commit)?
+            else {
+                continue;
+            };
+            if file.mode.is_rich() && file.hunks.count() > 0 {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 #[derive(Clone, Copy)]
@@ -670,7 +773,7 @@ enum SyntaxAvailability<'engine> {
 impl Default for DecorationSet {
     fn default() -> Self {
         Self {
-            identity: None,
+            revision: None,
             lines: Vec::new(),
             whitespace: WhitespaceChoice::Ignore,
             approximate_bytes: 0,
@@ -684,13 +787,13 @@ impl Default for DecorationSet {
 fn decorate_syntax_hunk(
     builder: &mut DecorationBuilder,
     engine: &SyntaxEngine,
-    file: &FileEntry,
-    hunk: &Hunk,
+    file: StoredFileRef<'_>,
+    hunk: StoredHunk,
     context: &DecorationContext<'_>,
     readers: &mut DecorationReaders,
 ) -> Result<bool, DecorationComputeError> {
-    let old_path = file.old_path.as_deref().or(file.new_path.as_deref());
-    let new_path = file.new_path.as_deref().or(file.old_path.as_deref());
+    let old_path = file.old_path.or(file.new_path);
+    let new_path = file.new_path.or(file.old_path);
     // Syntax検出用first lineを先読みして保持せず、各sideで最初に現れたsource lineからsessionを開く。
     // 以後は同じsessionへ順番どおり渡すため、複数行のtextを同時に所有する必要がない。
     let mut old = None;
@@ -925,7 +1028,7 @@ fn advance_session(
 
 fn decorate_intraline_hunk(
     builder: &mut DecorationBuilder,
-    hunk: &Hunk,
+    hunk: StoredHunk,
     document: &DocumentSnapshot,
     whitespace: WhitespaceChoice,
     cancelled: &dyn Fn() -> bool,
@@ -1311,11 +1414,12 @@ fn own_bounded_line(
         hunk_id: metadata.hunk_id,
         old_line_number: metadata.old_line_number,
         new_line_number: metadata.new_line_number,
+        file_line_bounds: metadata.file_line_bounds,
         terminated: metadata.terminated,
     }))
 }
 
-fn hunk_line_range(document: &DocumentSnapshot, hunk: &Hunk) -> Range<u64> {
+fn hunk_line_range(document: &DocumentSnapshot, hunk: StoredHunk) -> Range<u64> {
     let document_end = u64::try_from(document.line_count()).unwrap_or(u64::MAX);
     let start = hunk.span.start.get().min(document_end);
     let end = hunk
@@ -1355,7 +1459,7 @@ struct PendingIntralineTransfer {
 
 impl<'ledger> DecorationBuilder<'ledger> {
     fn new(
-        identity: DocumentIdentity,
+        revision: DocumentRevision,
         whitespace: WhitespaceChoice,
         ledger: &'ledger DerivedMemoryLedger,
         pool: DerivedMemoryPool,
@@ -1368,7 +1472,7 @@ impl<'ledger> DecorationBuilder<'ledger> {
         debug_assert!(budget <= pool.limit_bytes());
         Ok(Self {
             set: DecorationSet {
-                identity: Some(identity),
+                revision: Some(revision),
                 whitespace,
                 ..DecorationSet::default()
             },
@@ -1870,6 +1974,7 @@ fn decoration_worker_loop(
                     priority_hunk: Some(priority_hunk),
                     only_priority: true,
                     line_range: None,
+                    structure_cursor: None,
                 };
                 DecorationSet::compute_internal(context, scope)
             }));
@@ -1940,6 +2045,7 @@ fn decoration_worker_loop(
                 priority_hunk: None,
                 only_priority: false,
                 line_range: None,
+                structure_cursor: None,
             };
             DecorationSet::compute_internal(context, scope)
         }))
@@ -1994,6 +2100,7 @@ fn send_latest_response(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::fmt::Write as _;
     use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::{Duration, Instant};
 
@@ -2001,11 +2108,56 @@ mod tests {
     use crate::cli::ThemeChoice;
     use crate::document::DocumentLineReader;
     use crate::document_store::CHUNKED_LINE_RAW_BYTES;
-    use crate::parser::parse_bytes as parse_snapshot;
+    use crate::input::AppendStore;
+    use crate::parser::{GitParser, parse_bytes as parse_snapshot};
+    use crate::storage::{StorageConfig, StructuralStorage};
+    use crate::structure_store::StoredFileMetadata;
     use crate::theme::ColorLevel;
+
+    /// Inline fixtureの全件materializeは小さい単体testだけに限定する。Productionの範囲走査は
+    /// [`ScopedStructureCursor`]を通り、この上限やVecへ依存しない。
+    const MAX_MATERIALIZED_TEST_STRUCTURES: u64 = 4_096;
 
     fn parse_bytes(input: &[u8]) -> DocumentSnapshot {
         parse_snapshot(input).unwrap()
+    }
+
+    fn parse_bytes_with_storage(input: &[u8], config: StorageConfig) -> DocumentSnapshot {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::with_config(config).unwrap();
+        let mut parser = GitParser::new(raw.clone(), &storage).unwrap();
+        let start = raw.append(input).unwrap();
+        let _ = parser.push(start, input).unwrap();
+        let _ = raw.seal().unwrap();
+        parser.into_document().unwrap()
+    }
+
+    fn materialize_file_metadata(document: &DocumentSnapshot) -> Vec<StoredFileMetadata> {
+        let counts = document.structure().visible_counts().unwrap();
+        assert!(counts.files <= MAX_MATERIALIZED_TEST_STRUCTURES);
+        let mut reader = StructureMetadataReader::new();
+        (0..counts.files)
+            .map(|raw_id| {
+                reader
+                    .read_file(document.structure(), FileId::new(raw_id))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn materialize_hunks(document: &DocumentSnapshot) -> Vec<StoredHunk> {
+        let counts = document.structure().visible_counts().unwrap();
+        assert!(counts.hunks <= MAX_MATERIALIZED_TEST_STRUCTURES);
+        let mut reader = StructureMetadataReader::new();
+        (0..counts.hunks)
+            .map(|raw_id| {
+                reader
+                    .read_hunk(document.structure(), HunkId::new(raw_id))
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect()
     }
 
     fn read_lines(document: &DocumentSnapshot) -> Vec<OwnedDocumentLine> {
@@ -2050,6 +2202,18 @@ mod tests {
         input.push(b'\n');
     }
 
+    fn many_rust_files(count: usize) -> String {
+        let mut input = String::new();
+        for index in 0..count {
+            let _ = write!(
+                input,
+                "diff --git a/file{index}.rs b/file{index}.rs\n--- a/file{index}.rs\n+++ b/file{index}.rs\n@@ -1 +1 @@\n-let value = {index};\n+let value = {};\n",
+                index + 1,
+            );
+        }
+        input
+    }
+
     fn block_metadata(id: usize, kind: LineKind, display_len: u32) -> DocumentLineMetadata {
         DocumentLineMetadata {
             id: LineId::new(id as u64),
@@ -2059,6 +2223,7 @@ mod tests {
             hunk_id: None,
             old_line_number: None,
             new_line_number: None,
+            file_line_bounds: None,
             terminated: true,
             raw_len: u64::from(display_len),
             display_len: LineDisplayLength::Exact(display_len),
@@ -2167,7 +2332,10 @@ mod tests {
             b"diff --git a/src/old.rs b/src/old.rs\ndeleted file mode 100644\n--- a/src/old.rs\n+++ /dev/null\n@@ -1,2 +1 @@\n-/*\n let value = 1;\n",
         );
         let context = line_with_kind(&document, LineKind::Context);
-        assert_eq!(document.files()[0].status, ChangeStatus::Deleted);
+        assert_eq!(
+            materialize_file_metadata(&document)[0].status,
+            ChangeStatus::Deleted
+        );
         let decorations =
             DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
 
@@ -2270,7 +2438,7 @@ mod tests {
             cancelled: &cancelled,
         };
         let mut builder = DecorationBuilder::new(
-            document.identity(),
+            document.revision(),
             WhitespaceChoice::Ignore,
             &ledger,
             DerivedMemoryPool::NextDecoration,
@@ -2278,17 +2446,20 @@ mod tests {
         )
         .unwrap();
         let mut readers = DecorationReaders::new(&ledger).unwrap();
+        let mut structure_reader = StructureReader::new();
+        let file = structure_reader
+            .read_file(document.structure(), FileId::new(0))
+            .unwrap()
+            .unwrap();
+        let mut hunk_reader = StructureMetadataReader::new();
+        let hunk = hunk_reader
+            .read_hunk_in_file(document.structure(), HunkId::new(0), file.metadata())
+            .unwrap()
+            .unwrap();
 
         assert!(
-            !decorate_syntax_hunk(
-                &mut builder,
-                &engine,
-                &document.files()[0],
-                &document.hunks()[0],
-                &context,
-                &mut readers,
-            )
-            .unwrap()
+            !decorate_syntax_hunk(&mut builder, &engine, file, hunk, &context, &mut readers,)
+                .unwrap()
         );
         let raw_bytes_read = readers.text.large_line_stats().raw_bytes_read;
         assert!(raw_bytes_read > 0);
@@ -2379,7 +2550,8 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;\ndiff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-let b = 1;\n+let b = 2;\n",
         );
-        let first = &document.files()[0];
+        let files = materialize_file_metadata(&document);
+        let first = files[0];
         let first_range = usize::try_from(first.span.start.get()).unwrap()
             ..usize::try_from(first.span.end_exclusive.unwrap()).unwrap();
         let result = DecorationSet::compute_range(
@@ -2394,7 +2566,7 @@ mod tests {
             .iter()
             .find(|line| line.file_id == Some(first.id) && line.kind == LineKind::Addition)
             .unwrap();
-        let second = &document.files()[1];
+        let second = files[1];
         let second_source = lines
             .iter()
             .find(|line| line.file_id == Some(second.id) && line.kind == LineKind::Addition)
@@ -2402,6 +2574,77 @@ mod tests {
 
         assert!(result.line(first_source.id).is_some());
         assert!(result.line(second_source.id).is_none());
+    }
+
+    #[test]
+    fn spill_backed_range_compute_decorates_only_the_intersecting_file() {
+        // Directory reserveとresident limitを同値にしてencoded payloadのRAM枠を0にする。Table/blobは
+        // unlinked tempfileへ置かれ、decoratorは同じcursor/read APIだけで中央fileを処理する。
+        let config = StorageConfig::new(64 * 1024, 64 * 1024, 64, 256).unwrap();
+        let document = parse_bytes_with_storage(many_rust_files(48).as_bytes(), config);
+        let files = materialize_file_metadata(&document);
+        let selected = files[24];
+        let selected_range = usize::try_from(selected.span.start.get()).unwrap()
+            ..usize::try_from(selected.span.end_exclusive.unwrap()).unwrap();
+
+        let colorless = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let result = DecorationSet::compute_range(
+            &document,
+            &colorless,
+            WhitespaceChoice::Show,
+            selected_range,
+        )
+        .unwrap();
+        let lines = read_lines(&document);
+        let addition_for = |file_id| {
+            lines
+                .iter()
+                .find(|line| line.file_id == Some(file_id) && line.kind == LineKind::Addition)
+                .unwrap()
+                .id
+        };
+
+        assert!(result.line(addition_for(selected.id)).is_some());
+        assert!(result.line(addition_for(files[23].id)).is_none());
+        assert!(result.line(addition_for(files[25].id)).is_none());
+    }
+
+    #[test]
+    fn scoped_hunk_scan_does_not_redecode_parent_records() {
+        let document = parse_bytes(many_rust_files(6).as_bytes());
+        let mut cursor_reader = StructureMetadataReader::new();
+        let cursor = ScopedStructureCursor::new(&document, None, &mut cursor_reader).unwrap();
+        let mut path_reader = StructureReader::new();
+        let mut metadata_reader = StructureMetadataReader::new();
+        let mut visited_commits = 0_u64;
+        let mut visited_hunks = 0_u64;
+
+        for raw_commit_id in cursor.commits.clone() {
+            let commit = metadata_reader
+                .read_commit(document.structure(), CommitId::new(raw_commit_id))
+                .unwrap()
+                .unwrap();
+            visited_commits += 1;
+            for file_id in cursor.files_in_commit(commit.files) {
+                let file = path_reader
+                    .read_file_in_commit(document.structure(), file_id, commit)
+                    .unwrap()
+                    .unwrap();
+                let file_metadata = file.metadata();
+                for hunk_id in file.hunks.iter() {
+                    let _ = metadata_reader
+                        .read_hunk_in_file(document.structure(), hunk_id, file_metadata)
+                        .unwrap()
+                        .unwrap();
+                    visited_hunks += 1;
+                }
+            }
+        }
+
+        let stats = metadata_reader.statistics();
+        assert_eq!(stats.hunk_records, visited_hunks);
+        assert_eq!(stats.file_records, 0);
+        assert_eq!(stats.commit_records, visited_commits);
     }
 
     #[test]
@@ -2512,6 +2755,20 @@ mod tests {
     }
 
     #[test]
+    fn bounded_owned_line_preserves_snapshot_file_line_bounds() {
+        let mut metadata = block_metadata(0, LineKind::Deletion, 4);
+        metadata.file_line_bounds = Some(crate::structure_store::StructureFileLineBounds {
+            max_old_line_number: Some(42),
+            max_new_line_number: Some(84),
+        });
+
+        let line = own_bounded_line(metadata, "-old", &|| false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(line.file_line_bounds, metadata.file_line_bounds);
+    }
+
+    #[test]
     fn worker_replaces_queued_stale_response() {
         let worker = DecorationWorker::spawn(Arc::new(DerivedMemoryLedger::new())).unwrap();
         let document = Arc::new(parse_bytes(b"plain\n"));
@@ -2613,6 +2870,7 @@ mod tests {
             priority_hunk: None,
             only_priority: false,
             line_range: None,
+            structure_cursor: None,
         };
         let result = DecorationSet::compute_internal(context, scope);
         assert!(result.unwrap().is_none());
@@ -2625,11 +2883,12 @@ mod tests {
         let document = Arc::new(parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let first = 1;\n+let first = 2;\n@@ -10 +10 @@\n-let second = 1;\n+let second = 2;\n",
         ));
-        let priority = document.hunks()[1].id;
+        let hunks = materialize_hunks(&document);
+        let priority = hunks[1].id;
         let lines = read_lines(&document);
         let first_line = lines
             .iter()
-            .find(|line| line.hunk_id == Some(document.hunks()[0].id) && is_source(line.kind))
+            .find(|line| line.hunk_id == Some(hunks[0].id) && is_source(line.kind))
             .unwrap()
             .id;
         let priority_line = lines
@@ -2855,7 +3114,7 @@ mod tests {
         let ledger = DerivedMemoryLedger::new();
         let budget = 2 * size_of::<DecorationEntry>() - 1;
         let mut builder = DecorationBuilder::new(
-            document.identity(),
+            document.revision(),
             WhitespaceChoice::Ignore,
             &ledger,
             DerivedMemoryPool::NextDecoration,
@@ -2939,23 +3198,26 @@ mod tests {
             cancelled: &cancelled,
         };
         let mut builder = DecorationBuilder::new(
-            document.identity(),
+            document.revision(),
             WhitespaceChoice::Ignore,
             &ledger,
             DerivedMemoryPool::NextDecoration,
             DERIVED_RESULT_BUDGET_BYTES,
         )
         .unwrap();
-        assert!(
-            decorate_syntax_hunk(
-                &mut builder,
-                &engine,
-                &document.files()[0],
-                &document.hunks()[0],
-                &context,
-                &mut readers,
-            )
+        let mut structure_reader = StructureReader::new();
+        let file = structure_reader
+            .read_file(document.structure(), FileId::new(0))
             .unwrap()
+            .unwrap();
+        let mut hunk_reader = StructureMetadataReader::new();
+        let hunk = hunk_reader
+            .read_hunk_in_file(document.structure(), HunkId::new(0), file.metadata())
+            .unwrap()
+            .unwrap();
+        assert!(
+            decorate_syntax_hunk(&mut builder, &engine, file, hunk, &context, &mut readers,)
+                .unwrap()
         );
 
         let addition = metadata_with_kind(&document, LineKind::Addition);
@@ -2972,7 +3234,7 @@ mod tests {
         let ledger = DerivedMemoryLedger::new();
         let budget = 16 * 1024;
         let mut builder = DecorationBuilder::new(
-            document.identity(),
+            document.revision(),
             WhitespaceChoice::Ignore,
             &ledger,
             DerivedMemoryPool::NextDecoration,

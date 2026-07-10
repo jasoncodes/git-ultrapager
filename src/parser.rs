@@ -22,8 +22,8 @@ use crate::document::{AppendDocumentLine, DocumentBuilder, DocumentError, Docume
 use crate::document_store::{RawLineSpan, RawLineSpanError};
 use crate::input::{AppendStore, StoreError};
 use crate::model::{
-    ChangeStatus, Commit, CommitId, CommitKind, FileEntry, FileId, FileMode, Hunk, HunkId,
-    HunkKind, LineId, LineKind, LineSpan, SourceRange,
+    ChangeStatus, CommitId, CommitKind, FileId, FileMode, HunkId, HunkKind, LineId, LineKind,
+    SourceRange,
 };
 use crate::storage::{StorageError, StructuralStorage};
 use crate::text::MAX_SYNTAX_LINE_BYTES;
@@ -33,6 +33,12 @@ use crate::text::MAX_SYNTAX_LINE_BYTES;
 /// Syntax対象の最大行と同じ1 MiBまでは従来どおり全文をgrammarへ渡す。それを越えたhunk bodyは
 /// markerだけでsource counterを進め、header/path候補はpartial parseせずfallbackへ落とす。
 const GRAMMAR_PREFIX_BYTES: usize = MAX_SYNTAX_LINE_BYTES;
+
+/// Public `push` 1回のinputが巨大でもparser内部の作業bufferをこの単位で再利用する。
+///
+/// Readerのchunk設定はAPI callerごとに異なるため、public boundary自体が上限を所有する。
+/// ANSI stateとunfinished logical lineはslice間で維持するので、grammar結果はcallerのchunkingに依存しない。
+const MAX_PUSH_SLICE_BYTES: usize = 32 * 1024;
 
 /// Raw event、ANSI boundary、document recordのどこでparseを継続できなくなったかを表すfailure。
 #[derive(Debug, Error)]
@@ -98,51 +104,66 @@ impl From<RawLineSpanError> for ParseError {
 /// を invalidate し、[`GitParser::snapshot`] から読み直す。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseDelta {
+    /// 今回appendされたlogical-line indexの半開範囲。
     pub lines: Range<usize>,
-    pub commits: Range<usize>,
-    pub files: Range<usize>,
-    pub hunks: Range<usize>,
+    /// 今回初めて可視になったcommitのstable-ID cursor範囲。
+    pub commits: Range<u64>,
+    /// 今回初めて可視になったfileのstable-ID cursor範囲。
+    pub files: Range<u64>,
+    /// 今回初めて可視になったhunkのstable-ID cursor範囲。
+    pub hunks: Range<u64>,
+    /// Push開始時にopenで、今回のfield更新対象になり得たcommit。
     pub updated_commit: Option<CommitId>,
+    /// Push開始時にopenで、今回のfield更新対象になり得たfile。
     pub updated_file: Option<FileId>,
+    /// Push開始時にopenで、今回のfield更新対象になり得たhunk。
     pub updated_hunk: Option<HunkId>,
+    /// EOF処理とopen spanのcloseが完了した回だけ`true`。
     pub completed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ParserSnapshot {
     lines: usize,
-    commits: usize,
-    files: usize,
-    hunks: usize,
+    commits: u64,
+    files: u64,
+    hunks: u64,
     open_commit: Option<CommitId>,
     open_file: Option<FileId>,
     open_hunk: Option<HunkId>,
 }
 
 impl ParserSnapshot {
-    fn from_parser(parser: &GitParser) -> Self {
-        Self {
+    fn from_parser(parser: &GitParser) -> Result<Self, ParseError> {
+        let counts = parser.document.structure_counts()?;
+        Ok(Self {
             lines: parser.document.line_count(),
-            commits: parser.document.commits().len(),
-            files: parser.document.files().len(),
-            hunks: parser.document.hunks().len(),
+            commits: counts.commits,
+            files: counts.files,
+            hunks: counts.hunks,
             open_commit: parser.current_commit,
             open_file: parser.current_file,
             open_hunk: parser.current_hunk.map(|cursor| cursor.id),
-        }
+        })
     }
 
-    fn delta(self, document: &DocumentBuilder, completed: bool, may_update: bool) -> ParseDelta {
-        ParseDelta {
+    fn delta(
+        self,
+        document: &DocumentBuilder,
+        completed: bool,
+        may_update: bool,
+    ) -> Result<ParseDelta, ParseError> {
+        let counts = document.structure_counts()?;
+        Ok(ParseDelta {
             lines: self.lines..document.line_count(),
-            commits: self.commits..document.commits().len(),
-            files: self.files..document.files().len(),
-            hunks: self.hunks..document.hunks().len(),
+            commits: self.commits..counts.commits,
+            files: self.files..counts.files,
+            hunks: self.hunks..counts.hunks,
             updated_commit: may_update.then_some(self.open_commit).flatten(),
             updated_file: may_update.then_some(self.open_file).flatten(),
             updated_hunk: may_update.then_some(self.open_hunk).flatten(),
             completed,
-        }
+        })
     }
 }
 
@@ -153,6 +174,13 @@ struct HunkCursor {
     new_next: u64,
     old_remaining: u64,
     new_remaining: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RichHunkLine {
+    kind: LineKind,
+    old_line: Option<u64>,
+    new_line: Option<u64>,
 }
 
 /// `Err` 側にも decode できた path を残し、malformed fallback の file identity に使う。
@@ -185,7 +213,7 @@ pub struct GitParser {
 /// ANSI除去済みbyteを1 logical line分だけ数え、grammar prefixだけを保持する。
 ///
 /// CRLF判定には除去後の末尾1 byteが必要なので、`last_byte`はline確定までescaperへ渡さない。
-/// `prefix`は1 MiB、`escaped_chunk`は1 reader chunkの最大4倍に留まり、line全長には比例しない。
+/// `prefix`は1 MiB、`escaped_chunk`は32 KiBの内部sliceの最大4倍に留まり、line全長には比例しない。
 #[derive(Debug, Default)]
 struct BoundedLineAccumulator {
     escaper: StreamingInteractiveEscaper,
@@ -311,9 +339,21 @@ impl GitParser {
             ParserLifecycle::Poisoned => return Err(ParseError::Poisoned),
             ParserLifecycle::Active => {}
         }
-        let before = ParserSnapshot::from_parser(self);
+        let before = match ParserSnapshot::from_parser(self) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.lifecycle = ParserLifecycle::Poisoned;
+                return Err(error);
+            }
+        };
         match self.push_active(raw_start, input) {
-            Ok(()) => Ok(before.delta(&self.document, false, !input.is_empty())),
+            Ok(()) => match before.delta(&self.document, false, !input.is_empty()) {
+                Ok(delta) => Ok(delta),
+                Err(error) => {
+                    self.lifecycle = ParserLifecycle::Poisoned;
+                    Err(error)
+                }
+            },
             Err(error) => {
                 self.lifecycle = ParserLifecycle::Poisoned;
                 Err(error)
@@ -325,16 +365,23 @@ impl GitParser {
     pub fn finish(&mut self) -> Result<ParseDelta, ParseError> {
         match self.lifecycle {
             ParserLifecycle::Finished => {
-                return Ok(ParserSnapshot::from_parser(self).delta(&self.document, true, false));
+                let before = ParserSnapshot::from_parser(self)?;
+                return before.delta(&self.document, true, false);
             }
             ParserLifecycle::Poisoned => return Err(ParseError::Poisoned),
             ParserLifecycle::Active => {}
         }
-        let before = ParserSnapshot::from_parser(self);
+        let before = match ParserSnapshot::from_parser(self) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.lifecycle = ParserLifecycle::Poisoned;
+                return Err(error);
+            }
+        };
         match self.finish_active() {
             Ok(()) => {
                 self.lifecycle = ParserLifecycle::Finished;
-                Ok(before.delta(&self.document, true, true))
+                before.delta(&self.document, true, true)
             }
             Err(error) => {
                 self.lifecycle = ParserLifecycle::Poisoned;
@@ -379,18 +426,31 @@ impl GitParser {
                 stored_len: status.len,
             });
         }
-        self.raw
-            .read_range_into(raw_start..raw_end, &mut self.stored_chunk)?;
-        if self.stored_chunk.as_slice() != input {
-            return Err(ParseError::RawChunkMismatch {
-                start: raw_start,
-                end: raw_end,
-            });
-        }
+        let mut slice_start = raw_start;
+        for slice in input.chunks(MAX_PUSH_SLICE_BYTES) {
+            let slice_len =
+                u64::try_from(slice.len()).map_err(|_| ParseError::BufferLengthOverflow {
+                    buffer: "raw parser slice",
+                })?;
+            let slice_end = slice_start
+                .checked_add(slice_len)
+                .ok_or(ParseError::RawOffsetOverflow(RawOffsetOverflow))?;
+            self.raw
+                .read_range_into(slice_start..slice_end, &mut self.stored_chunk)?;
+            if self.stored_chunk.as_slice() != slice {
+                return Err(ParseError::RawChunkMismatch {
+                    start: slice_start,
+                    end: slice_end,
+                });
+            }
 
-        self.collect_indexed(raw_start, input)?;
-        self.raw_cursor = raw_end;
-        self.consume_collected()
+            self.collect_indexed(slice_start, slice)?;
+            self.consume_collected()?;
+            self.raw_cursor = slice_end;
+            slice_start = slice_end;
+        }
+        debug_assert_eq!(slice_start, raw_end);
+        Ok(())
     }
 
     fn finish_active(&mut self) -> Result<(), ParseError> {
@@ -410,10 +470,10 @@ impl GitParser {
         let final_span = self.tracker.seal_eof(status.len)?;
         self.consume_final_span(final_span)?;
 
-        let end = self.next_line_id();
-        self.close_file(end);
-        self.close_commit(end);
-        self.document.mark_complete();
+        let end = self.next_line_id()?;
+        self.close_file(end)?;
+        self.close_commit(end)?;
+        self.document.mark_complete()?;
         Ok(())
     }
 
@@ -590,17 +650,17 @@ impl GitParser {
         }
 
         if self.current_hunk.is_some() {
-            if self.current_file_mode() == Some(FileMode::Rich) {
-                if let Some((kind, old_line, new_line)) = self.consume_rich_hunk_line(prefix) {
+            if self.current_file_mode()? == Some(FileMode::Rich) {
+                if let Some(line) = self.consume_rich_hunk_line(prefix)? {
                     return self.append_current_file_line(
                         span,
                         display_len,
-                        kind,
-                        old_line,
-                        new_line,
+                        line.kind,
+                        line.old_line,
+                        line.new_line,
                     );
                 }
-                self.mark_current_file_mode(FileMode::Malformed);
+                self.mark_current_file_mode(FileMode::Malformed)?;
                 return self.append_current_file_line(
                     span,
                     display_len,
@@ -609,30 +669,25 @@ impl GitParser {
                     None,
                 );
             }
-            let kind = line_kind_for_mode(self.current_file_mode().unwrap_or(FileMode::Malformed));
+            let kind = line_kind_for_mode(self.current_file_mode()?.unwrap_or(FileMode::Malformed));
             return self.append_current_file_line(span, display_len, kind, None, None);
         }
 
         self.awaiting_new_file_header = false;
         self.awaiting_hunk_header = false;
-        self.mark_current_file_mode(FileMode::Malformed);
+        self.mark_current_file_mode(FileMode::Malformed)?;
         self.append_current_file_line(span, display_len, LineKind::Fallback, None, None)
     }
 
     fn process_line(&mut self, text: &str, span: RawLineSpan) -> Result<(), ParseError> {
-        let line_id = self.next_line_id();
+        let line_id = self.next_line_id()?;
 
         if let Some(object_id) = parse_commit_header(text) {
-            self.close_file(line_id);
-            self.close_commit(line_id);
-            let commit_id = self.document.push_commit(Commit {
-                id: CommitId::new(0),
-                kind: CommitKind::Commit,
-                object_id: Some(object_id),
-                subject: None,
-                span: LineSpan::open(line_id),
-                file_ids: Vec::new(),
-            });
+            self.close_file(line_id)?;
+            self.close_commit(line_id)?;
+            let commit_id =
+                self.document
+                    .begin_commit(CommitKind::Commit, Some(object_id), line_id)?;
             self.current_commit = Some(commit_id);
             return self.append_line(
                 span,
@@ -649,11 +704,14 @@ impl GitParser {
         // `--submodule=log` は環境によって `diff --git` を出さず、summary 行から始まる。
         // その場合も外側の submodule path を1 file occurrence として navigation 対象にする。
         if let Some(path) = parse_submodule_path(text) {
-            let belongs_to_current = self
-                .current_file
-                .and_then(|id| self.document.file(id))
-                .and_then(FileEntry::primary_path)
-                .is_some_and(|current| current == path);
+            let belongs_to_current = if let Some(id) = self.current_file {
+                self.document
+                    .open_file(id)?
+                    .primary_path()
+                    .is_some_and(|current| current == path)
+            } else {
+                false
+            };
             if !belongs_to_current {
                 self.start_file(
                     Ok((Some(path.clone()), Some(path))),
@@ -661,7 +719,7 @@ impl GitParser {
                     line_id,
                 )?;
             } else {
-                self.mark_current_file_mode(FileMode::Submodule);
+                self.mark_current_file_mode(FileMode::Submodule)?;
             }
             return self.append_current_file_line(
                 span,
@@ -674,8 +732,8 @@ impl GitParser {
 
         if let Some(rest) = text.strip_prefix("diff --git ") {
             let paths = parse_diff_git_paths(rest);
-            if self.paths_are_inside_current_submodule(&paths) {
-                self.close_hunk(line_id);
+            if self.paths_are_inside_current_submodule(&paths)? {
+                self.close_hunk(line_id)?;
                 return self.append_current_file_line(
                     span,
                     text.len(),
@@ -724,14 +782,8 @@ impl GitParser {
         let kind = if let Some(id) = commit_id {
             if text.starts_with("    ") {
                 let subject = text.trim();
-                if !subject.is_empty()
-                    && self
-                        .document
-                        .commit(id)
-                        .is_some_and(|commit| commit.subject.is_none())
-                    && let Some(commit) = self.document.commit_mut(id)
-                {
-                    commit.subject = Some(subject.to_owned());
+                if !subject.is_empty() && self.document.open_commit(id)?.subject.is_none() {
+                    self.document.open_commit_mut(id)?.subject = Some(subject.to_owned());
                 }
                 LineKind::CommitMessage
             } else {
@@ -751,18 +803,18 @@ impl GitParser {
         line_id: LineId,
     ) -> Result<(), ParseError> {
         if self.awaiting_new_file_header && !text.starts_with("+++ ") {
-            self.mark_current_file_mode(FileMode::Malformed);
+            self.mark_current_file_mode(FileMode::Malformed)?;
             self.awaiting_new_file_header = false;
         }
         if self.awaiting_hunk_header && !text.starts_with("@@") && !is_binary_line(text) {
-            self.mark_current_file_mode(FileMode::Malformed);
+            self.mark_current_file_mode(FileMode::Malformed)?;
             self.awaiting_hunk_header = false;
         }
 
         if text.starts_with("@@@") {
             self.awaiting_hunk_header = false;
-            self.close_hunk(line_id);
-            self.mark_current_file_mode(FileMode::Combined);
+            self.close_hunk(line_id)?;
+            self.mark_current_file_mode(FileMode::Combined)?;
             self.start_fallback_hunk(line_id, HunkKind::Combined)?;
             return self.append_current_file_line(
                 span,
@@ -775,16 +827,16 @@ impl GitParser {
 
         if text.starts_with("@@") {
             self.awaiting_hunk_header = false;
-            self.close_hunk(line_id);
+            self.close_hunk(line_id)?;
             if let Some((old_range, new_range)) = parse_unified_hunk_header(text) {
-                let mode = self.current_file_mode().unwrap_or(FileMode::Malformed);
+                let mode = self.current_file_mode()?.unwrap_or(FileMode::Malformed);
                 if mode.is_rich() {
                     self.start_unified_hunk(line_id, old_range, new_range)?;
                 } else {
                     self.start_fallback_hunk(line_id, hunk_kind_for_mode(mode))?;
                 }
             } else {
-                self.mark_current_file_mode(FileMode::Malformed);
+                self.mark_current_file_mode(FileMode::Malformed)?;
                 self.start_fallback_hunk(line_id, HunkKind::Malformed)?;
             }
             return self.append_current_file_line(
@@ -808,22 +860,22 @@ impl GitParser {
 
         if is_binary_line(text) {
             self.awaiting_hunk_header = false;
-            self.mark_current_file_mode(FileMode::Binary);
+            self.mark_current_file_mode(FileMode::Binary)?;
             return self.append_current_file_line(span, text.len(), LineKind::Binary, None, None);
         }
 
         if self.current_hunk.is_some() {
-            if self.current_file_mode() == Some(FileMode::Rich) {
-                if let Some((kind, old_line, new_line)) = self.consume_rich_hunk_line(text) {
+            if self.current_file_mode()? == Some(FileMode::Rich) {
+                if let Some(line) = self.consume_rich_hunk_line(text)? {
                     return self.append_current_file_line(
                         span,
                         text.len(),
-                        kind,
-                        old_line,
-                        new_line,
+                        line.kind,
+                        line.old_line,
+                        line.new_line,
                     );
                 } else if is_word_diff_line(text) {
-                    self.mark_current_file_mode(FileMode::WordDiff);
+                    self.mark_current_file_mode(FileMode::WordDiff)?;
                     return self.append_current_file_line(
                         span,
                         text.len(),
@@ -832,7 +884,7 @@ impl GitParser {
                         None,
                     );
                 } else if is_submodule_line(text) {
-                    self.mark_current_file_mode(FileMode::Submodule);
+                    self.mark_current_file_mode(FileMode::Submodule)?;
                     return self.append_current_file_line(
                         span,
                         text.len(),
@@ -841,7 +893,7 @@ impl GitParser {
                         None,
                     );
                 } else {
-                    self.mark_current_file_mode(FileMode::Malformed);
+                    self.mark_current_file_mode(FileMode::Malformed)?;
                     return self.append_current_file_line(
                         span,
                         text.len(),
@@ -852,14 +904,14 @@ impl GitParser {
                 }
             } else {
                 let kind =
-                    line_kind_for_mode(self.current_file_mode().unwrap_or(FileMode::Malformed));
+                    line_kind_for_mode(self.current_file_mode()?.unwrap_or(FileMode::Malformed));
                 return self.append_current_file_line(span, text.len(), kind, None, None);
             }
         }
 
         // inline submodule diff の `index` / `---` / `+++` は外側 file の path/status を
         // 上書きしてはならない。hunk header は上で navigation anchor として記録済みである。
-        if self.current_file_mode() == Some(FileMode::Submodule) {
+        if self.current_file_mode()? == Some(FileMode::Submodule) {
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -870,7 +922,7 @@ impl GitParser {
         }
 
         if is_gitlink_metadata(text) {
-            self.mark_current_file_mode(FileMode::Submodule);
+            self.mark_current_file_mode(FileMode::Submodule)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -881,7 +933,7 @@ impl GitParser {
         }
 
         if let Some(path) = text.strip_prefix("rename from ") {
-            self.update_extended_path(path, true, ChangeStatus::Renamed);
+            self.update_extended_path(path, true, ChangeStatus::Renamed)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -891,7 +943,7 @@ impl GitParser {
             );
         }
         if let Some(path) = text.strip_prefix("rename to ") {
-            self.update_extended_path(path, false, ChangeStatus::Renamed);
+            self.update_extended_path(path, false, ChangeStatus::Renamed)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -901,7 +953,7 @@ impl GitParser {
             );
         }
         if let Some(path) = text.strip_prefix("copy from ") {
-            self.update_extended_path(path, true, ChangeStatus::Copied);
+            self.update_extended_path(path, true, ChangeStatus::Copied)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -911,7 +963,7 @@ impl GitParser {
             );
         }
         if let Some(path) = text.strip_prefix("copy to ") {
-            self.update_extended_path(path, false, ChangeStatus::Copied);
+            self.update_extended_path(path, false, ChangeStatus::Copied)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -921,7 +973,7 @@ impl GitParser {
             );
         }
         if text.starts_with("new file mode ") {
-            self.update_status(ChangeStatus::Added);
+            self.update_status(ChangeStatus::Added)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -931,7 +983,7 @@ impl GitParser {
             );
         }
         if text.starts_with("deleted file mode ") {
-            self.update_status(ChangeStatus::Deleted);
+            self.update_status(ChangeStatus::Deleted)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -942,7 +994,7 @@ impl GitParser {
         }
         if let Some(path) = text.strip_prefix("--- ") {
             self.awaiting_new_file_header = true;
-            self.update_source_path(path, true);
+            self.update_source_path(path, true)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -953,11 +1005,11 @@ impl GitParser {
         }
         if let Some(path) = text.strip_prefix("+++ ") {
             if !self.awaiting_new_file_header {
-                self.mark_current_file_mode(FileMode::Malformed);
+                self.mark_current_file_mode(FileMode::Malformed)?;
             }
             self.awaiting_new_file_header = false;
             self.awaiting_hunk_header = true;
-            self.update_source_path(path, false);
+            self.update_source_path(path, false)?;
             return self.append_current_file_line(
                 span,
                 text.len(),
@@ -967,16 +1019,17 @@ impl GitParser {
             );
         }
 
-        let kind = line_kind_for_mode(self.current_file_mode().unwrap_or(FileMode::Malformed));
+        let kind = line_kind_for_mode(self.current_file_mode()?.unwrap_or(FileMode::Malformed));
         self.append_current_file_line(span, text.len(), kind, None, None)
     }
 
-    fn consume_rich_hunk_line(
-        &mut self,
-        text: &str,
-    ) -> Option<(LineKind, Option<u64>, Option<u64>)> {
-        let marker = text.as_bytes().first().copied()?;
-        let cursor = self.current_hunk?;
+    fn consume_rich_hunk_line(&mut self, text: &str) -> Result<Option<RichHunkLine>, ParseError> {
+        let Some(marker) = text.as_bytes().first().copied() else {
+            return Ok(None);
+        };
+        let Some(cursor) = self.current_hunk else {
+            return Ok(None);
+        };
 
         let (kind, old_line, new_line) = match marker {
             b' ' if cursor.old_remaining > 0 && cursor.new_remaining > 0 => (
@@ -986,7 +1039,7 @@ impl GitParser {
             ),
             b'-' if cursor.old_remaining > 0 => (LineKind::Deletion, Some(cursor.old_next), None),
             b'+' if cursor.new_remaining > 0 => (LineKind::Addition, None, Some(cursor.new_next)),
-            _ => return None,
+            _ => return Ok(None),
         };
 
         if let Some(active) = self.current_hunk.as_mut() {
@@ -1009,9 +1062,8 @@ impl GitParser {
             }
         }
 
-        if let Some(file_id) = self.current_file
-            && let Some(file) = self.document.file_mut(file_id)
-        {
+        if let Some(file_id) = self.current_file {
+            let file = self.document.open_file_mut(file_id)?;
             match kind {
                 LineKind::Deletion => {
                     file.deletions = file.deletions.map(|value| value.saturating_add(1));
@@ -1023,7 +1075,11 @@ impl GitParser {
             }
         }
 
-        Some((kind, old_line, new_line))
+        Ok(Some(RichHunkLine {
+            kind,
+            old_line,
+            new_line,
+        }))
     }
 
     fn start_file(
@@ -1032,51 +1088,37 @@ impl GitParser {
         requested_mode: FileMode,
         line_id: LineId,
     ) -> Result<(), ParseError> {
-        self.close_file(line_id);
-        let commit_id = self.ensure_working_commit(line_id);
+        self.close_file(line_id)?;
+        let commit_id = self.ensure_working_commit(line_id)?;
         let (old_path, new_path, mode) = match paths {
             Ok((old_path, new_path)) => (old_path, new_path, requested_mode),
             Err((old_path, new_path)) => (old_path, new_path, FileMode::Malformed),
         };
-        let counts = if mode.is_rich() { Some(0) } else { None };
         let status = match mode {
             FileMode::Binary => ChangeStatus::Binary,
             FileMode::Submodule => ChangeStatus::Submodule,
             _ => ChangeStatus::Modified,
         };
-        let file_id = self.document.push_file(FileEntry {
-            id: FileId::new(0),
-            commit_id,
-            old_path,
-            new_path,
-            status,
-            mode,
-            span: LineSpan::open(line_id),
-            hunk_ids: Vec::new(),
-            additions: counts,
-            deletions: counts,
-        })?;
+        let file_id = self
+            .document
+            .begin_file(commit_id, old_path, new_path, status, mode, line_id)?;
         self.current_file = Some(file_id);
         self.awaiting_new_file_header = false;
         self.awaiting_hunk_header = false;
         Ok(())
     }
 
-    fn ensure_working_commit(&mut self, line_id: LineId) -> CommitId {
+    fn ensure_working_commit(&mut self, line_id: LineId) -> Result<CommitId, ParseError> {
         if let Some(id) = self.current_commit {
-            return id;
+            let _ = self.document.open_commit(id)?;
+            return Ok(id);
         }
 
-        let id = self.document.push_commit(Commit {
-            id: CommitId::new(0),
-            kind: CommitKind::WorkingTree,
-            object_id: None,
-            subject: None,
-            span: LineSpan::open(line_id),
-            file_ids: Vec::new(),
-        });
+        let id = self
+            .document
+            .begin_commit(CommitKind::WorkingTree, None, line_id)?;
         self.current_commit = Some(id);
-        id
+        Ok(id)
     }
 
     fn start_unified_hunk(
@@ -1088,15 +1130,13 @@ impl GitParser {
         let Some(file_id) = self.current_file else {
             return Ok(());
         };
-        let hunk_id = self.document.push_hunk(Hunk {
-            id: HunkId::new(0),
+        let hunk_id = self.document.begin_hunk(
             file_id,
-            kind: HunkKind::Unified,
-            header_line: line_id,
-            span: LineSpan::open(line_id),
-            old_range: Some(old_range),
-            new_range: Some(new_range),
-        })?;
+            HunkKind::Unified,
+            line_id,
+            Some(old_range),
+            Some(new_range),
+        )?;
         self.current_hunk = Some(HunkCursor {
             id: hunk_id,
             old_next: old_range.start,
@@ -1111,15 +1151,9 @@ impl GitParser {
         let Some(file_id) = self.current_file else {
             return Ok(());
         };
-        let hunk_id = self.document.push_hunk(Hunk {
-            id: HunkId::new(0),
-            file_id,
-            kind,
-            header_line: line_id,
-            span: LineSpan::open(line_id),
-            old_range: None,
-            new_range: None,
-        })?;
+        let hunk_id = self
+            .document
+            .begin_hunk(file_id, kind, line_id, None, None)?;
         self.current_hunk = Some(HunkCursor {
             id: hunk_id,
             old_next: 0,
@@ -1130,55 +1164,53 @@ impl GitParser {
         Ok(())
     }
 
-    fn close_hunk(&mut self, end: LineId) {
-        let Some(cursor) = self.current_hunk.take() else {
-            return;
+    fn close_hunk(&mut self, end: LineId) -> Result<(), ParseError> {
+        let Some(cursor) = self.current_hunk else {
+            return Ok(());
         };
-        let incomplete = self.current_file_mode() == Some(FileMode::Rich)
+        let incomplete = self.current_file_mode()? == Some(FileMode::Rich)
             && (cursor.old_remaining != 0 || cursor.new_remaining != 0);
         if incomplete {
-            self.mark_current_file_mode(FileMode::Malformed);
-            if let Some(hunk) = self.document.hunk_mut(cursor.id) {
-                hunk.kind = HunkKind::Malformed;
-                hunk.old_range = None;
-                hunk.new_range = None;
-            }
+            self.mark_current_file_mode(FileMode::Malformed)?;
         }
-        if let Some(hunk) = self.document.hunk_mut(cursor.id) {
-            hunk.span.end_exclusive = Some(end.get());
-        }
+        self.document.finish_hunk(cursor.id, end.get())?;
+        // Fixed table appendが成功するまでIDを残す。Failure時はparserがpoisonされるが、
+        // errorの手前でopen overlayへの参照を失わない。
+        self.current_hunk = None;
+        Ok(())
     }
 
-    fn close_file(&mut self, end: LineId) {
-        self.close_hunk(end);
+    fn close_file(&mut self, end: LineId) -> Result<(), ParseError> {
+        self.close_hunk(end)?;
         if self.awaiting_new_file_header {
-            self.mark_current_file_mode(FileMode::Malformed);
+            self.mark_current_file_mode(FileMode::Malformed)?;
             self.awaiting_new_file_header = false;
         }
         if self.awaiting_hunk_header {
-            self.mark_current_file_mode(FileMode::Malformed);
+            self.mark_current_file_mode(FileMode::Malformed)?;
             self.awaiting_hunk_header = false;
         }
-        if let Some(file_id) = self.current_file.take()
-            && let Some(file) = self.document.file_mut(file_id)
-        {
-            file.span.end_exclusive = Some(end.get());
+        if let Some(file_id) = self.current_file {
+            self.document.finish_file(file_id, end.get())?;
+            self.current_file = None;
         }
+        Ok(())
     }
 
-    fn close_commit(&mut self, end: LineId) {
-        if let Some(commit_id) = self.current_commit.take()
-            && let Some(commit) = self.document.commit_mut(commit_id)
-        {
-            commit.span.end_exclusive = Some(end.get());
+    fn close_commit(&mut self, end: LineId) -> Result<(), ParseError> {
+        if let Some(commit_id) = self.current_commit {
+            self.document.finish_commit(commit_id, end.get())?;
+            self.current_commit = None;
         }
+        Ok(())
     }
 
-    fn mark_current_file_mode(&mut self, mode: FileMode) {
+    fn mark_current_file_mode(&mut self, mode: FileMode) -> Result<(), ParseError> {
         let Some(file_id) = self.current_file else {
-            return;
+            return Ok(());
         };
-        if let Some(file) = self.document.file_mut(file_id) {
+        {
+            let file = self.document.open_file_mut(file_id)?;
             file.mode = mode;
             file.additions = None;
             file.deletions = None;
@@ -1188,64 +1220,68 @@ impl GitParser {
                 file.status = ChangeStatus::Submodule;
             }
         }
-        if let Some(cursor) = self.current_hunk
-            && let Some(hunk) = self.document.hunk_mut(cursor.id)
-        {
+        if let Some(cursor) = self.current_hunk {
+            let hunk = self.document.open_hunk_mut(cursor.id)?;
             hunk.kind = hunk_kind_for_mode(mode);
             if !mode.is_rich() {
                 hunk.old_range = None;
                 hunk.new_range = None;
             }
         }
+        Ok(())
     }
 
-    fn current_file_mode(&self) -> Option<FileMode> {
+    fn current_file_mode(&self) -> Result<Option<FileMode>, ParseError> {
         self.current_file
-            .and_then(|file_id| self.document.file(file_id))
-            .map(|file| file.mode)
+            .map(|file_id| self.document.open_file(file_id).map(|file| file.mode))
+            .transpose()
+            .map_err(ParseError::from)
     }
 
-    fn paths_are_inside_current_submodule(&self, paths: &ParsedPaths) -> bool {
+    fn paths_are_inside_current_submodule(&self, paths: &ParsedPaths) -> Result<bool, ParseError> {
         let Some(file_id) = self.current_file else {
-            return false;
+            return Ok(false);
         };
-        let Some(file) = self.document.file(file_id) else {
-            return false;
-        };
+        let file = self.document.open_file(file_id)?;
         if file.mode != FileMode::Submodule {
-            return false;
+            return Ok(false);
         }
         let Some(root) = file.primary_path() else {
-            return false;
+            return Ok(false);
         };
         let (old_path, new_path) = match paths {
             Ok(paths) | Err(paths) => paths,
         };
-        old_path
+        Ok(old_path
             .as_deref()
             .into_iter()
             .chain(new_path.as_deref())
             .any(|path| {
                 path.strip_prefix(root)
                     .is_some_and(|suffix| suffix.starts_with('/'))
-            })
+            }))
     }
 
-    fn update_status(&mut self, status: ChangeStatus) {
-        if let Some(file_id) = self.current_file
-            && let Some(file) = self.document.file_mut(file_id)
-        {
-            file.status = status;
+    fn update_status(&mut self, status: ChangeStatus) -> Result<(), ParseError> {
+        if let Some(file_id) = self.current_file {
+            self.document.open_file_mut(file_id)?.status = status;
         }
+        Ok(())
     }
 
-    fn update_extended_path(&mut self, value: &str, old: bool, status: ChangeStatus) {
+    fn update_extended_path(
+        &mut self,
+        value: &str,
+        old: bool,
+        status: ChangeStatus,
+    ) -> Result<(), ParseError> {
         let decoded = decode_git_path(value.trim());
         let malformed = decoded.is_none();
         let Some(file_id) = self.current_file else {
-            return;
+            return Ok(());
         };
-        if let Some(file) = self.document.file_mut(file_id) {
+        {
+            let file = self.document.open_file_mut(file_id)?;
             file.status = status;
             if let Some(decoded) = decoded {
                 if old {
@@ -1256,11 +1292,12 @@ impl GitParser {
             }
         }
         if malformed {
-            self.mark_current_file_mode(FileMode::Malformed);
+            self.mark_current_file_mode(FileMode::Malformed)?;
         }
+        Ok(())
     }
 
-    fn update_source_path(&mut self, value: &str, old: bool) {
+    fn update_source_path(&mut self, value: &str, old: bool) -> Result<(), ParseError> {
         // Git の `---` / `+++` header は timestamp field を持たないため、unquoted space も path
         // の一部として扱う。quoted path では decoder が閉じ quote 外の byte を拒否する。
         let token = value.trim();
@@ -1276,9 +1313,10 @@ impl GitParser {
         });
 
         let Some(file_id) = self.current_file else {
-            return;
+            return Ok(());
         };
-        if let Some(file) = self.document.file_mut(file_id) {
+        {
+            let file = self.document.open_file_mut(file_id)?;
             if old {
                 if is_dev_null {
                     file.old_path = None;
@@ -1294,8 +1332,9 @@ impl GitParser {
             }
         }
         if decoded.is_none() {
-            self.mark_current_file_mode(FileMode::Malformed);
+            self.mark_current_file_mode(FileMode::Malformed)?;
         }
+        Ok(())
     }
 
     fn append_current_file_line(
@@ -1308,8 +1347,8 @@ impl GitParser {
     ) -> Result<(), ParseError> {
         let file_id = self.current_file;
         let commit_id = file_id
-            .and_then(|id| self.document.file(id))
-            .map(|file| file.commit_id);
+            .map(|id| self.document.open_file(id).map(|file| file.commit_id()))
+            .transpose()?;
         let hunk_id = self.current_hunk.map(|cursor| cursor.id);
         self.append_line(
             span,
@@ -1350,8 +1389,8 @@ impl GitParser {
         Ok(())
     }
 
-    fn next_line_id(&self) -> LineId {
-        LineId::new(self.document.line_count() as u64)
+    fn next_line_id(&self) -> Result<LineId, ParseError> {
+        self.document.next_line_id().map_err(ParseError::from)
     }
 }
 
@@ -1390,8 +1429,10 @@ pub fn parse_bytes(input: &[u8]) -> Result<DocumentSnapshot, ParseError> {
     let raw = AppendStore::new();
     let storage = StructuralStorage::new()?;
     let mut parser = GitParser::new(raw.clone(), &storage)?;
-    let raw_start = raw.append(input)?;
-    let _ = parser.push(raw_start, input)?;
+    for chunk in input.chunks(MAX_PUSH_SLICE_BYTES) {
+        let raw_start = raw.append(chunk)?;
+        let _ = parser.push(raw_start, chunk)?;
+    }
     let _ = raw.seal()?;
     parser.into_document()
 }
@@ -1679,6 +1720,7 @@ fn line_kind_for_mode(mode: FileMode) -> LineKind {
 mod bounded_line_tests {
     use super::*;
     use crate::document::{DocumentLineMetadataReader, DocumentLineReader};
+    use crate::structure_store::StructureMetadataReader;
 
     fn push(parser: &mut GitParser, raw: &AppendStore, bytes: &[u8]) {
         let start = raw.append(bytes).unwrap();
@@ -1727,6 +1769,110 @@ mod bounded_line_tests {
             .unwrap()
             .unwrap();
         assert_eq!(second.text, "+next");
-        assert_eq!(snapshot.files()[0].additions, Some(2));
+        let file_id = snapshot.structure().file_id_at(0).unwrap();
+        let file = StructureMetadataReader::new()
+            .read_file(snapshot.structure(), file_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(file.additions, Some(2));
+    }
+
+    #[test]
+    fn one_shot_multi_megabyte_push_uses_only_bounded_internal_slices() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut parser = GitParser::new(raw.clone(), &storage).unwrap();
+        let mut input = vec![b'x'; 8 * 1024 * 1024];
+        input.push(b'\n');
+        let start = raw.append(&input).unwrap();
+
+        let delta = parser.push(start, &input).unwrap();
+        assert_eq!(delta.lines, 0..1);
+        assert_eq!(parser.raw_cursor, input.len() as u64);
+        assert!(parser.stored_chunk.capacity() <= MAX_PUSH_SLICE_BYTES * 2);
+        assert!(parser.emitted.capacity() <= MAX_PUSH_SLICE_BYTES * 2);
+        assert!(parser.completed_spans.capacity() <= MAX_PUSH_SLICE_BYTES * 2);
+        assert!(parser.pending_line.escaped_chunk.capacity() <= MAX_PUSH_SLICE_BYTES * 8);
+        assert!(parser.pending_line.prefix.capacity() <= GRAMMAR_PREFIX_BYTES * 2);
+
+        raw.seal().unwrap();
+        let snapshot = parser.into_document().unwrap();
+        let metadata = DocumentLineMetadataReader::new()
+            .read(&snapshot, snapshot.line_id_at(0).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.raw_len, input.len().saturating_sub(1) as u64);
+        assert!(metadata.display_len.exceeds(GRAMMAR_PREFIX_BYTES));
+    }
+
+    #[test]
+    fn failed_structural_closes_keep_parser_current_ids() {
+        let storage = StructuralStorage::new().unwrap();
+
+        let mut commit_parser =
+            GitParser::new(AppendStore::new(), &storage).expect("commit parser");
+        let commit_id = commit_parser
+            .document
+            .begin_commit(CommitKind::WorkingTree, None, LineId::new(0))
+            .unwrap();
+        commit_parser.current_commit = Some(commit_id);
+        assert!(commit_parser.close_commit(LineId::new(1)).is_err());
+        assert_eq!(commit_parser.current_commit, Some(commit_id));
+
+        let mut file_parser = GitParser::new(AppendStore::new(), &storage).expect("file parser");
+        let commit_id = file_parser
+            .document
+            .begin_commit(CommitKind::WorkingTree, None, LineId::new(0))
+            .unwrap();
+        let file_id = file_parser
+            .document
+            .begin_file(
+                commit_id,
+                Some("a".to_owned()),
+                Some("a".to_owned()),
+                ChangeStatus::Modified,
+                FileMode::Malformed,
+                LineId::new(0),
+            )
+            .unwrap();
+        file_parser.current_commit = Some(commit_id);
+        file_parser.current_file = Some(file_id);
+        assert!(file_parser.close_file(LineId::new(1)).is_err());
+        assert_eq!(file_parser.current_file, Some(file_id));
+
+        let mut hunk_parser = GitParser::new(AppendStore::new(), &storage).expect("hunk parser");
+        let commit_id = hunk_parser
+            .document
+            .begin_commit(CommitKind::WorkingTree, None, LineId::new(0))
+            .unwrap();
+        let file_id = hunk_parser
+            .document
+            .begin_file(
+                commit_id,
+                Some("a".to_owned()),
+                Some("a".to_owned()),
+                ChangeStatus::Modified,
+                FileMode::Malformed,
+                LineId::new(0),
+            )
+            .unwrap();
+        let hunk_id = hunk_parser
+            .document
+            .begin_hunk(file_id, HunkKind::Malformed, LineId::new(0), None, None)
+            .unwrap();
+        hunk_parser.current_commit = Some(commit_id);
+        hunk_parser.current_file = Some(file_id);
+        hunk_parser.current_hunk = Some(HunkCursor {
+            id: hunk_id,
+            old_next: 0,
+            new_next: 0,
+            old_remaining: 0,
+            new_remaining: 0,
+        });
+        assert!(hunk_parser.close_hunk(LineId::new(1)).is_err());
+        assert_eq!(
+            hunk_parser.current_hunk.map(|cursor| cursor.id),
+            Some(hunk_id)
+        );
     }
 }

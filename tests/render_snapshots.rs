@@ -5,7 +5,7 @@ use git_ultrapager::decorations::DecorationSet;
 use git_ultrapager::parser::parse_bytes;
 use git_ultrapager::state::AppState;
 use git_ultrapager::theme::{ColorLevel, Theme};
-use git_ultrapager::ui::{FrameLines, render};
+use git_ultrapager::ui::{FrameLoader, render};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, Cell};
@@ -67,7 +67,8 @@ fn render_snapshot(
     let theme = Theme::new(theme_choice, color_level);
     let decorations = DecorationSet::compute(state.document(), &theme, state.whitespace())
         .expect("decoration computation failed");
-    let lines = FrameLines::load(&state).expect("frame line decode failed");
+    let mut frame_loader = FrameLoader::new();
+    let lines = frame_loader.load(&state).expect("frame line decode failed");
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend の初期化に失敗した");
     terminal

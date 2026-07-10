@@ -150,6 +150,22 @@ pub struct ResidentBytes {
     pub limit: usize,
 }
 
+/// Structural storage全体の観測用snapshot。
+///
+/// Resident ledgerとspill allocatorの内部handleは公開せず、acceptance testとprofile harnessが
+/// memory上限とdisk tierへの遷移を同じAPIで記録できる値だけを返す。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StructuralStorageStats {
+    /// Record page、blob page、sparse directory、control領域の課金済みresident byte。
+    pub resident: ResidentBytes,
+    /// RAM payloadで保持できないrecord/blobのためunlinked tempfileを作成済みなら`true`。
+    pub spill_file_allocated: bool,
+    /// Spill allocatorが重複しないextent/blob rangeとして予約済みのbyte数。
+    ///
+    /// File system上のallocated block数ではなく、allocator内の次offsetと等しいlogical high-water mark。
+    pub spill_reserved_bytes: u64,
+}
+
 /// Structural storage のfailure。
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -366,6 +382,27 @@ impl StructuralStorage {
     /// 現在RAMに残るpayloadとsparse directoryの課金値を返す。
     pub fn resident_bytes(&self) -> Result<ResidentBytes, StorageError> {
         self.inner.budget.snapshot()
+    }
+
+    /// Resident ledgerとspill allocatorの現在値を、内部file handleを含まない値として返す。
+    ///
+    /// 2つのlockは同時保持しない。Concurrent append中の値はresident取得後にspillが進む場合があるが、
+    /// 各fieldはそれぞれ完全なlock acquisitionから得る。Parser完了後の呼び出しでは両high-water markが
+    /// 固定される。
+    pub fn stats(&self) -> Result<StructuralStorageStats, StorageError> {
+        let resident = self.inner.budget.snapshot()?;
+        let spill = self
+            .inner
+            .spill
+            .lock()
+            .map_err(|_| StorageError::LockPoisoned {
+                resource: "spill allocator",
+            })?;
+        Ok(StructuralStorageStats {
+            resident,
+            spill_file_allocated: spill.file.is_some(),
+            spill_reserved_bytes: spill.next_offset,
+        })
     }
 
     /// このstorageを共有する空の固定長record tableを作る。
@@ -1630,6 +1667,22 @@ mod tests {
         let expected_spill_control =
             size_of::<DiskExtent>() + size_of::<File>() + 2 * size_of::<usize>();
         assert_eq!(after_spill - before_spill, expected_spill_control);
+    }
+
+    #[test]
+    fn public_stats_report_resident_usage_and_spill_high_water_without_handles() {
+        let storage = StructuralStorage::with_config(disk_only_config(25)).unwrap();
+        let before = storage.stats().unwrap();
+        assert_eq!(before.resident, storage.resident_bytes().unwrap());
+        assert!(!before.spill_file_allocated);
+        assert_eq!(before.spill_reserved_bytes, 0);
+
+        let table = storage.table::<TestRecord>().unwrap();
+        table.append(&TestRecord { ordinal: 1, tag: 1 }).unwrap();
+        let after = storage.stats().unwrap();
+        assert_eq!(after.resident, storage.resident_bytes().unwrap());
+        assert!(after.spill_file_allocated);
+        assert_eq!(after.spill_reserved_bytes, 25);
     }
 
     #[test]

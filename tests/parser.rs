@@ -1,16 +1,130 @@
+use std::ops::Deref;
+
 use git_ultrapager::ansi::{AnsiStripper, escape_interactive_bytes, escape_path_bytes};
-use git_ultrapager::direct::layout_document;
-use git_ultrapager::document::{DocumentLineReader, DocumentSnapshot, OwnedDocumentLine};
+use git_ultrapager::document::{
+    DocumentLineMetadataReader, DocumentLineReader, DocumentSnapshot, OwnedDocumentLine,
+};
 use git_ultrapager::input::AppendStore;
-use git_ultrapager::model::{ChangeStatus, CommitKind, FileMode, HunkKind, LineKind};
+use git_ultrapager::model::{
+    ChangeStatus, Commit, CommitKind, FileEntry, FileId, FileMode, Hunk, HunkId, HunkKind, LineKind,
+};
 use git_ultrapager::parser::{
     GitParser, ParseDelta, ParseError, decode_git_path, parse_bytes as parse_bytes_result,
 };
 use git_ultrapager::storage::StructuralStorage;
+use git_ultrapager::structure_store::{StructureFileLineBounds, StructureReader};
 use pretty_assertions::assert_eq;
 
-fn parse_bytes(input: &[u8]) -> DocumentSnapshot {
-    parse_bytes_result(input).unwrap()
+struct TestDocument {
+    snapshot: DocumentSnapshot,
+    commits: Vec<Commit>,
+    files: Vec<FileEntry>,
+    hunks: Vec<Hunk>,
+    file_line_bounds: Vec<StructureFileLineBounds>,
+}
+
+impl TestDocument {
+    fn commits(&self) -> &[Commit] {
+        &self.commits
+    }
+
+    fn files(&self) -> &[FileEntry] {
+        &self.files
+    }
+
+    fn hunks(&self) -> &[Hunk] {
+        &self.hunks
+    }
+
+    fn hunk(&self, id: HunkId) -> Option<&Hunk> {
+        self.hunks
+            .get(usize::try_from(id.get()).ok()?)
+            .filter(|hunk| hunk.id == id)
+    }
+
+    fn file_line_bounds(&self, id: FileId) -> Option<StructureFileLineBounds> {
+        self.file_line_bounds
+            .get(usize::try_from(id.get()).ok()?)
+            .copied()
+    }
+}
+
+impl Deref for TestDocument {
+    type Target = DocumentSnapshot;
+
+    fn deref(&self) -> &Self::Target {
+        &self.snapshot
+    }
+}
+
+fn materialize(snapshot: DocumentSnapshot) -> TestDocument {
+    let structure = snapshot.structure();
+    let counts = structure.visible_counts().unwrap();
+    let mut reader = StructureReader::new();
+    let commits = (0..counts.commits)
+        .map(|ordinal| {
+            let id = structure.commit_id_at(ordinal).unwrap();
+            let commit = reader.read_commit(structure, id).unwrap().unwrap();
+            Commit {
+                id: commit.id,
+                kind: commit.kind,
+                object_id: commit.object_id.map(str::to_owned),
+                subject: commit.subject.map(str::to_owned),
+                span: commit.span,
+                file_ids: commit.files.iter().collect(),
+            }
+        })
+        .collect();
+    let mut file_line_bounds = Vec::new();
+    let files = (0..counts.files)
+        .map(|ordinal| {
+            let id = structure.file_id_at(ordinal).unwrap();
+            let file = reader.read_file(structure, id).unwrap().unwrap();
+            file_line_bounds.push(if file.mode.is_rich() {
+                file.line_bounds
+            } else {
+                StructureFileLineBounds::default()
+            });
+            FileEntry {
+                id: file.id,
+                commit_id: file.commit_id,
+                old_path: file.old_path.map(str::to_owned),
+                new_path: file.new_path.map(str::to_owned),
+                status: file.status,
+                mode: file.mode,
+                span: file.span,
+                hunk_ids: file.hunks.iter().collect(),
+                additions: file.additions,
+                deletions: file.deletions,
+            }
+        })
+        .collect();
+    let hunks = (0..counts.hunks)
+        .map(|ordinal| {
+            let id = structure.hunk_id_at(ordinal).unwrap();
+            let hunk = reader.read_hunk(structure, id).unwrap().unwrap();
+            Hunk {
+                id: hunk.id,
+                file_id: hunk.file_id,
+                kind: hunk.kind,
+                header_line: hunk.header_line,
+                span: hunk.span,
+                old_range: hunk.old_range,
+                new_range: hunk.new_range,
+            }
+        })
+        .collect();
+    TestDocument {
+        snapshot,
+        commits,
+        files,
+        hunks,
+        file_line_bounds,
+    }
+}
+
+fn parse_bytes(input: &[u8]) -> TestDocument {
+    materialize(parse_bytes_result(input).unwrap())
 }
 
 fn decoded_lines(document: &DocumentSnapshot) -> Vec<OwnedDocumentLine> {
@@ -258,7 +372,7 @@ fn parser_keeps_partial_lines_and_escape_sequences_between_pushes() {
     }
     let _ = raw.seal().unwrap();
     let _ = parser.finish().unwrap();
-    let document = parser.snapshot().unwrap();
+    let document = materialize(parser.snapshot().unwrap());
     let lines = decoded_lines(&document);
 
     assert_eq!(document.files()[0].deletions, Some(1));
@@ -382,14 +496,14 @@ fn incomplete_hunk_body_loses_source_semantics_after_malformed_downgrade() {
         b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n",
     )
     .unwrap();
-    let active = parser.snapshot().unwrap();
+    let active = materialize(parser.snapshot().unwrap());
     assert_eq!(active.files()[0].mode, FileMode::Rich);
     assert!(decoded_lines(&active).iter().any(|line| {
         line.text == "-old" && line.kind == LineKind::Deletion && line.old_line_number == Some(1)
     }));
 
     let _ = raw.seal().unwrap();
-    let document = parser.into_document().unwrap();
+    let document = materialize(parser.into_document().unwrap());
     let file = &document.files()[0];
     let body = decoded_lines(&document)
         .into_iter()
@@ -407,10 +521,16 @@ fn incomplete_hunk_body_loses_source_semantics_after_malformed_downgrade() {
     assert_eq!(bounds.max_old_line_number, None);
     assert_eq!(bounds.max_new_line_number, None);
 
-    let layout = layout_document(&document, 80, 4).unwrap();
+    let mut metadata_reader = DocumentLineMetadataReader::new();
     for line in &body {
-        let row = layout.row_for_line(line.id).unwrap();
-        assert_eq!(layout.rows()[row].text, line.text);
+        let metadata = metadata_reader.read(&document, line.id).unwrap().unwrap();
+        assert_eq!(metadata.kind, LineKind::Fallback);
+        assert_eq!(metadata.old_line_number, None);
+        assert_eq!(metadata.new_line_number, None);
+        assert_eq!(
+            metadata.file_line_bounds,
+            Some(StructureFileLineBounds::default())
+        );
     }
 
     // Final snapshotのCOW downgradeは、workerが既に保持するactive snapshotを書き換えない。
@@ -446,12 +566,18 @@ fn source_header_without_hunk_downgrades_only_that_file() {
 fn parse_delta_identifies_existing_tail_records_that_need_invalidation() {
     let (raw, mut parser) = streaming_parser();
     let first = push_stored(&raw, &mut parser, b"diff --git a/x b/x\n@@ -1 +1 @@\n").unwrap();
+    assert_eq!(first.commits, 0_u64..1);
+    assert_eq!(first.files, 0_u64..1);
+    assert_eq!(first.hunks, 0_u64..1);
     assert_eq!(first.updated_commit, None);
     assert_eq!(first.updated_file, None);
     assert_eq!(first.updated_hunk, None);
 
     let second = push_stored(&raw, &mut parser, b"-old\n+new\n").unwrap();
-    let document = parser.snapshot().unwrap();
+    assert_eq!(second.commits, 1_u64..1);
+    assert_eq!(second.files, 1_u64..1);
+    assert_eq!(second.hunks, 1_u64..1);
+    let document = materialize(parser.snapshot().unwrap());
     assert_eq!(second.updated_commit, Some(document.commits()[0].id));
     assert_eq!(second.updated_file, Some(document.files()[0].id));
     assert_eq!(second.updated_hunk, Some(document.hunks()[0].id));

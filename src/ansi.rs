@@ -555,6 +555,33 @@ pub fn escape_path_bytes(input: &[u8]) -> String {
     escape_bytes(input, false)
 }
 
+/// Path用escapeの結果、または指定byte数を越えたため出力を確保しなかった結果。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LimitedPathEscape {
+    Escaped(String),
+    LimitExceeded { escaped_len: usize },
+}
+
+/// Pathをescapeした正確なUTF-8 byte数が`limit`以下の場合だけ出力を確保する。
+///
+/// `LimitExceeded`では長さ検査だけを行い、escaped text用のbufferを作らない。入力欄の上限を
+/// 検査するcallerは、既存textへ挿入する前にこの関数を呼ぶことで拒否時の内容を維持できる。
+pub(crate) fn escape_path_bytes_with_limit(
+    input: &[u8],
+    limit: usize,
+) -> Result<LimitedPathEscape, EscapeError> {
+    let escaped_len = escaped_bytes_len(input, false)?;
+    if escaped_len > limit {
+        return Ok(LimitedPathEscape::LimitExceeded { escaped_len });
+    }
+
+    let mut output = String::new();
+    reserve_escape_capacity(&mut output, escaped_len)?;
+    push_escaped_bytes(input, false, &mut output);
+    debug_assert_eq!(output.len(), escaped_len);
+    Ok(LimitedPathEscape::Escaped(output))
+}
+
 fn escape_bytes(input: &[u8], preserve_layout_controls: bool) -> String {
     let mut output = String::new();
     match escape_bytes_into(input, preserve_layout_controls, &mut output) {
@@ -853,6 +880,18 @@ mod tests {
         assert_eq!(escaped_len, output.len());
         assert_eq!(escaped_len, 22);
         assert!(escaped_len < input.len() * 4);
+    }
+
+    #[test]
+    fn limited_path_escape_checks_expanded_length_before_output() {
+        assert_eq!(
+            escape_path_bytes_with_limit(b"\0", 3).unwrap(),
+            LimitedPathEscape::LimitExceeded { escaped_len: 4 }
+        );
+        assert_eq!(
+            escape_path_bytes_with_limit(b"\0", 4).unwrap(),
+            LimitedPathEscape::Escaped("\\x00".to_owned())
+        );
     }
 
     #[test]

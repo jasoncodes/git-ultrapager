@@ -3,8 +3,8 @@
 //! [`ViewportLayout`]はdocument全体のrow indexを作らない。Top位置はstableな[`LineId`]、logical byte
 //! offset、同じbyteを描くfragmentのordinalからなる[`VisualAnchor`]で保持し、移動またはframe収集で
 //! 触れたlogical lineだけを[`DocumentLineReader`]でdecodeする。折り返しは
-//! [`crate::direct::layout_line`]へ集約し、source lineのgutterはsnapshotが持つfile単位の最大行番号から
-//! O(1)で決める。
+//! [`crate::direct::layout_line`]へ集約し、source lineのgutterはlineのfixed metadataに正規化済みの
+//! file単位最大行番号を使う。Hot pathはpath等のblobを読まない。
 //!
 //! 折り返し結果はbyte weight付きLRUへ置く。Engineは[`DocumentSnapshot::identity`]が変わるとcacheを
 //! 空にし、keyにはeffective kind、sticky metadata、行番号、gutter、terminal幅、tab幅を含める。同じ
@@ -22,7 +22,9 @@ use thiserror::Error;
 use crate::cache::{CacheHandle, CacheUsage, WeightedLruCache};
 use crate::direct::{
     DocumentLayoutError, GutterSpec, LargeLineNavigator, LargeRowAnchor, LayoutError, LineLayout,
-    MAX_STREAMING_VISUAL_ROW_BYTES, VisualRow, layout_line, line_requires_streaming_layout,
+    MAX_STREAMING_VISUAL_ROW_BYTES, MAX_STREAMING_WINDOW_ROWS, VisualRow,
+    eager_layout_allocation_upper_bound, eager_layout_decoded_allocation_upper_bound, layout_line,
+    line_requires_streaming_layout,
 };
 use crate::document::{
     DocumentError, DocumentIdentity, DocumentLineMetadata, DocumentLineMetadataReader,
@@ -39,10 +41,32 @@ pub const DEFAULT_VIEWPORT_STREAM_BYTES: usize = 8 * 1024 * 1024;
 const VIEWPORT_STREAM_FRAME_BYTES: usize = DEFAULT_VIEWPORT_STREAM_BYTES / 2;
 /// Line decode buffer、frame metadata、row/index bookkeepingへ残す上限。
 pub const DEFAULT_VIEWPORT_TRANSIENT_BYTES: usize = 4 * 1024 * 1024;
+/// Eager [`DocumentLineReader`]のraw、ANSI除去後、escaped text bufferへ予約する上限。
+const VIEWPORT_EAGER_READER_BYTES: usize = 3 * 1024 * 1024;
+/// Current/prepared frameが同時に生存するtransaction全体のrow handle上限。
+const VIEWPORT_ROW_HANDLE_BYTES: usize =
+    DEFAULT_VIEWPORT_TRANSIENT_BYTES - VIEWPORT_EAGER_READER_BYTES;
+/// 2 frameのどちらか片方がtransient shareを使い切らないよう、1 frameを半分に制限する。
+const VIEWPORT_ROW_HANDLE_FRAME_BYTES: usize = VIEWPORT_ROW_HANDLE_BYTES / 2;
+/// Cacheとprepared eager candidateが共有する24 MiB partitionの非transient部分。
+const VIEWPORT_EAGER_OWNED_BYTES: usize =
+    DEFAULT_VIEWPORT_CACHE_BYTES + DEFAULT_VIEWPORT_STREAM_BYTES;
+const MAX_VIEWPORT_ROW_HANDLES_PER_FRAME: usize = {
+    let by_bytes = VIEWPORT_ROW_HANDLE_FRAME_BYTES / mem::size_of::<ViewportRow>();
+    if by_bytes < MAX_STREAMING_WINDOW_ROWS {
+        by_bytes
+    } else {
+        MAX_STREAMING_WINDOW_ROWS
+    }
+};
 
 const _: () = assert!(
     DEFAULT_VIEWPORT_CACHE_BYTES + DEFAULT_VIEWPORT_STREAM_BYTES + DEFAULT_VIEWPORT_TRANSIENT_BYTES
         == crate::derived_memory::VIEWPORT_MEMORY_BYTES
+);
+const _: () = assert!(
+    VIEWPORT_EAGER_READER_BYTES + 2 * VIEWPORT_ROW_HANDLE_FRAME_BYTES
+        == DEFAULT_VIEWPORT_TRANSIENT_BYTES
 );
 
 /// Reflow後も位置を復元できるtop-row anchor。
@@ -226,13 +250,26 @@ impl ViewportRows {
     pub const fn byte_limited(&self) -> bool {
         self.byte_limited
     }
+
+    /// Row textを共有するhandle vectorが確保したbyte数を返す。
+    ///
+    /// [`ViewportLayout::collect`]が作るframeでは、state transaction中のold/new合計が
+    /// [`VIEWPORT_ROW_HANDLE_BYTES`]以下になる。
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn row_handle_bytes(&self) -> usize {
+        self.rows
+            .capacity()
+            .saturating_mul(mem::size_of::<ViewportRow>())
+    }
 }
 
 /// Lazy decodeとwrap cacheのdeterministic counter。
 ///
-/// `metadata_reads`はcache lookupのfixed-record read数、`decoded_lines`と`layout_misses`はcache missで
-/// text decodeと[`layout_line`]を実行したline数を数える。CounterはI/O量の受入testに使い、cache
-/// clearやdocument lineage変更では戻さない。
+/// `metadata_reads`はcache lookupのfixed-record read数、`decoded_lines`はcontent-aware allocation
+/// preflightのためtextを読んだline数、`layout_misses`はその後[`layout_line`]まで実行したline数を
+/// 数える。Frame残量またはcache admissionで止めたlineでは前者だけが増える。CounterはI/O量の
+/// 受入testに使い、cache clearやdocument lineage変更では戻さない。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ViewportLayoutStats {
     pub metadata_reads: u64,
@@ -597,20 +634,21 @@ impl ViewportLayout {
         let normalized = self.normalize_on_line(document, initial, config)?;
         let mut current = normalized;
         let mut line_index = ensure_line(document, normalized.line_id)?;
+        let collection_limit = row_limit.min(MAX_VIEWPORT_ROW_HANDLES_PER_FRAME);
         let mut output = Vec::new();
-        output
-            .try_reserve(row_limit)
-            .map_err(|_| LayoutError::StreamingRowAllocation {
-                requested: row_limit.saturating_mul(mem::size_of::<ViewportRow>()),
-            })?;
+        output.try_reserve_exact(collection_limit).map_err(|_| {
+            LayoutError::StreamingRowAllocation {
+                requested: collection_limit.saturating_mul(mem::size_of::<ViewportRow>()),
+            }
+        })?;
         let mut at_end = false;
         let mut streaming_bytes = 0_usize;
         let mut eager_bytes = 0_usize;
         let mut byte_limited = false;
 
-        while output.len() < row_limit {
+        while output.len() < collection_limit {
             let descriptor = self.describe_line(document, current.line_id, config)?;
-            let available = row_limit - output.len();
+            let available = collection_limit - output.len();
             if descriptor.streaming {
                 // Eager cache pinとstreamed Arc windowを同じframeへ混ぜるとcurrent/preparedの同居量を
                 // 1つの台帳で追えない。Streamed lineへ達した時点でeager frameを確定し、次frameの
@@ -635,16 +673,15 @@ impl ViewportLayout {
                 }
                 break;
             } else {
-                let layout = self.load_eager_layout(document, descriptor)?;
-                if eager_bytes
-                    .saturating_add(streaming_bytes)
-                    .saturating_add(layout.weight_bytes())
-                    > DEFAULT_VIEWPORT_STREAM_BYTES
-                {
-                    self.discard_unused_prepared_layout(&layout);
+                let remaining = DEFAULT_VIEWPORT_STREAM_BYTES
+                    .saturating_sub(eager_bytes)
+                    .saturating_sub(streaming_bytes);
+                let Some(layout) =
+                    self.load_eager_layout_for_frame(document, descriptor, remaining)?
+                else {
                     byte_limited = true;
                     break;
-                }
+                };
                 eager_bytes = eager_bytes.saturating_add(layout.weight_bytes());
                 let rows = ensure_non_empty(current.line_id, layout.rows())?;
                 let (_, row_index) = normalize_anchor_for_rows(rows, current);
@@ -659,7 +696,7 @@ impl ViewportLayout {
                 at_end = true;
                 break;
             }
-            if output.len() == row_limit {
+            if output.len() == collection_limit {
                 break;
             }
             let next_index = line_index + 1;
@@ -673,8 +710,20 @@ impl ViewportLayout {
                 break;
             }
             line_index = next_index;
-            current = self.first_on_line(document, next_line_id, config)?;
+            // 次line先頭はbyte 0 / fragment 0で一意に表せる。ここでlayoutを先読みすると、
+            // 次loopがframe残量を照合する前にold-frame pinとcandidateを同居させてしまう。
+            current = VisualAnchor::new(next_line_id, 0);
         }
+
+        if collection_limit < row_limit && output.len() == collection_limit && !at_end {
+            byte_limited = true;
+        }
+        debug_assert!(
+            output
+                .capacity()
+                .saturating_mul(mem::size_of::<ViewportRow>())
+                <= VIEWPORT_ROW_HANDLE_FRAME_BYTES
+        );
 
         Ok(ViewportRows {
             top: Some(normalized),
@@ -795,12 +844,20 @@ impl ViewportLayout {
             .metadata_reader
             .read(document, line_id)?
             .ok_or(ViewportLayoutError::MissingLine { line_id })?;
-        let gutter = gutter_for(document, metadata.file_id);
-        let streaming = document_line_requires_streaming(document, metadata, config)?;
+        let gutter = gutter_for(metadata);
+        let streaming = document_line_requires_streaming(metadata, config)?;
+        let key = LineLayoutKey::from_metadata(metadata, gutter, config);
+        let candidate_weight_upper_bound = if streaming {
+            None
+        } else {
+            eager_layout_allocation_upper_bound(metadata, config.width, config.tab_width, gutter)?
+                .map(|bytes| bytes.saturating_add(mem::size_of::<LineLayoutKey>()))
+        };
         Ok(LineDescriptor {
-            key: LineLayoutKey::from_metadata(metadata, gutter, config),
+            key,
             gutter,
             streaming,
+            candidate_weight_upper_bound,
         })
     }
 
@@ -809,25 +866,93 @@ impl ViewportLayout {
         document: &DocumentSnapshot,
         descriptor: LineDescriptor,
     ) -> Result<LoadedLineLayout, ViewportLayoutError> {
+        let line_id = descriptor.key.line_id;
+        self.load_eager_layout_with_frame_limit(document, descriptor, None)?
+            .ok_or(ViewportLayoutError::MissingVisualRows { line_id })
+    }
+
+    fn load_eager_layout_for_frame(
+        &mut self,
+        document: &DocumentSnapshot,
+        descriptor: LineDescriptor,
+        remaining_frame_bytes: usize,
+    ) -> Result<Option<LoadedLineLayout>, ViewportLayoutError> {
+        self.load_eager_layout_with_frame_limit(document, descriptor, Some(remaining_frame_bytes))
+    }
+
+    fn load_eager_layout_with_frame_limit(
+        &mut self,
+        document: &DocumentSnapshot,
+        descriptor: LineDescriptor,
+        remaining_frame_bytes: Option<usize>,
+    ) -> Result<Option<LoadedLineLayout>, ViewportLayoutError> {
+        // Streaming lineからeager lineへ移った時点でchunk decoderをdropし、この後に確保する
+        // 3 MiB eager readerとのbuffer共存を防ぐ。Statsはretire時に累積へ移す。
+        self.retire_large_navigator();
         if let Some(layout) = self.cache.get(&descriptor.key) {
             self.stats.cache_hits = self.stats.cache_hits.saturating_add(1);
-            return Ok(LoadedLineLayout::Cached(layout));
+            if remaining_frame_bytes.is_some_and(|remaining| layout.weight_bytes() > remaining) {
+                return Ok(None);
+            }
+            return Ok(Some(LoadedLineLayout::Cached(layout)));
         }
         if let Some(prepared) = self.prepared_layouts.get(&descriptor.key) {
-            return Ok(LoadedLineLayout::Prepared {
+            if remaining_frame_bytes.is_some_and(|remaining| prepared.weight > remaining) {
+                return Ok(None);
+            }
+            return Ok(Some(LoadedLineLayout::Prepared {
                 key: descriptor.key,
                 layout: Arc::clone(&prepared.layout),
                 weight: prepared.weight,
-            });
+            }));
         }
 
-        self.stats.layout_misses = self.stats.layout_misses.saturating_add(1);
+        let metadata_weight_upper_bound = descriptor.candidate_weight_upper_bound.ok_or(
+            ViewportLayoutError::MissingVisualRows {
+                line_id: descriptor.key.line_id,
+            },
+        )?;
         self.stats.decoded_lines = self.stats.decoded_lines.saturating_add(1);
         let line_id = descriptor.key.line_id;
         let line = self
             .reader
             .read(document, line_id)?
             .ok_or(ViewportLayoutError::MissingLine { line_id })?;
+        let candidate_weight_upper_bound = eager_layout_decoded_allocation_upper_bound(
+            &line,
+            descriptor.key.width,
+            descriptor.key.tab_width,
+            descriptor.gutter,
+        )?
+        .saturating_add(mem::size_of::<LineLayoutKey>());
+        if candidate_weight_upper_bound > metadata_weight_upper_bound {
+            return Err(ViewportLayoutError::CacheBudgetExhausted {
+                requested: candidate_weight_upper_bound,
+                live: self
+                    .cache
+                    .live_bytes()
+                    .saturating_add(self.prepared_owned_bytes),
+                limit: metadata_weight_upper_bound,
+            });
+        }
+        let admission = admit_eager_candidate_parts(
+            &mut self.cache,
+            self.preparing,
+            self.prepared_owned_bytes,
+            candidate_weight_upper_bound,
+        );
+        if let Err(error) = admission {
+            if remaining_frame_bytes
+                .is_some_and(|remaining| candidate_weight_upper_bound > remaining)
+            {
+                // Candidate上限は実weightより大きい。Frame残量を越える候補だけは、old-frame pinと
+                // 同居できない時点で現在の有効frameを返す。残量内の候補ならtransaction台帳の
+                // 破損を隠さないようtyped errorを保つ。
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        self.stats.layout_misses = self.stats.layout_misses.saturating_add(1);
         let layout = layout_line(
             &line,
             descriptor.key.width,
@@ -835,12 +960,26 @@ impl ViewportLayout {
             descriptor.gutter,
         )?;
         let weight = estimate_cache_weight(&layout);
+        if weight > candidate_weight_upper_bound {
+            return Err(ViewportLayoutError::CacheBudgetExhausted {
+                requested: weight,
+                live: self
+                    .cache
+                    .live_bytes()
+                    .saturating_add(self.prepared_owned_bytes),
+                limit: candidate_weight_upper_bound,
+            });
+        }
+        if remaining_frame_bytes.is_some_and(|remaining| weight > remaining) {
+            return Ok(None);
+        }
         let lookup = descriptor.key.clone();
         match self.cache.insert(descriptor.key, layout, weight) {
             Ok(_) => self
                 .cache
                 .get(&lookup)
                 .map(LoadedLineLayout::Cached)
+                .map(Some)
                 .ok_or(ViewportLayoutError::CacheEntryUnavailable),
             Err(error) => {
                 self.stats.cache_insert_rejections =
@@ -867,13 +1006,23 @@ impl ViewportLayout {
                     },
                 );
                 self.prepared_owned_bytes = next_prepared;
-                Ok(LoadedLineLayout::Prepared {
+                Ok(Some(LoadedLineLayout::Prepared {
                     key,
                     layout,
                     weight,
-                })
+                }))
             }
         }
+    }
+
+    #[cfg(test)]
+    fn admit_eager_candidate(&mut self, candidate: usize) -> Result<(), ViewportLayoutError> {
+        admit_eager_candidate_parts(
+            &mut self.cache,
+            self.preparing,
+            self.prepared_owned_bytes,
+            candidate,
+        )
     }
 
     fn ensure_large_navigator(
@@ -891,6 +1040,13 @@ impl ViewportLayout {
             // Streamed frameは8 MiB visible shareを所有する。Resident eager entriesを同時に残さず、
             // 既存frameがpinする値だけをstate commitまでlive accountingへ残す。
             self.cache.clear();
+            // Navigation中に通過したeager lineのprepared layoutはfinal streaming frameから参照されない。
+            // Dropしてstreaming windowの8 MiB shareと二重に保持しない。
+            self.prepared_layouts.clear();
+            self.prepared_owned_bytes = 0;
+            // Eager decoderはraw/stripped/textの3 MiB high-waterを再利用のため保持する。
+            // Streaming decoderと同時に残すとtransient shareを二重に使うため、空bufferへ戻す。
+            self.reader = DocumentLineReader::new();
             let navigator = LargeLineNavigator::new(
                 document,
                 descriptor.key.line_id,
@@ -913,15 +1069,6 @@ impl ViewportLayout {
             .navigator;
         let _ = navigator.normalize(large_anchor(anchor))?;
         Ok(navigator)
-    }
-
-    fn discard_unused_prepared_layout(&mut self, layout: &LoadedLineLayout) {
-        let LoadedLineLayout::Prepared { key, weight, .. } = layout else {
-            return;
-        };
-        if self.prepared_layouts.remove(key).is_some() {
-            self.prepared_owned_bytes = self.prepared_owned_bytes.saturating_sub(*weight);
-        }
     }
 
     fn synchronize_identity(&mut self, document: &DocumentSnapshot) {
@@ -950,11 +1097,64 @@ impl ViewportLayout {
     }
 }
 
+/// Decode済みcandidateのlayout allocation前に、cacheまたはprepared領域の格納先を確保する。
+///
+/// Reader bufferは独立した3 MiB transient share内にあり、この関数は12 MiB cache、8 MiB
+/// prepared share、candidateの合計だけを扱う。Reclaimable cache entryを外した後もold frameが
+/// pinするentryは`live_bytes`へ残るため、成功時のcandidate allocationを含む合計は20 MiB以下になる。
+fn admit_eager_candidate_parts(
+    cache: &mut WeightedLruCache<LineLayoutKey, LineLayout>,
+    preparing: bool,
+    prepared_owned_bytes: usize,
+    candidate: usize,
+) -> Result<(), ViewportLayoutError> {
+    let mut cache_live = cache.live_bytes();
+    let global_fits = cache_live
+        .saturating_add(prepared_owned_bytes)
+        .saturating_add(candidate)
+        <= VIEWPORT_EAGER_OWNED_BYTES;
+    let cache_fits = cache_live.saturating_add(candidate) <= cache.limit_bytes();
+    let prepared_fits = preparing
+        && prepared_owned_bytes.saturating_add(candidate) <= DEFAULT_VIEWPORT_STREAM_BYTES;
+
+    if !global_fits || (!cache_fits && !prepared_fits) {
+        // Residentのpinされていないentryだけをdropし、old frameが所有するentryは
+        // live accountingへ残す。この後の値がcandidate生成中の最小cache footprintになる。
+        cache.clear();
+        cache_live = cache.live_bytes();
+    }
+
+    let global_fits = cache_live
+        .saturating_add(prepared_owned_bytes)
+        .saturating_add(candidate)
+        <= VIEWPORT_EAGER_OWNED_BYTES;
+    let cache_fits = cache_live.saturating_add(candidate) <= cache.limit_bytes();
+    let prepared_fits = preparing
+        && prepared_owned_bytes.saturating_add(candidate) <= DEFAULT_VIEWPORT_STREAM_BYTES;
+    if global_fits && (cache_fits || prepared_fits) {
+        return Ok(());
+    }
+
+    let limit = if !global_fits {
+        VIEWPORT_EAGER_OWNED_BYTES
+    } else if preparing {
+        cache.limit_bytes().max(DEFAULT_VIEWPORT_STREAM_BYTES)
+    } else {
+        cache.limit_bytes()
+    };
+    Err(ViewportLayoutError::CacheBudgetExhausted {
+        requested: candidate,
+        live: cache_live.saturating_add(prepared_owned_bytes),
+        limit,
+    })
+}
+
 #[derive(Clone, Debug)]
 struct LineDescriptor {
     key: LineLayoutKey,
     gutter: GutterSpec,
     streaming: bool,
+    candidate_weight_upper_bound: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1167,9 +1367,9 @@ fn anchor_for_row_at(line_id: LineId, rows: &[VisualRow], row_index: usize) -> V
     VisualAnchor::new(line_id, byte_offset).with_fragment_ordinal(fragment_ordinal)
 }
 
-fn gutter_for(document: &DocumentSnapshot, file_id: Option<FileId>) -> GutterSpec {
-    file_id
-        .and_then(|file_id| document.file_line_bounds(file_id))
+fn gutter_for(metadata: DocumentLineMetadata) -> GutterSpec {
+    metadata
+        .file_line_bounds
         .map_or_else(GutterSpec::default, |bounds| {
             GutterSpec::new(
                 bounds.max_old_line_number.map_or(0, decimal_width),
@@ -1182,7 +1382,6 @@ fn gutter_for(document: &DocumentSnapshot, file_id: Option<FileId>) -> GutterSpe
 ///
 /// UI frame preloadも同じ判定を使い、streamed lineを`OwnedDocumentLine`へ戻さない。
 pub(crate) fn document_line_requires_streaming(
-    document: &DocumentSnapshot,
     metadata: DocumentLineMetadata,
     config: ViewportLayoutConfig,
 ) -> Result<bool, LayoutError> {
@@ -1190,7 +1389,7 @@ pub(crate) fn document_line_requires_streaming(
         metadata,
         config.width,
         config.tab_width,
-        gutter_for(document, metadata.file_id),
+        gutter_for(metadata),
     )
 }
 
@@ -1218,28 +1417,7 @@ fn line_kind_tag(kind: LineKind) -> u8 {
 }
 
 fn estimate_cache_weight(layout: &LineLayout) -> usize {
-    let rows = layout.rows();
-    let row_capacity_estimate = rows.len().checked_next_power_of_two().unwrap_or(usize::MAX);
-    let row_storage = row_capacity_estimate.saturating_mul(mem::size_of::<VisualRow>());
-    let payload = rows.iter().fold(0_usize, |total, row| {
-        // SpanMappingはprivateなので、各rendered byteが別mappingになる上限を4 usize/entryで課金する。
-        // Vecのgrow余白として2倍し、empty rowの0-length mapping用にbyte数へ1を足す。Stringは
-        // public capacityから実allocationを数える。
-        let mapping_bound = row
-            .text
-            .len()
-            .saturating_add(1)
-            .saturating_mul(mem::size_of::<[usize; 4]>())
-            .saturating_mul(2);
-        total
-            .saturating_add(row.text.capacity())
-            .saturating_add(mapping_bound)
-    });
-    mem::size_of::<LineLayoutKey>()
-        .saturating_add(mem::size_of::<LineLayout>())
-        .saturating_add(mem::size_of::<Vec<VisualRow>>())
-        .saturating_add(row_storage)
-        .saturating_add(payload)
+    mem::size_of::<LineLayoutKey>().saturating_add(layout.retained_bytes())
 }
 
 #[cfg(test)]
@@ -1465,6 +1643,163 @@ mod tests {
     }
 
     #[test]
+    fn u16_max_row_request_keeps_one_frame_handle_capacity_bounded() {
+        let mut input = String::new();
+        for index in 0..6_000 {
+            input.push_str(&format!("row-{index:04}\n"));
+        }
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let mut viewport = ViewportLayout::new();
+
+        let frame = viewport
+            .collect(&document, None, usize::from(u16::MAX), WIDE)
+            .unwrap();
+
+        assert_eq!(frame.rows.len(), super::MAX_VIEWPORT_ROW_HANDLES_PER_FRAME);
+        assert!(frame.row_handle_bytes() <= super::VIEWPORT_ROW_HANDLE_FRAME_BYTES);
+        assert!(frame.byte_limited());
+    }
+
+    #[test]
+    fn old_and_prepared_frames_share_one_mibibyte_of_row_handles() {
+        let mut input = String::new();
+        for index in 0..10_100 {
+            input.push_str(&format!("row-{index:05}\n"));
+        }
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let mut viewport = ViewportLayout::new();
+        let old = viewport
+            .collect(&document, None, usize::from(u16::MAX), WIDE)
+            .unwrap();
+        let next = VisualAnchor::new(
+            document
+                .line_id_at(super::MAX_VIEWPORT_ROW_HANDLES_PER_FRAME)
+                .unwrap(),
+            0,
+        );
+
+        viewport.begin_preparation();
+        let prepared = viewport
+            .collect(&document, Some(next), usize::from(u16::MAX), WIDE)
+            .unwrap();
+
+        assert!(old.row_handle_bytes() <= super::VIEWPORT_ROW_HANDLE_FRAME_BYTES);
+        assert!(prepared.row_handle_bytes() <= super::VIEWPORT_ROW_HANDLE_FRAME_BYTES);
+        assert!(
+            old.row_handle_bytes()
+                .saturating_add(prepared.row_handle_bytes())
+                <= super::VIEWPORT_ROW_HANDLE_BYTES
+        );
+    }
+
+    #[test]
+    fn cache_prepared_candidate_and_reader_peak_stays_within_24_mibibytes() {
+        let document = parse_bytes(b"candidate\n").unwrap();
+        let mut viewport = ViewportLayout::new();
+        let descriptor = viewport
+            .describe_line(&document, document.line_id_at(0).unwrap(), WIDE)
+            .unwrap();
+        let mut reader = DocumentLineReader::new();
+        let line = reader
+            .read(&document, document.line_id_at(0).unwrap())
+            .unwrap()
+            .unwrap();
+        let layout = crate::direct::layout_line(&line, 80, 4, descriptor.gutter).unwrap();
+        let pinned_cache = 11 * 1024 * 1024;
+        viewport
+            .cache
+            .insert(descriptor.key.clone(), layout, pinned_cache)
+            .unwrap();
+        let pin = viewport.cache.get(&descriptor.key).unwrap();
+        viewport.cache.clear();
+        viewport.preparing = true;
+        viewport.prepared_owned_bytes = super::DEFAULT_VIEWPORT_STREAM_BYTES;
+        let candidate = 1024 * 1024;
+
+        viewport.admit_eager_candidate(candidate).unwrap();
+        let eager_peak = viewport
+            .cache
+            .live_bytes()
+            .saturating_add(viewport.prepared_owned_bytes)
+            .saturating_add(candidate);
+        assert_eq!(eager_peak, super::VIEWPORT_EAGER_OWNED_BYTES);
+        assert_eq!(
+            eager_peak.saturating_add(super::DEFAULT_VIEWPORT_TRANSIENT_BYTES),
+            crate::derived_memory::VIEWPORT_MEMORY_BYTES
+        );
+        assert!(matches!(
+            viewport.admit_eager_candidate(candidate + 1),
+            Err(ViewportLayoutError::CacheBudgetExhausted {
+                requested,
+                live,
+                limit: super::VIEWPORT_EAGER_OWNED_BYTES,
+            }) if requested == candidate + 1
+                && live == pinned_cache + super::DEFAULT_VIEWPORT_STREAM_BYTES
+        ));
+        drop(pin);
+    }
+
+    #[test]
+    fn metadata_candidate_upper_bound_covers_actual_cache_weight() {
+        let document = parse_bytes(
+            "plain\t界\n\
+             diff --git a/x.rs b/x.rs\n\
+             --- a/x.rs\n\
+             +++ b/x.rs\n\
+             @@ -123,1 +4567,1 @@\n\
+             -\told界\n\
+             +\tnew界\n"
+                .as_bytes(),
+        )
+        .unwrap();
+        let config = ViewportLayoutConfig::new(24, 4);
+        let mut metadata_reader = crate::document::DocumentLineMetadataReader::new();
+        let mut line_reader = DocumentLineReader::new();
+
+        for index in 0..document.line_count() {
+            let line_id = document.line_id_at(index).unwrap();
+            let metadata = metadata_reader.read(&document, line_id).unwrap().unwrap();
+            let gutter = super::gutter_for(metadata);
+            if crate::direct::line_requires_streaming_layout(
+                metadata,
+                config.width,
+                config.tab_width,
+                gutter,
+            )
+            .unwrap()
+            {
+                continue;
+            }
+            let admitted = crate::direct::eager_layout_allocation_upper_bound(
+                metadata,
+                config.width,
+                config.tab_width,
+                gutter,
+            )
+            .unwrap()
+            .unwrap()
+            .saturating_add(std::mem::size_of::<super::LineLayoutKey>());
+            let line = line_reader.read(&document, line_id).unwrap().unwrap();
+            let decoded = crate::direct::eager_layout_decoded_allocation_upper_bound(
+                &line,
+                config.width,
+                config.tab_width,
+                gutter,
+            )
+            .unwrap()
+            .saturating_add(std::mem::size_of::<super::LineLayoutKey>());
+            let layout =
+                crate::direct::layout_line(&line, config.width, config.tab_width, gutter).unwrap();
+            let actual = super::estimate_cache_weight(&layout);
+            assert!(decoded <= admitted, "line {line_id} decoded bound widened");
+            assert!(
+                actual <= decoded,
+                "line {line_id} retained {actual} bytes above decoded bound {decoded}"
+            );
+        }
+    }
+
+    #[test]
     fn collect_preserves_sticky_ids_and_reports_typed_failures() {
         let document =
             parse_bytes(b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n")
@@ -1511,13 +1846,17 @@ mod tests {
         assert!(viewport.stats().cache_hits >= 1);
 
         let mut uncached = ViewportLayout::with_cache_budget(1);
+        let decoded_before = uncached.stats().decoded_lines;
+        let misses_before = uncached.stats().layout_misses;
         let frame = uncached.collect(&document, None, 1, WIDE);
         assert!(matches!(
             frame,
             Err(ViewportLayoutError::CacheBudgetExhausted { limit: 1, .. })
         ));
         assert_eq!(uncached.cached_line_count(), 0);
-        assert_eq!(uncached.stats().cache_insert_rejections, 1);
+        assert_eq!(uncached.stats().cache_insert_rejections, 0);
+        assert_eq!(uncached.stats().decoded_lines, decoded_before + 1);
+        assert_eq!(uncached.stats().layout_misses, misses_before);
         assert_eq!(uncached.cache_usage().live_bytes, 0);
     }
 

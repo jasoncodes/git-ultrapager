@@ -24,15 +24,19 @@ use crate::derived_memory::DerivedMemoryLedger;
 use crate::direct::{
     DocumentLayoutError, LayoutError, count_rendered_rows_up_to, write_direct_decorated_range,
 };
-use crate::document::DocumentSnapshot;
+use crate::document::{DocumentError, DocumentSnapshot};
 use crate::model::HunkId;
 use crate::parser::GitParser;
-use crate::runtime::{ReaderEvent, ReaderRuntime, SearchJob, SearchWorker, SearchWorkerEvent};
+use crate::runtime::{
+    FileFilterJob, FileFilterWorker, FileFilterWorkerEvent, ReaderEvent, ReaderRuntime, SearchJob,
+    SearchWorker, SearchWorkerEvent,
+};
 use crate::state::{AppState, Effect, Event as StateEvent};
 use crate::storage::StructuralStorage;
+use crate::structure_store::{StructureMetadataReader, StructureStoreError};
 use crate::terminal::{SignalEvent, SignalWatcher, TerminalError, TerminalSession};
 use crate::theme::{Theme, detect_color_level};
-use crate::ui::FrameLines;
+use crate::ui::FrameLoader;
 
 const READ_CHUNK_BYTES: usize = 32 * 1024;
 const AUTO_PROBE_TIME: Duration = Duration::from_millis(100);
@@ -324,7 +328,11 @@ fn run_interactive(
         eof,
     )
     .context("failed to build initial viewport")?;
+    // 構造metadataのfallback走査位置と再利用bufferはframe間で保持する。毎frame作り直すと、
+    // open fileを含むstreaming入力で同じprefixを繰り返しdecodeしてしまう。
+    let mut frame_loader = FrameLoader::new();
     let search = SearchWorker::spawn().context("failed to spawn search worker")?;
+    let file_filter = FileFilterWorker::spawn().context("failed to spawn file-filter worker")?;
     let decorations_worker = DecorationWorker::spawn(Arc::clone(&derived_memory))
         .context("failed to spawn decoration worker")?;
     let mut decoration_generation = 0_u64;
@@ -364,9 +372,14 @@ fn run_interactive(
             document_dirty = false;
             last_document_publish = Instant::now();
             redraw = true;
-            if let Some(code) =
-                apply_effects(effects, &state, &mut guards.terminal, &search, &mut redraw)?
-            {
+            if let Some(code) = apply_effects(
+                effects,
+                &state,
+                &mut guards.terminal,
+                &search,
+                &file_filter,
+                &mut redraw,
+            )? {
                 guards.terminal.restore().map_err(anyhow::Error::new)?;
                 return Ok(ExitCode::from(code));
             }
@@ -408,9 +421,14 @@ fn run_interactive(
                 .update(event)
                 .context("failed to apply search result")?;
             redraw = true;
-            if let Some(code) =
-                apply_effects(effects, &state, &mut guards.terminal, &search, &mut redraw)?
-            {
+            if let Some(code) = apply_effects(
+                effects,
+                &state,
+                &mut guards.terminal,
+                &search,
+                &file_filter,
+                &mut redraw,
+            )? {
                 guards.terminal.restore().map_err(anyhow::Error::new)?;
                 return Ok(ExitCode::from(code));
             }
@@ -421,6 +439,43 @@ fn run_interactive(
                     &mut state,
                     &theme,
                 )?;
+            }
+        }
+
+        while let Ok(worker_event) = file_filter.responses.try_recv() {
+            let event = match worker_event {
+                FileFilterWorkerEvent::Completed(result) => StateEvent::FileFilterCompleted {
+                    generation: result.generation,
+                    document_generation: result.document_generation,
+                    total_matches: result.total_matches,
+                    selected_rank: result.selected_rank,
+                    start_rank: result.start_rank,
+                    file_ids: result.file_ids,
+                },
+                FileFilterWorkerEvent::Failed {
+                    generation,
+                    document_generation,
+                    message,
+                } => StateEvent::FileFilterFailed {
+                    generation,
+                    document_generation,
+                    message,
+                },
+            };
+            let effects = state
+                .update(event)
+                .context("failed to apply file-filter result")?;
+            redraw = true;
+            if let Some(code) = apply_effects(
+                effects,
+                &state,
+                &mut guards.terminal,
+                &search,
+                &file_filter,
+                &mut redraw,
+            )? {
+                guards.terminal.restore().map_err(anyhow::Error::new)?;
+                return Ok(ExitCode::from(code));
             }
         }
 
@@ -462,9 +517,14 @@ fn run_interactive(
                 .update(event)
                 .context("failed to apply terminal event")?;
             redraw = true;
-            if let Some(code) =
-                apply_effects(effects, &state, &mut guards.terminal, &search, &mut redraw)?
-            {
+            if let Some(code) = apply_effects(
+                effects,
+                &state,
+                &mut guards.terminal,
+                &search,
+                &file_filter,
+                &mut redraw,
+            )? {
                 guards.terminal.restore().map_err(anyhow::Error::new)?;
                 return Ok(ExitCode::from(code));
             }
@@ -479,15 +539,19 @@ fn run_interactive(
         }
 
         if redraw {
-            let frame_lines =
-                FrameLines::load(&state).context("failed to decode viewport lines")?;
+            let frame_lines = frame_loader
+                .load(&state)
+                .context("failed to decode viewport lines")?;
+            let follow_up_frame = frame_lines.needs_follow_up_frame();
             guards
                 .terminal
                 .draw(|frame| {
                     crate::ui::render(frame, &state, &theme, &decorations, &frame_lines);
                 })
                 .context("failed to draw pager")?;
-            redraw = false;
+            // Fallback検出は1 frameにつき4,096 fileまでに制限する。未走査分がある間だけevent
+            // loopをもう一周し、terminal inputとworker responseを処理する機会を残して走査を進める。
+            redraw = follow_up_frame;
         }
     }
 }
@@ -558,6 +622,7 @@ fn apply_effects(
     state: &AppState,
     terminal: &mut TerminalSession,
     search: &SearchWorker,
+    file_filter: &FileFilterWorker,
     redraw: &mut bool,
 ) -> Result<Option<u8>> {
     for effect in effects {
@@ -572,6 +637,7 @@ fn apply_effects(
                 *redraw = true;
             }
             Effect::Quit(code) => return Ok(Some(code)),
+            Effect::CancelSearch => search.cancel_latest(),
             Effect::Search(task) => {
                 if task.document_generation != state.document_generation() {
                     bail!(
@@ -585,6 +651,22 @@ fn apply_effects(
                     document: state.document_snapshot(),
                 }) {
                     bail!("search worker disconnected");
+                }
+            }
+            Effect::CancelFileFilter => file_filter.cancel_latest(),
+            Effect::FileFilter(task) => {
+                if task.document_generation != state.document_generation() {
+                    bail!(
+                        "file-filter task document generation {} does not match current generation {}",
+                        task.document_generation.get(),
+                        state.document_generation().get()
+                    );
+                }
+                if !file_filter.submit_latest(FileFilterJob {
+                    task,
+                    document: state.document_snapshot(),
+                }) {
+                    bail!("file-filter worker disconnected");
                 }
             }
         }
@@ -726,14 +808,15 @@ fn emit_direct_prefix<W: Write>(
     eof: bool,
     emitted_lines: &mut usize,
 ) -> Result<(), crate::direct::DirectWriteError> {
-    let safe = safe_direct_line_exclusive(document, eof);
+    let mut structure_reader = StructureMetadataReader::new();
+    let safe = safe_direct_line_exclusive(document, eof, &mut structure_reader)?;
     if safe <= *emitted_lines {
         return Ok(());
     }
 
     let mut cursor = *emitted_lines;
     while cursor < safe {
-        let segment = next_direct_segment(document, cursor, safe);
+        let segment = next_direct_segment(document, cursor, safe, &mut structure_reader)?;
         let decorations = settings.decoration_computer.compute_range(
             document,
             settings.theme,
@@ -764,21 +847,33 @@ fn next_direct_segment(
     document: &DocumentSnapshot,
     cursor: usize,
     safe_end: usize,
-) -> std::ops::Range<usize> {
-    let files = document.files();
-    let candidate = files.partition_point(|file| {
-        file.span
-            .end_exclusive
-            .and_then(|end| usize::try_from(end).ok())
-            .unwrap_or(document.line_count())
-            <= cursor
-    });
-    let Some(file) = files.get(candidate) else {
-        return cursor..safe_end;
+    reader: &mut StructureMetadataReader,
+) -> Result<std::ops::Range<usize>, crate::direct::DirectWriteError> {
+    let cursor_u64 = u64::try_from(cursor)
+        .map_err(|_| crate::direct::DirectWriteError::UnavailableLineIndex { index: cursor })?;
+    let safe_u64 = u64::try_from(safe_end)
+        .map_err(|_| crate::direct::DirectWriteError::UnavailableLineIndex { index: safe_end })?;
+    let files = reader
+        .files_intersecting(document.structure(), cursor_u64..safe_u64)
+        .map_err(DocumentError::from)?;
+    let Some(file_id) = files.first() else {
+        return Ok(cursor..safe_end);
     };
+    let file = reader
+        .read_file(document.structure(), file_id)
+        .map_err(DocumentError::from)?
+        .ok_or_else(|| {
+            crate::direct::DirectWriteError::Document(DocumentError::StructureStore(
+                StructureStoreError::OutsideSnapshot {
+                    kind: "file",
+                    id: file_id.get(),
+                    high_water: document.structure().file_count(),
+                },
+            ))
+        })?;
     let file_start = line_index(file.span.start.get(), document.line_count());
     if cursor < file_start {
-        return cursor..file_start.min(safe_end);
+        return Ok(cursor..file_start.min(safe_end));
     }
     let file_end = file
         .span
@@ -786,23 +881,54 @@ fn next_direct_segment(
         .map_or(document.line_count(), |end| {
             line_index(end, document.line_count())
         });
-    cursor
+    Ok(cursor
         ..file_end
             .min(safe_end)
-            .max(cursor.saturating_add(1).min(safe_end))
+            .max(cursor.saturating_add(1).min(safe_end)))
 }
 
-fn safe_direct_line_exclusive(document: &DocumentSnapshot, eof: bool) -> usize {
-    if eof || document.files().is_empty() {
-        return document.line_count();
+fn safe_direct_line_exclusive(
+    document: &DocumentSnapshot,
+    eof: bool,
+    reader: &mut StructureMetadataReader,
+) -> Result<usize, crate::direct::DirectWriteError> {
+    if eof {
+        return Ok(document.line_count());
     }
-    let last = &document.files()[document.files().len() - 1];
+    let counts = document
+        .structure()
+        .visible_counts()
+        .map_err(DocumentError::from)?;
+    let Some(last_ordinal) = counts.files.checked_sub(1) else {
+        return Ok(document.line_count());
+    };
+    let last_id = document.structure().file_id_at(last_ordinal).ok_or({
+        crate::direct::DirectWriteError::Document(DocumentError::StructureStore(
+            StructureStoreError::OutsideSnapshot {
+                kind: "file",
+                id: last_ordinal,
+                high_water: counts.files,
+            },
+        ))
+    })?;
+    let last = reader
+        .read_file(document.structure(), last_id)
+        .map_err(DocumentError::from)?
+        .ok_or_else(|| {
+            crate::direct::DirectWriteError::Document(DocumentError::StructureStore(
+                StructureStoreError::OutsideSnapshot {
+                    kind: "file",
+                    id: last_id.get(),
+                    high_water: counts.files,
+                },
+            ))
+        })?;
     if last.span.end_exclusive.is_some() {
         // 最後のfileが閉じていれば、その後に届いたcommit/plain metadataはgutterやhunk pairingで
         // 遡って変わらない。次file/EOFを待たず、現在のhigh-water markまで出力できる。
-        document.line_count()
+        Ok(document.line_count())
     } else {
-        line_index(last.span.start.get(), document.line_count())
+        Ok(line_index(last.span.start.get(), document.line_count()))
     }
 }
 

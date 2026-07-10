@@ -6,7 +6,10 @@
 //! `PtySession`のdropは未終了childをkillし、writer/masterのcloseで子孫processにもhangupを送るため、
 //! assertion failureやtimeoutが後続testとCI runnerを占有しない。
 
+use std::fs;
 use std::io::{Read, Write};
+use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -28,6 +31,7 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(3);
 const OUTPUT_QUIET: Duration = Duration::from_millis(100);
 
 const PIPE_SCRIPT: &str = r#"printf '%s' "$GUP_FIXTURE" | "$GUP_BIN" --paging always"#;
+const GIT_DIFF_SCRIPT: &str = r#"git -C "$GUP_REPO" --no-pager diff --no-ext-diff --no-textconv --no-color -- src/example.rs | "$GUP_BIN" --paging always"#;
 const SIGNAL_SCRIPT: &str = r#"printf '%s' "$GUP_FIXTURE" | "$GUP_BIN" --paging always & pager=$!; printf '\nGUP_PID=%s\n' "$pager"; wait "$pager""#;
 const STREAMING_SCRIPT: &str = r#"i=0; while [ "$i" -lt 30 ]; do printf 'stream-%s\n' "$i" || exit 0; i=$((i + 1)); sleep 0.1; done | "$GUP_BIN" --paging always"#;
 
@@ -48,6 +52,15 @@ struct PtySession {
 
 impl PtySession {
     fn spawn(script: &str, fixture: &str, size: PtySize) -> Result<Self> {
+        Self::spawn_with_repo(script, fixture, None, size)
+    }
+
+    fn spawn_with_repo(
+        script: &str,
+        fixture: &str,
+        repo: Option<&Path>,
+        size: PtySize,
+    ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pair = pty_system.openpty(size).context("failed to open PTY")?;
         let mut command = CommandBuilder::new("/bin/sh");
@@ -56,6 +69,9 @@ impl PtySession {
         command.env("GUP_FIXTURE", fixture);
         command.env("TERM", "xterm-256color");
         command.env("NO_COLOR", "1");
+        if let Some(repo) = repo {
+            command.env("GUP_REPO", repo);
+        }
 
         let child = pair
             .slave
@@ -401,6 +417,22 @@ fn pager_pid(output: &[u8]) -> Result<Pid> {
     Pid::from_raw(raw).context("pager PID is zero")
 }
 
+fn run_git(repo: &Path, arguments: &[&str]) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(arguments)
+        .output()
+        .context("failed to execute git while preparing the PTY fixture")?;
+    ensure!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        arguments,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
 #[test]
 fn q_leaves_alternate_screen_and_exits_zero() -> Result<()> {
     let mut session = PtySession::spawn(PIPE_SCRIPT, &fixture(80), default_size())?;
@@ -411,6 +443,42 @@ fn q_leaves_alternate_screen_and_exits_zero() -> Result<()> {
     ensure!(
         status.exit_code() == 0,
         "unexpected exit status: {status:?}; output tail: {:?}",
+        session.output_tail()
+    );
+    assert_restored(&session.output)
+}
+
+#[test]
+fn actual_git_diff_pipe_renders_changed_source_and_restores_terminal() -> Result<()> {
+    let repo = tempfile::tempdir().context("failed to create temporary Git repository")?;
+    let source_dir = repo.path().join("src");
+    fs::create_dir(&source_dir).context("failed to create source fixture directory")?;
+    let source = source_dir.join("example.rs");
+
+    run_git(repo.path(), &["init", "--quiet"])?;
+    fs::write(
+        &source,
+        "pub fn actual_git_value() -> &'static str {\n    \"old_actual_git_value\"\n}\n",
+    )
+    .context("failed to write the indexed Git fixture")?;
+    run_git(repo.path(), &["add", "--", "src/example.rs"])?;
+    fs::write(
+        &source,
+        "pub fn actual_git_value() -> &'static str {\n    \"new_actual_git_value\"\n}\n",
+    )
+    .context("failed to write the changed Git fixture")?;
+
+    let mut session =
+        PtySession::spawn_with_repo(GIT_DIFF_SCRIPT, "", Some(repo.path()), default_size())?;
+    session.wait_for_bytes(ENTER_ALTERNATE_SCREEN, STARTUP_TIMEOUT)?;
+    session.wait_for_bytes(b"src/example.rs", STARTUP_TIMEOUT)?;
+    session.wait_for_bytes(b"new_actual_git_value", STARTUP_TIMEOUT)?;
+    session.send(b"q")?;
+    let status = session.wait_for_exit(EXIT_TIMEOUT)?;
+
+    ensure!(
+        status.exit_code() == 0,
+        "actual git diff pager returned an unexpected status: {status:?}; output tail: {:?}",
         session.output_tail()
     );
     assert_restored(&session.output)

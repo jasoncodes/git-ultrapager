@@ -4,8 +4,7 @@ use std::num::NonZeroUsize;
 use git_ultrapager::search::{
     CommitIncrementalError, IncrementalQueryStatus, RepeatCommand, ScanOutcome, ScanRequest,
     ScanResult, SearchAnchor, SearchDirection, SearchHistory, SearchLine, SearchLineRead,
-    SearchSession, SearchSource, compile_smart_case, match_spans_in_line, repeat_anchor,
-    scan_lines, scan_source,
+    SearchSession, SearchSource, compile_smart_case, repeat_anchor, scan_lines, scan_source,
 };
 use git_ultrapager::text::MAX_SEARCH_LINE_BYTES;
 
@@ -394,14 +393,65 @@ fn oversized_lines_are_skipped_and_counted() {
 }
 
 #[test]
-fn line_spans_preserve_each_zero_width_match() {
+fn zero_width_scan_selects_each_match_without_collecting_line_results() {
     let compiled = compile_smart_case(r"^|$").expect("valid regex");
-    let spans = match_spans_in_line(&compiled, 3, SearchLine::new(9_u8, "abc"));
+    let lines = [SearchLine::new(9_u8, "abc")];
 
-    assert_eq!(spans.line_id, 9);
-    assert_eq!(spans.line_index, 3);
-    assert_eq!(spans.byte_ranges, vec![0..0, 3..3]);
-    assert!(!spans.skipped_oversized);
+    let first = scan_lines(
+        &compiled,
+        &lines,
+        ScanRequest::new(
+            SearchDirection::Forward,
+            SearchAnchor::BeforeDocument,
+            count(1),
+        ),
+    );
+    let second = scan_lines(
+        &compiled,
+        &lines,
+        ScanRequest::new(
+            SearchDirection::Forward,
+            SearchAnchor::BeforeDocument,
+            count(2),
+        ),
+    );
+
+    assert_eq!(
+        first.found.expect("first zero-width match").byte_range,
+        0..0
+    );
+    assert_eq!(
+        second.found.expect("second zero-width match").byte_range,
+        3..3
+    );
+}
+
+#[test]
+fn distant_zero_width_match_keeps_the_public_scan_result_fixed_size() {
+    // 入力長に比例するmatch数でも、public境界が保持するのは指定ordinalの1件だけにする。
+    let text = "a".repeat(1 << 16);
+    let compiled = compile_smart_case("").expect("valid zero-width regex");
+    let lines = [SearchLine::new(5_u8, text.as_str())];
+    let result = scan_lines(
+        &compiled,
+        &lines,
+        ScanRequest::new(
+            SearchDirection::Backward,
+            SearchAnchor::AfterDocument,
+            count(text.len() + 1),
+        ),
+    );
+
+    let ScanResult {
+        found,
+        skipped_oversized_lines,
+        forward_resume,
+    } = result;
+    let found = found.expect("first boundary in reverse ordinal order");
+    assert_eq!(found.line_id, 5);
+    assert_eq!(found.byte_range, 0..0);
+    assert_eq!(skipped_oversized_lines, 0);
+    assert_eq!(forward_resume, None);
 }
 
 #[test]
@@ -466,6 +516,31 @@ fn invalid_incremental_regex_keeps_the_last_valid_preview() {
             .and_then(|query| query.displayed_preview())
             .is_none()
     );
+}
+
+#[test]
+fn committing_a_preview_preserves_its_oversized_line_count() {
+    let mut session = SearchSession::<u64>::default();
+    session.begin_incremental(SearchDirection::Forward, SearchAnchor::BeforeDocument);
+    let update = session.update_incremental("foo").expect("incremental mode");
+    assert!(session.apply_incremental_preview(
+        update.generation,
+        ScanResult {
+            found: None,
+            skipped_oversized_lines: 7,
+            forward_resume: None,
+        },
+    ));
+
+    let committed = session.commit_incremental().expect("valid query");
+    assert_eq!(
+        committed
+            .preview
+            .as_ref()
+            .map(|preview| preview.skipped_oversized_lines),
+        Some(7)
+    );
+    assert_eq!(session.last_skipped_oversized_lines(), 7);
 }
 
 #[test]
