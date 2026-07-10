@@ -12,7 +12,7 @@
 - old / new のソース行番号を表示し、長い行をターミナル幅で折り返します。
 - 変更パスまたは shebang からファイル種別を判定し、ソースコードをハイライトします。
 - デフォルトでは ASCII の空白とタブの差を比較から除外し、行内差分を強調します。
-- 各ファイルの境界に context header を表示し、スクロール中は現在の header を画面上部に固定します。
+- commit と file の境界に context header を表示し、スクロール中は現在の commit の下に file を積んで画面上部に固定します。
 - `Tab` で、commit ごとにまとまった検索可能な変更ファイル一覧を開きます。
 - 16 MiB 以下の Git logical line を smart-case の正規表現で検索します。
 - 未対応または壊れた入力は、安全な plain pager へ切り替えて表示します。
@@ -140,8 +140,8 @@ help は本文と同じ row / page / half-page key と `g` / `G` でスクロー
 
 ## 表示動作
 
-interactive mode は sticky context header に1行、status bar に1行を使います。
-同じ context header を各 file section の直前にも表示し、画面上端へ達すると sticky row が引き継ぎます。
+interactive mode は sticky commit context に1行、file 内ではその下にもう1行、status bar に1行を使います。
+同じ header を各 commit section と file section の直前にも表示し、画面上端へ達すると sticky stack が引き継ぎます。
 diff のソース行には old / new の行番号列を別々に表示します。
 長い行は grapheme 境界で hard-wrap し、継続 row は両方の行番号列を空にして本文の開始位置へ揃えます。
 1 grapheme が64 KiBを超える場合は、1 row の buffer が無制限に増えないよう Unicode scalar 境界で分割します。

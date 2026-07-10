@@ -26,17 +26,17 @@ styles:
   s19: fg=Rgb(150, 181, 180) bg=Rgb(24, 55, 35) mod=NONE
   s20: fg=Rgb(210, 215, 228) bg=Rgb(38, 43, 55) mod=NONE
 rows:
-00 <s0>M·src/unicode.rs··1/1··+2·-1
-01 <s1>diff·--git·a/src/unicode.rs·b/src/
-02 <s1>unicode.rs
-03 <s1>index·1111111..2222222·100644
-04 <s1>---·a/src/unicode.rs
-05 <s1>+++·b/src/unicode.rs
-06 <s2>@@·-98,3·+98,4·@@·fn·render()·{
-07 <s3>·98··98·│<s4>·<s5>let<s6>·decomposed·=·"<s7>é<s6>";
-08 <s3>·99·····│<s8>-<s9>let<s10>·<s11>old<s10>·=·"<s12>東京<s10>";
-09 <s3>·····99·│<s13>+<s14>let<s15>·<s16>new<s15>·=·"<s17>東京<s18>·👩‍💻<s15>";
-10 <s3>····100·│<s13>+<s15>····<s19>very_long_function<s15>("
-11 <s3>········│<s13>·<s17>alpha<s15>",·"<s17>beta<s15>",·"<s17>gamma<s15>")
-12 <s3>········│<s13>·<s15>;
+00 <s0>working·tree
+01 <s0>M·src/unicode.rs··1/1··+2·-1
+02 <s1>diff·--git·a/src/unicode.rs·b/src/
+03 <s1>unicode.rs
+04 <s1>index·1111111..2222222·100644
+05 <s1>---·a/src/unicode.rs
+06 <s1>+++·b/src/unicode.rs
+07 <s2>@@·-98,3·+98,4·@@·fn·render()·{
+08 <s3>·98··98·│<s4>·<s5>let<s6>·decomposed·=·"<s7>é<s6>";
+09 <s3>·99·····│<s8>-<s9>let<s10>·<s11>old<s10>·=·"<s12>東京<s10>";
+10 <s3>·····99·│<s13>+<s14>let<s15>·<s16>new<s15>·=·"<s17>東京<s18>·👩‍💻<s15>";
+11 <s3>····100·│<s13>+<s15>····<s19>very_long_function<s15>("
+12 <s3>········│<s13>·<s17>alpha<s15>",·"<s17>beta<s15>",·"<s17>gamma<s15>")
 13 <s20>line·1/10··EOF··ws:ignore

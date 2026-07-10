@@ -1,6 +1,6 @@
 //! Interactive pager の画面構成と、semantic role から Ratatui widget への変換。
 //!
-//! このmoduleはAppState、DecorationSet、draw前に構築した[`FrameLines`]だけを読み、sticky header、本文、
+//! このmoduleはAppState、DecorationSet、draw前に構築した[`FrameLines`]だけを読み、sticky stack、本文、
 //! status bar、help/file-list overlayを1 frameへ描く。Raw store I/O、入力event、terminal lifecycle、
 //! background workerは扱わない。Frame preloadはfixed metadataとbounded search rangeだけを保持し、検索用に
 //! 一時decodeしたline textはdraw前に破棄する。Syntax foreground、intraline background、searchの順に
@@ -65,8 +65,8 @@ pub struct FrameLines {
     lines: HashMap<LineId, FrameLine>,
     current_column: Option<(LineId, usize)>,
     transient_raw_bytes_read: u64,
-    sticky_header: String,
-    inline_file_headers: HashMap<LineId, String>,
+    sticky_headers: Vec<String>,
+    inline_context_headers: HashMap<LineId, Vec<String>>,
     fallback_found: bool,
     fallback_scan_pending: bool,
     file_list: Option<FileListFrame>,
@@ -185,8 +185,8 @@ impl FrameLoader {
             return Ok(FrameLines::default());
         }
 
-        let sticky_header = self.load_sticky_header(state)?;
-        let inline_file_headers = self.load_inline_file_headers(state)?;
+        let sticky_headers = self.load_sticky_headers(state)?;
+        let inline_context_headers = self.load_inline_context_headers(state)?;
         let (fallback_found, fallback_scan_pending) = self.advance_fallback_scan(state)?;
         let visible = state.visible_rows();
         let visible_ranges = visible_logical_ranges(visible)?;
@@ -217,8 +217,11 @@ impl FrameLoader {
             .try_reserve(requested_ids.len())
             .map_err(|_| FrameLinesError::Allocation { requested })?;
         let reserved = retained_frame_index_bytes(lines.capacity())
-            .saturating_add(sticky_header.capacity())
-            .saturating_add(retained_inline_file_headers(&inline_file_headers));
+            .saturating_add(retained_header_rows(
+                &sticky_headers,
+                sticky_headers.capacity(),
+            ))
+            .saturating_add(retained_inline_context_headers(&inline_context_headers));
         if reserved > MAX_FRAME_RETAINED_BYTES {
             return Err(FrameLinesError::FrameBudget {
                 requested: reserved,
@@ -276,8 +279,11 @@ impl FrameLoader {
             }
             let next_retained = retained_frame_index_bytes(lines.capacity())
                 .saturating_add(retained_weak_match_bytes(&lines))
-                .saturating_add(sticky_header.capacity())
-                .saturating_add(retained_inline_file_headers(&inline_file_headers))
+                .saturating_add(retained_header_rows(
+                    &sticky_headers,
+                    sticky_headers.capacity(),
+                ))
+                .saturating_add(retained_inline_context_headers(&inline_context_headers))
                 .saturating_add(
                     weak_matches
                         .capacity()
@@ -305,8 +311,8 @@ impl FrameLoader {
                 .large_line_stats()
                 .raw_bytes_read
                 .saturating_sub(raw_bytes_before),
-            sticky_header,
-            inline_file_headers,
+            sticky_headers,
+            inline_context_headers,
             fallback_found,
             fallback_scan_pending,
             file_list: None,
@@ -363,10 +369,10 @@ impl FrameLoader {
         Ok((self.fallback_found, pending))
     }
 
-    fn load_sticky_header(&mut self, state: &AppState) -> Result<String, FrameLinesError> {
+    fn load_sticky_headers(&mut self, state: &AppState) -> Result<Vec<String>, FrameLinesError> {
         let width = usize::from(state.terminal_width());
         let Some(row) = state.current_row() else {
-            return Ok(fit_end("git-ultrapager", width));
+            return Ok(vec![fit_end("git-ultrapager", width)]);
         };
         let structure = state.document().structure();
         if let Some(file_id) = row.file_id {
@@ -375,43 +381,47 @@ impl FrameLoader {
                 .file_reader
                 .read_file(structure, file_id)?
                 .ok_or(FrameLinesError::MissingFile { file_id })?;
-            let commit = if counts.commits > 1 {
-                self.commit_reader.read_commit(structure, file.commit_id)?
-            } else {
-                None
-            };
+            let commit = self
+                .commit_reader
+                .read_commit(structure, file.commit_id)?
+                .ok_or(FrameLinesError::MissingCommit {
+                    commit_id: file.commit_id,
+                })?;
             let total = state
                 .document()
                 .is_complete()
                 .then(|| counts.files.to_string());
-            return Ok(sticky_file_header(file, total.as_deref(), commit, width));
+            return Ok(vec![
+                fit_end(&commit_label(commit), width),
+                sticky_file_header(file, total.as_deref(), width),
+            ]);
         }
         if let Some(commit_id) = row.commit_id {
             let commit = self
                 .commit_reader
                 .read_commit(structure, commit_id)?
                 .ok_or(FrameLinesError::MissingCommit { commit_id })?;
-            return Ok(fit_end(&commit_label(commit), width));
+            return Ok(vec![fit_end(&commit_label(commit), width)]);
         }
-        Ok(fit_end("git-ultrapager", width))
+        Ok(vec![fit_end("git-ultrapager", width)])
     }
 
-    /// Body先頭より後にfile先頭が現れる場合だけ、stickyと同じlabelを仮想行としてpreloadする。
+    /// Body先頭より後にcommit/file先頭が現れる場合だけ、stickyと同じlabelを仮想行としてpreloadする。
     ///
-    /// Body先頭のfile contextは固定sticky行がすでに担うため重複させない。Rendererはraw diff行を
-    /// 変更せず、対応するfile開始行の直前へこの文字列を差し込む。
-    fn load_inline_file_headers(
+    /// Body先頭のcontextは固定sticky stackがすでに担うため重複させない。同じlogical lineで
+    /// working-tree commitとfileが始まる場合はcommit、fileの順に保持する。
+    fn load_inline_context_headers(
         &mut self,
         state: &AppState,
-    ) -> Result<HashMap<LineId, String>, FrameLinesError> {
+    ) -> Result<HashMap<LineId, Vec<String>>, FrameLinesError> {
         let visible = state.visible_rows();
         let mut headers = HashMap::new();
         let requested = visible
             .windows(2)
             .filter(|pair| {
-                pair[1].file_id.is_some()
-                    && pair[1].file_id != pair[0].file_id
-                    && !pair[1].continuation
+                !pair[1].continuation
+                    && (pair[1].commit_id.is_some() && pair[1].commit_id != pair[0].commit_id
+                        || pair[1].file_id.is_some() && pair[1].file_id != pair[0].file_id)
             })
             .count();
         headers
@@ -428,37 +438,43 @@ impl FrameLoader {
             .is_complete()
             .then(|| counts.files.to_string());
         let width = usize::from(state.terminal_width());
+        let mut previous_commit = visible[0].commit_id;
         let mut previous_file = visible[0].file_id;
         for row in &visible[1..] {
-            let Some(file_id) = row.file_id else {
-                previous_file = None;
-                continue;
-            };
-            if previous_file == Some(file_id) {
-                continue;
-            }
-            previous_file = Some(file_id);
             if row.continuation {
                 continue;
             }
-            let file = self
-                .file_reader
-                .read_file(structure, file_id)?
-                .ok_or(FrameLinesError::MissingFile { file_id })?;
-            if row.line_id != file.span.start {
+            let mut row_headers = Vec::new();
+            if let Some(commit_id) = row.commit_id
+                && previous_commit != Some(commit_id)
+            {
+                let commit = self
+                    .commit_reader
+                    .read_commit(structure, commit_id)?
+                    .ok_or(FrameLinesError::MissingCommit { commit_id })?;
+                if row.line_id == commit.span.start {
+                    row_headers.push(fit_end(&commit_label(commit), width));
+                }
+            }
+            if let Some(file_id) = row.file_id
+                && previous_file != Some(file_id)
+            {
+                let file = self
+                    .file_reader
+                    .read_file(structure, file_id)?
+                    .ok_or(FrameLinesError::MissingFile { file_id })?;
+                if row.line_id == file.span.start {
+                    row_headers.push(sticky_file_header(file, total.as_deref(), width));
+                }
+            }
+            previous_commit = row.commit_id;
+            previous_file = row.file_id;
+            if row_headers.is_empty() {
                 continue;
             }
-            let commit = if counts.commits > 1 {
-                self.commit_reader.read_commit(structure, file.commit_id)?
-            } else {
-                None
-            };
-            headers.insert(
-                row.line_id,
-                sticky_file_header(file, total.as_deref(), commit, width),
-            );
+            headers.insert(row.line_id, row_headers);
             let retained = retained_frame_index_bytes(0)
-                .saturating_add(retained_inline_file_headers(&headers));
+                .saturating_add(retained_inline_context_headers(&headers));
             if retained > MAX_FRAME_RETAINED_BYTES {
                 return Err(FrameLinesError::FrameBudget {
                     requested: retained,
@@ -878,10 +894,12 @@ impl FrameLines {
             .map(|(_, column)| column)
     }
 
-    /// File開始行の直前へ表示する、事前整形済みcontext headerを返す。
+    /// Commit/file開始行の直前へ表示する、事前整形済みcontext header stackを返す。
     #[must_use]
-    pub fn inline_file_header(&self, line_id: LineId) -> Option<&str> {
-        self.inline_file_headers.get(&line_id).map(String::as_str)
+    pub fn inline_context_headers(&self, line_id: LineId) -> &[String] {
+        self.inline_context_headers
+            .get(&line_id)
+            .map_or(&[], Vec::as_slice)
     }
 
     /// Rendererへ保持するmetadata、range vector、hash tableの保守的byte数。
@@ -889,8 +907,13 @@ impl FrameLines {
     pub fn retained_bytes(&self) -> usize {
         retained_frame_index_bytes(self.lines.capacity())
             .saturating_add(retained_weak_match_bytes(&self.lines))
-            .saturating_add(self.sticky_header.capacity())
-            .saturating_add(retained_inline_file_headers(&self.inline_file_headers))
+            .saturating_add(retained_header_rows(
+                &self.sticky_headers,
+                self.sticky_headers.capacity(),
+            ))
+            .saturating_add(retained_inline_context_headers(
+                &self.inline_context_headers,
+            ))
             .saturating_add(self.file_list.as_ref().map_or(0, retained_file_list_bytes))
     }
 
@@ -1034,12 +1057,22 @@ fn retained_weak_match_bytes(lines: &HashMap<LineId, FrameLine>) -> usize {
     })
 }
 
-fn retained_inline_file_headers(headers: &HashMap<LineId, String>) -> usize {
+fn retained_header_rows(headers: &[String], capacity: usize) -> usize {
+    capacity
+        .saturating_mul(std::mem::size_of::<String>())
+        .saturating_add(headers.iter().fold(0_usize, |total, header| {
+            total.saturating_add(header.capacity())
+        }))
+}
+
+fn retained_inline_context_headers(headers: &HashMap<LineId, Vec<String>>) -> usize {
     headers
         .capacity()
-        .saturating_mul(std::mem::size_of::<(LineId, String)>() + 2 * std::mem::size_of::<usize>())
-        .saturating_add(headers.values().fold(0_usize, |total, header| {
-            total.saturating_add(header.capacity())
+        .saturating_mul(
+            std::mem::size_of::<(LineId, Vec<String>)>() + 2 * std::mem::size_of::<usize>(),
+        )
+        .saturating_add(headers.values().fold(0_usize, |total, rows| {
+            total.saturating_add(retained_header_rows(rows, rows.capacity()))
         }))
 }
 
@@ -1210,17 +1243,21 @@ fn render_body(
     decorations: &DecorationSet,
     lines: &FrameLines,
 ) {
-    let header_area = Rect::new(area.x, area.y, area.width, 1);
+    let sticky_height = u16::try_from(lines.sticky_headers.len())
+        .unwrap_or(u16::MAX)
+        .min(area.height);
     let body_area = Rect::new(
         area.x,
-        area.y.saturating_add(1),
+        area.y.saturating_add(sticky_height),
         area.width,
-        area.height.saturating_sub(1),
+        area.height.saturating_sub(sticky_height),
     );
-    frame.render_widget(
-        Paragraph::new(lines.sticky_header.as_str()).style(theme.style(SemanticRole::Sticky)),
-        header_area,
-    );
+    for (row, header) in lines.sticky_headers.iter().enumerate() {
+        frame.render_widget(
+            Paragraph::new(header.as_str()).style(theme.style(SemanticRole::Sticky)),
+            Rect::new(area.x, area.y.saturating_add(row as u16), area.width, 1),
+        );
+    }
 
     let visible_rows = &state.visible_rows()[..state
         .visible_rows()
@@ -1228,9 +1265,9 @@ fn render_body(
         .min(usize::from(body_area.height))];
     let mut screen_row = 0_usize;
     for (row_index, row) in visible_rows.iter().enumerate() {
-        if let Some(header) = lines.inline_file_header(row.line_id) {
+        for header in lines.inline_context_headers(row.line_id) {
             frame.render_widget(
-                Paragraph::new(header).style(theme.style(SemanticRole::Sticky)),
+                Paragraph::new(header.as_str()).style(theme.style(SemanticRole::Sticky)),
                 Rect::new(
                     body_area.x,
                     body_area.y.saturating_add(screen_row as u16),
@@ -1242,6 +1279,9 @@ fn render_body(
             if screen_row >= usize::from(body_area.height) {
                 break;
             }
+        }
+        if screen_row >= usize::from(body_area.height) {
+            break;
         }
         let y = body_area.y.saturating_add(screen_row as u16);
         let weak_matches = lines.weak_matches(row.line_id);
@@ -1373,12 +1413,7 @@ fn weak_matches_in_visible_range(
     Ok(matches)
 }
 
-fn sticky_file_header(
-    file: StoredFileRef<'_>,
-    total: Option<&str>,
-    commit: Option<StoredCommitRef<'_>>,
-    width: usize,
-) -> String {
+fn sticky_file_header(file: StoredFileRef<'_>, total: Option<&str>, width: usize) -> String {
     let occurrence = file.id.get().saturating_add(1);
     let total = total.unwrap_or("?");
     let additions = file
@@ -1387,13 +1422,7 @@ fn sticky_file_header(
     let deletions = file
         .deletions
         .map_or_else(|| "?".to_owned(), |value| value.to_string());
-    let commit = commit
-        .and_then(|commit| commit.object_id)
-        .map(short_object_id);
-    let suffix = commit.map_or_else(
-        || format!("  {occurrence}/{total}  +{additions} -{deletions}"),
-        |object| format!("  {occurrence}/{total}  +{additions} -{deletions}  @{object}"),
-    );
+    let suffix = format!("  {occurrence}/{total}  +{additions} -{deletions}");
     let prefix = format!("{} ", file.status.label());
     let fixed_width = display_width(&prefix).saturating_add(display_width(&suffix));
     if fixed_width >= width {
@@ -2612,12 +2641,12 @@ mod tests {
         )
         .unwrap();
         let state =
-            AppState::new(Arc::new(document), 60, 8, 4, WhitespaceChoice::Ignore, true).unwrap();
+            AppState::new(Arc::new(document), 60, 9, 4, WhitespaceChoice::Ignore, true).unwrap();
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
         let decorations =
             DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore).unwrap();
         let lines = load_frame(&state);
-        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 9)).unwrap();
         terminal
             .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
             .unwrap();
@@ -2654,10 +2683,11 @@ mod tests {
         let screen = buffer_text(&terminal);
         let rows = screen.lines().collect::<Vec<_>>();
 
-        assert!(rows[0].contains("src/main.rs  1/2"), "{screen}");
-        assert!(rows[7].contains("src/lib.rs  2/2"), "{screen}");
+        assert!(rows[0].contains("working tree"), "{screen}");
+        assert!(rows[1].contains("src/main.rs  1/2"), "{screen}");
+        assert!(rows[8].contains("src/lib.rs  2/2"), "{screen}");
         assert!(
-            rows[8].contains("diff --git a/src/lib.rs b/src/lib.rs"),
+            rows[9].contains("diff --git a/src/lib.rs b/src/lib.rs"),
             "{screen}"
         );
 
@@ -2670,6 +2700,95 @@ mod tests {
             .unwrap();
         let screen = buffer_text(&terminal);
         assert!(screen.contains("second-new"), "{screen}");
+    }
+
+    #[test]
+    fn body_stacks_commit_above_file_context() {
+        let document = parse_bytes(
+            br#"commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+
+    First change
+
+diff --git a/first.rs b/first.rs
+--- a/first.rs
++++ b/first.rs
+@@ -1 +1 @@
+-old
++first
+commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+
+    Second change
+
+diff --git a/second.rs b/second.rs
+--- a/second.rs
++++ b/second.rs
+@@ -1 +1 @@
+-old
++second
+"#,
+        )
+        .unwrap();
+        let mut state = AppState::new(
+            Arc::new(document),
+            100,
+            40,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore).unwrap();
+
+        let lines = load_frame(&state);
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        let rows = screen.lines().map(str::trim_end).collect::<Vec<_>>();
+        let second_commit_header = rows
+            .iter()
+            .position(|row| *row == "commit bbbbbbbb  Second change")
+            .expect("inline commit header");
+        let second_commit_source = rows
+            .iter()
+            .position(|row| *row == "commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .expect("source commit header");
+        let second_file_header = rows
+            .iter()
+            .position(|row| row.contains("second.rs  2/2"))
+            .expect("inline file header");
+        let second_file_source = rows
+            .iter()
+            .position(|row| *row == "diff --git a/second.rs b/second.rs")
+            .expect("source file header");
+        assert_eq!(second_commit_header + 1, second_commit_source, "{screen}");
+        assert_eq!(second_file_header + 1, second_file_source, "{screen}");
+
+        state
+            .update(Event::Resize {
+                width: 100,
+                height: 8,
+            })
+            .unwrap();
+        state
+            .update(Event::Key(KeyEvent::new(
+                KeyCode::Char('}'),
+                KeyModifiers::NONE,
+            )))
+            .unwrap();
+        let lines = load_frame(&state);
+        let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        let rows = screen.lines().map(str::trim_end).collect::<Vec<_>>();
+        assert_eq!(rows[0], "commit aaaaaaaa  First change", "{screen}");
+        assert!(rows[1].contains("first.rs  1/2"), "{screen}");
+        assert_eq!(rows[2], "diff --git a/first.rs b/first.rs", "{screen}");
     }
 
     #[test]
@@ -2832,9 +2951,11 @@ diff --git a/third.rs b/third.rs
         );
 
         let lines = load_frame(&state);
-        assert!(lines.sticky_header.contains("old-name.rs → new-name.rs"));
-        assert!(lines.sticky_header.contains("1/3"));
-        assert!(lines.sticky_header.contains("@aaaaaaaa"));
+        assert_eq!(lines.sticky_headers.len(), 2);
+        assert!(lines.sticky_headers[0].contains("commit aaaaaaaa"));
+        assert!(lines.sticky_headers[1].contains("old-name.rs → new-name.rs"));
+        assert!(lines.sticky_headers[1].contains("1/3"));
+        assert!(!lines.sticky_headers[1].contains("@aaaaaaaa"));
     }
 
     #[test]
@@ -3262,12 +3383,12 @@ commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
         )
         .unwrap();
         let state =
-            AppState::new(Arc::new(document), 60, 8, 4, WhitespaceChoice::Show, true).unwrap();
+            AppState::new(Arc::new(document), 60, 9, 4, WhitespaceChoice::Show, true).unwrap();
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
         let decorations =
             DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Show).unwrap();
         let lines = load_frame(&state);
-        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(60, 9)).unwrap();
         terminal
             .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
             .unwrap();

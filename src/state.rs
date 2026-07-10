@@ -473,7 +473,7 @@ impl AppState {
             height,
             tab_width,
             false,
-            true,
+            false,
         )?;
         viewport_layout
             .finish_preparation(&mut prepared.rows)
@@ -549,7 +549,7 @@ impl AppState {
         self.viewport_anchor
     }
 
-    /// Sticky headerとpriority decorationが参照するbody先頭row。
+    /// Sticky stackとpriority decorationが参照するbody先頭row。
     #[must_use]
     pub fn current_row(&self) -> Option<&VisualRow> {
         self.viewport_rows.rows.first().map(ViewportRow::row)
@@ -950,7 +950,7 @@ impl AppState {
             self.mode = Mode::Body;
             return Vec::new();
         }
-        // Helpはsticky headerを置かず、status以外の全rowを使う。Body用heightを流用すると
+        // Helpはsticky stackを置かず、status以外の全rowを使う。Body用heightを流用すると
         // 最終pageに空行が残り、page移動のoverlapも2行になる。
         let overlay_height = usize::from(self.height).saturating_sub(1);
         let page = overlay_height.saturating_sub(1).max(1);
@@ -1911,7 +1911,9 @@ impl AppState {
                 return Err(map_viewport_error(error));
             }
         };
-        let moved = self.install_anchor(candidate, true)?;
+        // Backward移動をbottom clampすると、sticky/inline headerでraw rowが減る末尾viewportから
+        // 1行も戻れない。Forwardだけ末尾へ寄せ、Backwardは要求したanchorをそのまま採用する。
+        let moved = self.install_anchor(candidate, forward)?;
         if moved {
             self.follow = false;
             self.status.clear();
@@ -2563,8 +2565,8 @@ fn prepare_viewport(
         };
         let mut rows = viewport.collect(document, top, body_height, config)?;
         if clamp_bottom && rows.at_end {
-            // File境界の仮想headerもbodyを1行使う。Raw rowだけでbottom-alignすると末尾がheaderの
-            // ぶん隠れるため、表示行の超過数だけtopを進めて末尾raw rowをviewport内へ戻す。
+            // Sticky stackの2段目とcommit/file境界の仮想headerもbodyを使う。Raw rowだけで
+            // bottom-alignすると末尾が隠れるため、表示行の超過数だけtopを進める。
             if let Some(mut bottom) = viewport.bottom_aligned_top(document, body_height, config)? {
                 loop {
                     rows = viewport.collect(document, Some(bottom), body_height, config)?;
@@ -2616,43 +2618,61 @@ fn prepare_viewport(
     }
 }
 
-/// Raw row間にfile context headerを差し込んだ後のbody行数を返す。
+/// Sticky stackとcommit/file context headerを加えた後のbody行数を返す。
 ///
-/// 先頭fileのheaderは固定sticky行が表示する。2行目以降でfile IDが切り替わる箇所だけを数え、
-/// [`crate::ui::FrameLoader`]がpreloadするinline headerと同じ行数契約を保つ。
+/// Body heightはsticky 1段目を除外済みなので、先頭rowがfileを持つ場合はcommit/file stackの
+/// 2段目を1行として加える。2行目以降はcommit IDとfile IDの遷移を別々に数える。
 fn displayed_body_row_count(rows: &[ViewportRow]) -> usize {
     let Some(first) = rows.first() else {
         return 0;
     };
-    let mut displayed = 1_usize;
+    let mut displayed = 1_usize.saturating_add(usize::from(first.file_id.is_some()));
+    let mut previous_commit = first.commit_id;
     let mut previous_file = first.file_id;
     for row in &rows[1..] {
-        if row.file_id.is_some() && row.file_id != previous_file && !row.continuation {
-            displayed = displayed.saturating_add(1);
+        if !row.continuation {
+            displayed = displayed
+                .saturating_add(usize::from(
+                    row.commit_id.is_some() && row.commit_id != previous_commit,
+                ))
+                .saturating_add(usize::from(
+                    row.file_id.is_some() && row.file_id != previous_file,
+                ));
         }
         displayed = displayed.saturating_add(1);
+        previous_commit = row.commit_id;
         previous_file = row.file_id;
     }
     displayed
 }
 
-/// Inline headerを含めてbody高さに収まるraw rowだけを残す。
+/// Sticky 2段目とinline headerを含めてbody高さに収まるraw rowだけを残す。
 ///
 /// Layout cacheのbyte accountingはtruncate前の保守値を保持する。末尾を落としたframeはdocument末尾を
 /// 表示していないため`at_end`を解除し、次のnavigationで残りを収集できるようにする。
 fn fit_body_rows(rows: &mut ViewportRows, body_height: usize) {
-    let mut displayed = 0_usize;
+    let mut displayed = rows
+        .rows
+        .first()
+        .map_or(0, |row| usize::from(row.file_id.is_some()));
     let mut retained = 0_usize;
+    let mut previous_commit = None;
     let mut previous_file = None;
     for (index, row) in rows.rows.iter().enumerate() {
-        let inline_header =
-            index > 0 && row.file_id.is_some() && row.file_id != previous_file && !row.continuation;
-        let required = 1_usize.saturating_add(usize::from(inline_header));
+        let inline_headers = if index == 0 || row.continuation {
+            0
+        } else {
+            usize::from(row.commit_id.is_some() && row.commit_id != previous_commit).saturating_add(
+                usize::from(row.file_id.is_some() && row.file_id != previous_file),
+            )
+        };
+        let required = 1_usize.saturating_add(inline_headers);
         if displayed.saturating_add(required) > body_height {
             break;
         }
         displayed = displayed.saturating_add(required);
         retained = index.saturating_add(1);
+        previous_commit = row.commit_id;
         previous_file = row.file_id;
     }
     if retained < rows.rows.len() {
