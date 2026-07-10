@@ -212,7 +212,8 @@ search/filter input は grapheme 単位で cursor 移動と削除を行い、Lef
 path の拡張子と既知 file name から syntax を選ぶ。
 判定できない場合は、各 hunk の old 側で最初に現れる削除または context 行と、new 側で最初に現れる追加または context 行にある shebang を使う。
 該当する source 行がなければ推測しない。
-`syntect` の bundled TextMate grammar と pure-Rust `fancy-regex` backend を使う。
+`two-face` が curated した TextMate grammar set と、`syntect` の pure-Rust `fancy-regex` backend を使う。
+`fancy-regex` 向け set に JavaScript (Babel) grammar は含まれないため、`.jsx` は JSX expression を解釈できる TypeScriptReact grammar へ割り当てる。
 
 削除側と追加側は別の parse state を持ち、hunk 内で継続し、hunk 境界で reset する。
 両 state が diverge した context 行は new side の style、deleted file では old side を使う。

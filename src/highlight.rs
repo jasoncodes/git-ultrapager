@@ -179,7 +179,7 @@ pub(crate) struct SyntaxEngine {
 
 impl SyntaxEngine {
     pub(crate) fn new() -> Result<Self, HighlightError> {
-        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let syntaxes = two_face::syntax::extra_newlines();
         if syntaxes.find_syntax_by_name("Plain Text").is_none() {
             return Err(HighlightError::MissingPlainText);
         }
@@ -418,8 +418,14 @@ fn detect_syntax<'a>(
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or("");
-        syntaxes
-            .find_syntax_by_extension(file_name)
+        // fancy-regex では JavaScript (Babel) grammar が除外されるため、JSX は JSX を内包する
+        // TypeScriptReact grammar へ割り当てる。TSX と同じ parse state を使うことで、タグと
+        // JavaScript expression の境界を plain JavaScript grammar より細かく保持できる。
+        let jsx = extension
+            .eq_ignore_ascii_case("jsx")
+            .then(|| syntaxes.find_syntax_by_name("TypeScriptReact"))
+            .flatten();
+        jsx.or_else(|| syntaxes.find_syntax_by_extension(file_name))
             .or_else(|| syntaxes.find_syntax_by_extension(extension))
     });
     path_match.or_else(|| {
@@ -435,14 +441,31 @@ mod tests {
 
     #[test]
     fn path_detection_does_not_read_repository_files() {
-        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let syntaxes = two_face::syntax::extra_newlines();
         let syntax = detect_syntax(&syntaxes, Some("not/on/disk/main.rs"), None).unwrap();
         assert_eq!(syntax.name, "Rust");
     }
 
     #[test]
+    fn detects_swift_typescript_and_jsx_family_extensions() {
+        let syntaxes = two_face::syntax::extra_newlines();
+        let cases = [
+            ("main.swift", "Swift"),
+            ("main.ts", "TypeScript"),
+            ("component.tsx", "TypeScriptReact"),
+            ("component.jsx", "TypeScriptReact"),
+        ];
+
+        for (path, expected) in cases {
+            let syntax = detect_syntax(&syntaxes, Some(path), None)
+                .unwrap_or_else(|| panic!("{path} should have a syntax"));
+            assert_eq!(syntax.name, expected, "unexpected syntax for {path}");
+        }
+    }
+
+    #[test]
     fn shebang_is_used_only_as_fallback() {
-        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let syntaxes = two_face::syntax::extra_newlines();
         let syntax =
             detect_syntax(&syntaxes, Some("script"), Some("#!/usr/bin/env python3")).unwrap();
         assert!(syntax.name.contains("Python"));
@@ -450,7 +473,7 @@ mod tests {
 
     #[test]
     fn non_shebang_first_line_does_not_guess_a_syntax() {
-        let syntaxes = SyntaxSet::load_defaults_newlines();
+        let syntaxes = two_face::syntax::extra_newlines();
         assert!(
             detect_syntax(&syntaxes, Some("unknown"), Some("<?xml version=\"1.0\"?>")).is_none()
         );

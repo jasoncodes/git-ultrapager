@@ -11,7 +11,8 @@ sticky file context, and fast file navigation.
 - Reads Git output from standard input and starts before the producer reaches EOF.
 - Uses familiar `less` navigation, including `e`/`y` aliases for `j`/`k`.
 - Shows old and new source line numbers and wraps long lines to terminal width.
-- Highlights source syntax based on the changed path or a detected shebang.
+- Highlights source syntax based on the changed path or a detected shebang,
+  including Swift, TypeScript, TSX, and JSX.
 - Highlights intraline changes while ignoring whitespace differences by default.
 - Marks commit and file boundaries with context headers, stacking the current commit above the current file while scrolling.
 - Opens a filterable, commit-grouped changed-file list with `Tab`.
