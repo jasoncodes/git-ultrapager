@@ -19,7 +19,7 @@ sticky な file context、高速な file navigation を追加します。
 - whitespace 差分を default で無視しながら、行内の変更箇所を highlight します。
 - scroll 中の file を sticky header に表示します。
 - `Tab` で filter 可能な commit group 付き変更 file 一覧を開きます。
-- Git 出力全体を smart case の正規表現で検索します。
+- 16 MiB 以下の Git logical line を smart case の正規表現で検索します。
 - 未対応または壊れた入力を安全な plain pager で表示します。
 - UTF-8 出力に対応する macOS と Linux の terminal を support します。
 
@@ -107,7 +107,9 @@ stdout が terminal ではない場合、生成した行番号、折り返し、
 
 検索には Rust の正規表現 syntax を使います。小文字だけの pattern は大文字と
 小文字を区別せず、大文字を含む pattern は区別します。入力中に一致箇所を preview
-し、表示中の全一致を highlight したうえで、現在の一致を別の表示にします。
+し、現在の一致を別の表示にします。ほかの表示中の一致に付ける弱い highlight は
+上限付きで、密な一致、raw byte、escape 後の表示 text が上限を超える行では省略する
+場合があります。現在の一致への navigation には影響しません。
 
 file 一覧は Git の出力順を保ちます。一覧内で `/` を押すと表示 path を fuzzy
 filter できます。navigation key で entry を選び、`Enter` で移動します。
@@ -117,7 +119,8 @@ filter できます。navigation key で entry を選び、`Enter` で移動し�
 interactive mode は sticky context header に1行、status bar に1行を使います。
 diff の source 行には old/new の行番号列を別々に表示します。長い行は grapheme
 境界で hard wrap し、継続 row は両方の行番号列を空にして source text の開始位置へ
-揃えます。
+揃えます。1 grapheme が64 KiBを超える場合は、細工されたclusterが無制限のrow bufferを
+要求しないよう、Unicode scalar境界で分割します。
 
 入力の ANSI、OSC、DCS sequence は表示前に除去します。不正な UTF-8 と安全でない
 control byte は terminal へ送らず、interactive mode では `\xNN` と表示します。

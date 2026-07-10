@@ -1,12 +1,14 @@
 //! Blocking stdin と CPU-bound search を main thread から隔離する bounded runtime primitive。
 //!
-//! Reader は受信 byte を [`AppendStore`] へ先に永続化してから同じ chunk を channel へ渡す。EOFでは
-//! storeをsealしてhigh-water markを固定してから[`ReaderEvent::Eof`]をpublishする。
+//! Reader は受信 byte を [`AppendStore`] へ先に永続化し、appendが返した開始offsetと同じchunkを
+//! channelへ渡す。EOFではstoreをsealしてhigh-water markを固定してから[`ReaderEvent::Eof`]を
+//! publishする。
 //! channel が満杯なら producer 側で backpressure をかけ、未処理 chunk を無制限に保持しない。
 //! Search worker は実行中1件とpending 1件だけを持ち、新requestの内部sequenceで旧scanを
-//! cooperative cancellationする。Documentはline accessorから逐次読み、全lineの参照配列を複製しない。
-//! Panicはfailure eventへ変換する。どちらのthreadもpager終了時にはjoinしない。stdin readや巨大regex
-//! の完了待ちで`q`を遅延させず、process終了によって残ったthreadを回収するためである。
+//! cooperative cancellationする。Document snapshotはworkerごとのline readerから逐次decodeし、全lineの
+//! 参照配列を複製しない。Resultはtaskのquery/document generationをそのまま返し、stateが現在の
+//! snapshotと照合する。Panicはfailure eventへ変換する。どちらのthreadもpager終了時にはjoinしない。
+//! stdin readや巨大regexの完了待ちで`q`を遅延させず、process終了によって残ったthreadを回収するためである。
 
 use std::io::{self, Read};
 use std::panic::{self, AssertUnwindSafe};
@@ -17,10 +19,15 @@ use std::thread;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use thiserror::Error;
 
+use crate::bounded_text::{BoundedDocumentTextReader, BoundedTextError, BoundedTextRead};
+use crate::document::DocumentSnapshot;
 use crate::input::{AppendStore, StoreError};
-use crate::model::{Document, LineId};
-use crate::search::{ScanOutcome, ScanResult, SearchLine, SearchSource, scan_source};
-use crate::state::SearchTask;
+use crate::model::LineId;
+use crate::search::{
+    ScanOutcome, ScanResult, SearchLine, SearchLineRead, SearchSource, scan_source,
+};
+use crate::state::{DocumentGeneration, SearchTask};
+use crate::text::MAX_SEARCH_LINE_BYTES;
 
 const READER_CHANNEL_CAPACITY: usize = 4;
 const READ_CHUNK_BYTES: usize = 32 * 1024;
@@ -28,7 +35,12 @@ const READ_CHUNK_BYTES: usize = 32 * 1024;
 /// Reader threadからmain loopへ届く入力状態。
 #[derive(Debug)]
 pub enum ReaderEvent {
-    Data(Vec<u8>),
+    Data {
+        /// 同じeventの`bytes`をappendした時に[`AppendStore::append`]が返した絶対offset。
+        raw_start: u64,
+        /// `raw_start`からstoreへ永続化済みのbyte列。
+        bytes: Vec<u8>,
+    },
     Eof,
     Failed(ReaderFailure),
 }
@@ -90,12 +102,18 @@ fn reader_loop<R: Read>(reader: &mut R, store: &AppendStore, sender: &Sender<Rea
                 return;
             }
         };
-        if let Err(error) = store.append(&buffer[..count]) {
-            let _ = sender.send(ReaderEvent::Failed(ReaderFailure::Store(error)));
-            return;
-        }
+        let raw_start = match store.append(&buffer[..count]) {
+            Ok(raw_start) => raw_start,
+            Err(error) => {
+                let _ = sender.send(ReaderEvent::Failed(ReaderFailure::Store(error)));
+                return;
+            }
+        };
         if sender
-            .send(ReaderEvent::Data(buffer[..count].to_vec()))
+            .send(ReaderEvent::Data {
+                raw_start,
+                bytes: buffer[..count].to_vec(),
+            })
             .is_err()
         {
             return;
@@ -103,16 +121,19 @@ fn reader_loop<R: Read>(reader: &mut R, store: &AppendStore, sender: &Sender<Rea
     }
 }
 
-/// Search workerが返すgeneration付きevent。
+/// Search workerが返すquery/document generation付きevent。
 #[derive(Clone, Debug)]
 pub enum SearchWorkerEvent {
     Completed {
         generation: crate::search::SearchGeneration,
+        document_generation: DocumentGeneration,
         result: ScanResult<LineId>,
         preview: bool,
     },
     Failed {
         generation: crate::search::SearchGeneration,
+        document_generation: DocumentGeneration,
+        preview: bool,
         message: String,
     },
 }
@@ -121,7 +142,7 @@ pub enum SearchWorkerEvent {
 #[derive(Clone, Debug)]
 pub struct SearchJob {
     pub task: SearchTask,
-    pub document: Arc<Document>,
+    pub document: Arc<DocumentSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -208,28 +229,56 @@ impl SearchWorker {
 }
 
 struct DocumentSearchSource<'document> {
-    document: &'document Document,
+    document: &'document DocumentSnapshot,
+    /// Scanner経由のreadはmetadata capと64 KiB cancellationを共有する。
+    bounded_reader: BoundedDocumentTextReader,
 }
 
-#[derive(Clone, Copy, Debug, Error)]
-#[error("document search source does not contain logical line {index}")]
-struct DocumentSearchSourceError {
-    index: usize,
+impl<'document> DocumentSearchSource<'document> {
+    fn new(document: &'document DocumentSnapshot) -> Self {
+        Self {
+            document,
+            bounded_reader: BoundedDocumentTextReader::new(),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum DocumentSearchSourceError {
+    #[error("document search source does not contain logical line {index}")]
+    MissingLine { index: usize },
+    #[error(transparent)]
+    BoundedText(#[from] BoundedTextError),
 }
 
 impl SearchSource<LineId> for DocumentSearchSource<'_> {
     type Error = DocumentSearchSourceError;
 
     fn line_count(&self) -> usize {
-        self.document.lines().len()
+        self.document.line_count()
     }
 
-    fn line(&mut self, index: usize) -> Result<SearchLine<'_, LineId>, Self::Error> {
-        self.document
-            .lines()
-            .get(index)
-            .map(|line| SearchLine::new(line.id, line.text.as_str()))
-            .ok_or(DocumentSearchSourceError { index })
+    fn read_line(
+        &mut self,
+        index: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SearchLineRead<'_, LineId>, Self::Error> {
+        let line_id = self
+            .document
+            .line_id_at(index)
+            .ok_or(DocumentSearchSourceError::MissingLine { index })?;
+        match self
+            .bounded_reader
+            .read(self.document, line_id, MAX_SEARCH_LINE_BYTES, cancelled)?
+        {
+            BoundedTextRead::Available { metadata, text } => Ok(SearchLineRead::Searchable(
+                SearchLine::new(metadata.id, text),
+            )),
+            BoundedTextRead::Oversized { metadata } => Ok(SearchLineRead::Oversized {
+                line_id: metadata.id,
+            }),
+            BoundedTextRead::Cancelled => Ok(SearchLineRead::Cancelled),
+        }
     }
 }
 
@@ -242,12 +291,11 @@ fn search_loop(
 ) {
     while let Ok(queued) = requests.recv() {
         let generation = queued.job.task.generation;
+        let document_generation = queued.job.task.document_generation;
         let preview = queued.job.task.preview;
         let cancelled = || latest_sequence.load(Ordering::Acquire) != queued.sequence;
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-            let mut source = DocumentSearchSource {
-                document: &queued.job.document,
-            };
+            let mut source = DocumentSearchSource::new(&queued.job.document);
             scan_source(
                 &queued.job.task.compiled,
                 &mut source,
@@ -258,16 +306,21 @@ fn search_loop(
         let event = match outcome {
             Ok(ScanOutcome::Completed(result)) => SearchWorkerEvent::Completed {
                 generation,
+                document_generation,
                 result,
                 preview,
             },
             Ok(ScanOutcome::Cancelled) => continue,
             Ok(ScanOutcome::Failed(error)) => SearchWorkerEvent::Failed {
                 generation,
+                document_generation,
+                preview,
                 message: format!("search source failed: {error}"),
             },
             Err(_) => SearchWorkerEvent::Failed {
                 generation,
+                document_generation,
+                preview,
                 message: "search worker panicked; current search was discarded".to_owned(),
             },
         };
@@ -306,20 +359,90 @@ fn send_latest_response(
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::cell::Cell;
+    use std::io::{Cursor, Read};
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
     use super::*;
-    use crate::parser::parse_bytes;
+    use crate::ansi::AnsiStripper;
+    use crate::bounded_text::MAX_EAGER_TEXT_RAW_BYTES;
+    use crate::document::{AppendDocumentLine, DocumentBuilder, DocumentError, DocumentSnapshot};
+    use crate::document_store::{CHUNKED_LINE_RAW_BYTES, LineStoreError};
+    use crate::model::LineKind;
     use crate::search::{
         ScanRequest, SearchAnchor, SearchDirection, SearchGeneration, SearchSession,
         compile_smart_case,
     };
+    use crate::storage::StructuralStorage;
+
+    fn document_snapshot_with_display_lengths(
+        input: &[u8],
+        display_lengths: &[usize],
+    ) -> DocumentSnapshot {
+        let raw = AppendStore::new();
+        raw.append(input).unwrap();
+        raw.seal().unwrap();
+        let storage = StructuralStorage::new().unwrap();
+        let mut builder = DocumentBuilder::new(raw, &storage).unwrap();
+        let mut tracker = builder.start_line_tracker().unwrap();
+        let mut stripper = AnsiStripper::default();
+        let mut spans = Vec::new();
+        stripper
+            .push_indexed(0, input, |offset, byte| {
+                if let Some(span) = tracker.observe(offset, byte).unwrap() {
+                    spans.push(span);
+                }
+            })
+            .unwrap();
+        stripper.finish_indexed(|offset, byte| {
+            if let Some(span) = tracker.observe(offset, byte).unwrap() {
+                spans.push(span);
+            }
+        });
+        if let Some(span) = tracker
+            .seal_eof(u64::try_from(input.len()).unwrap())
+            .unwrap()
+        {
+            spans.push(span);
+        }
+        assert_eq!(spans.len(), display_lengths.len());
+        for (span, &display_len) in spans.into_iter().zip(display_lengths) {
+            builder
+                .append_line(
+                    span,
+                    AppendDocumentLine {
+                        display_len,
+                        kind: LineKind::Plain,
+                        commit_id: None,
+                        file_id: None,
+                        hunk_id: None,
+                        old_line_number: None,
+                        new_line_number: None,
+                    },
+                )
+                .unwrap();
+        }
+        builder.mark_complete();
+        builder.snapshot().unwrap()
+    }
+
+    fn osc_prefixed_line(payload_bytes: usize, visible: &[u8]) -> Vec<u8> {
+        let mut input = Vec::with_capacity(
+            b"\x1b]0;".len() + payload_bytes + b"\x07".len() + visible.len() + 1,
+        );
+        input.extend_from_slice(b"\x1b]0;");
+        input.extend(std::iter::repeat_n(b'x', payload_bytes));
+        input.push(b'\x07');
+        input.extend_from_slice(visible);
+        input.push(b'\n');
+        input
+    }
 
     fn search_task(generation: SearchGeneration, pattern: &str) -> SearchTask {
         SearchTask {
             generation,
+            document_generation: DocumentGeneration::default(),
             compiled: compile_smart_case(pattern).unwrap(),
             request: ScanRequest::new(
                 SearchDirection::Forward,
@@ -330,12 +453,59 @@ mod tests {
         }
     }
 
+    struct ChunkReader {
+        chunks: std::vec::IntoIter<Vec<u8>>,
+    }
+
+    impl ChunkReader {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into_iter(),
+            }
+        }
+    }
+
+    impl Read for ChunkReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let Some(chunk) = self.chunks.next() else {
+                return Ok(0);
+            };
+            assert!(chunk.len() <= buffer.len());
+            buffer[..chunk.len()].copy_from_slice(&chunk);
+            Ok(chunk.len())
+        }
+    }
+
     #[test]
-    fn reader_spools_before_publishing_chunks() {
-        let runtime = ReaderRuntime::spawn(Cursor::new(b"hello".to_vec())).unwrap();
+    fn reader_publishes_contiguous_offsets_for_spooled_chunks() {
+        let runtime =
+            ReaderRuntime::spawn(ChunkReader::new(vec![b"ab".to_vec(), b"cde".to_vec()])).unwrap();
         let first = runtime.events.recv_timeout(Duration::from_secs(1)).unwrap();
-        assert!(matches!(first, ReaderEvent::Data(ref bytes) if bytes == b"hello"));
-        assert_eq!(runtime.store.read_range(0..5).unwrap(), b"hello");
+        assert!(matches!(
+            first,
+            ReaderEvent::Data {
+                raw_start: 0,
+                ref bytes,
+            } if bytes == b"ab"
+        ));
+        let second = runtime.events.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(matches!(
+            second,
+            ReaderEvent::Data {
+                raw_start: 2,
+                ref bytes,
+            } if bytes == b"cde"
+        ));
+        assert_eq!(runtime.store.read_range(0..5).unwrap(), b"abcde");
+    }
+
+    #[test]
+    fn reader_seals_store_before_publishing_eof() {
+        let runtime = ReaderRuntime::spawn(Cursor::new(b"hello".to_vec())).unwrap();
+        assert!(matches!(
+            runtime.events.recv_timeout(Duration::from_secs(1)),
+            Ok(ReaderEvent::Data { .. })
+        ));
         assert!(matches!(
             runtime.events.recv_timeout(Duration::from_secs(1)),
             Ok(ReaderEvent::Eof)
@@ -348,10 +518,166 @@ mod tests {
     }
 
     #[test]
+    fn document_search_source_decodes_only_the_requested_line_and_preserves_document_errors() {
+        // 先頭recordだけdisplay lengthを壊す。2行目の取得が成功すれば、source構築時やscan前に
+        // 全lineをdecodeしていないことも同時に固定できる。
+        let document = document_snapshot_with_display_lengths(b"alpha\nbeta\n", &[99, 4]);
+        let mut source = DocumentSearchSource::new(&document);
+
+        assert_eq!(source.line_count(), 2);
+        let second = source.read_line(1, &|| false).unwrap();
+        assert!(matches!(
+            second,
+            SearchLineRead::Searchable(SearchLine {
+                id,
+                text: "beta"
+            }) if id == LineId::new(1)
+        ));
+
+        let error = source.read_line(0, &|| false).unwrap_err();
+        assert!(matches!(
+            error,
+            DocumentSearchSourceError::BoundedText(BoundedTextError::Document(
+                DocumentError::LineStore(LineStoreError::DisplayLengthMismatch { line_id: 0, .. })
+            ))
+        ));
+    }
+
+    #[test]
+    fn metadata_oversized_lines_skip_raw_io_once_in_both_directions() {
+        // Raw textと矛盾するdisplay lengthを持たせる。Metadata判定より先にdecodeすると
+        // DisplayLengthMismatchになるため、Oversized完了そのものがraw未読の回帰検査になる。
+        let document = document_snapshot_with_display_lengths(
+            b"x\nneedle\nz\n",
+            &[MAX_SEARCH_LINE_BYTES + 1, 6, MAX_SEARCH_LINE_BYTES + 1],
+        );
+        let compiled = compile_smart_case("needle").unwrap();
+
+        let mut forward_source = DocumentSearchSource::new(&document);
+        let forward = scan_source(
+            &compiled,
+            &mut forward_source,
+            ScanRequest::new(
+                SearchDirection::Forward,
+                SearchAnchor::BeforeDocument,
+                NonZeroUsize::MIN,
+            ),
+            &|| false,
+        );
+        let ScanOutcome::Completed(forward) = forward else {
+            panic!("forward search completed");
+        };
+        assert_eq!(forward.skipped_oversized_lines, 1);
+        assert_eq!(forward.found.unwrap().line_id, LineId::new(1));
+
+        let mut backward_source = DocumentSearchSource::new(&document);
+        let backward = scan_source(
+            &compiled,
+            &mut backward_source,
+            ScanRequest::new(
+                SearchDirection::Backward,
+                SearchAnchor::AfterDocument,
+                NonZeroUsize::MIN,
+            ),
+            &|| false,
+        );
+        let ScanOutcome::Completed(backward) = backward else {
+            panic!("backward search completed");
+        };
+        assert_eq!(backward.skipped_oversized_lines, 1);
+        assert_eq!(backward.found.unwrap().line_id, LineId::new(1));
+    }
+
+    #[test]
+    fn raw_huge_small_display_line_remains_searchable_from_both_anchor_directions() {
+        let visible = b"needle middle needle";
+        let input = osc_prefixed_line(MAX_SEARCH_LINE_BYTES + 1, visible);
+        let document = document_snapshot_with_display_lengths(&input, &[visible.len()]);
+        let compiled = compile_smart_case("needle").unwrap();
+        let cases = [
+            (SearchDirection::Forward, SearchAnchor::BeforeDocument, 0..6),
+            (SearchDirection::Forward, SearchAnchor::at(0, 1), 14..20),
+            (
+                SearchDirection::Backward,
+                SearchAnchor::AfterDocument,
+                14..20,
+            ),
+            (SearchDirection::Backward, SearchAnchor::at(0, 19), 0..6),
+        ];
+
+        for (direction, anchor, expected_range) in cases {
+            let mut source = DocumentSearchSource::new(&document);
+            let outcome = scan_source(
+                &compiled,
+                &mut source,
+                ScanRequest::new(direction, anchor, NonZeroUsize::MIN),
+                &|| false,
+            );
+            let ScanOutcome::Completed(result) = outcome else {
+                panic!("bounded search completed");
+            };
+            assert_eq!(result.skipped_oversized_lines, 0);
+            assert_eq!(result.found.unwrap().byte_range, expected_range);
+            assert!(
+                source.bounded_reader.large_line_stats().raw_bytes_read
+                    > u64::try_from(MAX_EAGER_TEXT_RAW_BYTES).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_multi_megabyte_line_can_cancel_after_one_streaming_chunk() {
+        let visible_len = MAX_EAGER_TEXT_RAW_BYTES * 2;
+        let mut input = vec![b'a'; visible_len];
+        input.push(b'\n');
+        let document = document_snapshot_with_display_lengths(&input, &[visible_len]);
+        let mut source = DocumentSearchSource::new(&document);
+        let checks = Cell::new(0_usize);
+        let read = source
+            .read_line(0, &|| {
+                let current = checks.get().saturating_add(1);
+                checks.set(current);
+                current >= 3
+            })
+            .unwrap();
+
+        assert!(matches!(read, SearchLineRead::Cancelled));
+        assert_eq!(
+            source.bounded_reader.large_line_stats().raw_bytes_read,
+            u64::try_from(CHUNKED_LINE_RAW_BYTES).unwrap()
+        );
+    }
+
+    #[test]
+    fn ansi_only_payload_checks_cancellation_on_progress_without_visible_units() {
+        let input = osc_prefixed_line(MAX_EAGER_TEXT_RAW_BYTES * 2, b"");
+        let document = document_snapshot_with_display_lengths(&input, &[0]);
+        let mut source = DocumentSearchSource::new(&document);
+        let checks = Cell::new(0_usize);
+        let read = source
+            .read_line(0, &|| {
+                let current = checks.get().saturating_add(1);
+                checks.set(current);
+                current >= 4
+            })
+            .unwrap();
+
+        assert!(matches!(read, SearchLineRead::Cancelled));
+        assert_eq!(
+            source.bounded_reader.large_line_stats().raw_bytes_read,
+            u64::try_from(CHUNKED_LINE_RAW_BYTES * 2).unwrap()
+        );
+    }
+
+    #[test]
     fn search_worker_returns_owned_result() {
         let worker = SearchWorker::spawn().unwrap();
-        let document = Arc::new(parse_bytes(b"alpha\nbeta\n"));
+        let document = Arc::new(document_snapshot_with_display_lengths(
+            b"alpha\nbeta\n",
+            &[5, 4],
+        ));
         let task = search_task(SearchGeneration::default(), "beta");
+        let expected_document_generation = task.document_generation;
         assert!(worker.submit_latest(SearchJob { task, document }));
         let result = worker
             .responses
@@ -360,9 +686,10 @@ mod tests {
         assert!(matches!(
             result,
             SearchWorkerEvent::Completed {
+                document_generation,
                 result: ScanResult { found: Some(_), .. },
                 ..
-            }
+            } if document_generation == expected_document_generation
         ));
     }
 
@@ -377,20 +704,23 @@ mod tests {
     #[test]
     fn submitting_a_replacement_removes_or_suppresses_stale_responses() {
         let worker = SearchWorker::spawn().unwrap();
-        let document = Arc::new(parse_bytes(b"alpha\nbeta\n"));
+        let stale_input = osc_prefixed_line(MAX_EAGER_TEXT_RAW_BYTES * 2, b"alpha");
+        let stale_document = Arc::new(document_snapshot_with_display_lengths(&stale_input, &[5]));
+        let current_document = Arc::new(document_snapshot_with_display_lengths(b"beta\n", &[4]));
         let mut session = SearchSession::<LineId>::default();
         let first_generation = session.begin_navigation_intent();
         let second_generation = session.begin_navigation_intent();
 
         assert!(worker.submit_latest(SearchJob {
-            task: search_task(first_generation, "alpha"),
-            document: Arc::clone(&document),
+            task: search_task(first_generation, "missing"),
+            document: stale_document,
         }));
-        // Workerが先のresultをすでにpublishした場合も、次のsubmitが同じgate内でqueueを空にする。
-        std::thread::sleep(Duration::from_millis(10));
+        // Workerが64 KiB streaming decodeへ入る機会を与える。先のresultをすでにpublishした場合も、
+        // 次のsubmitが同じgate内でresponseを空にするため、submit完了後に旧世代は残らない。
+        std::thread::sleep(Duration::from_millis(1));
         assert!(worker.submit_latest(SearchJob {
             task: search_task(second_generation, "beta"),
-            document,
+            document: current_document,
         }));
 
         let response = worker

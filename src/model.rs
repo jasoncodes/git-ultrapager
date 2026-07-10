@@ -1,8 +1,8 @@
-//! parser、background worker、renderer が共有する append-only document model。
+//! parser、document store、renderer が共有するstructural recordとstable ID。
 //!
-//! commit / file / hunk / logical line は追加時に単調増加 ID を受け取り、後続 chunk の到着で ID
-//! や既存 record の順序を変えない。parser は status、mode、count、hunk kind/range、終端 offset
-//! のような未確定 field だけを更新し、renderer は公開 accessor から同じ record を追跡できる。
+//! commit / file / hunk / logical line は追加時に単調増加 ID を受け取り、後続 chunk の到着でIDや
+//! record順を変えない。Logical-line textとsnapshot ownershipは[`crate::document`]が持ち、このmoduleは
+//! Git structureの値型だけを定義する。
 
 use std::fmt;
 
@@ -21,10 +21,6 @@ macro_rules! stable_id {
 
             pub(crate) const fn new(value: u64) -> Self {
                 Self(value)
-            }
-
-            pub(crate) const fn index(self) -> usize {
-                self.0 as usize
             }
         }
 
@@ -173,40 +169,6 @@ pub enum LineKind {
     Fallback,
 }
 
-/// sanitized input の1 logical line。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DocumentLine {
-    pub id: LineId,
-    /// ANSI sequence を除去し、invalid/control byte を `\\xNN` にした元の1行。
-    pub text: String,
-    pub kind: LineKind,
-    /// plain preamble では `None`。file line は所有 commit group を参照する。
-    pub commit_id: Option<CommitId>,
-    pub file_id: Option<FileId>,
-    pub hunk_id: Option<HunkId>,
-    /// context / deletion line が参照する旧 file 行番号。
-    pub old_line_number: Option<u64>,
-    /// context / addition line が参照する新 file 行番号。
-    pub new_line_number: Option<u64>,
-    /// input で LF により終端された行か。最終 unterminated line だけ `false` になる。
-    pub terminated: bool,
-}
-
-impl DocumentLine {
-    /// source line では diff marker を除いた本文、それ以外では行全体を返す。
-    #[must_use]
-    pub fn content(&self) -> &str {
-        if matches!(
-            self.kind,
-            LineKind::Context | LineKind::Deletion | LineKind::Addition
-        ) {
-            self.text.get(1..).unwrap_or("")
-        } else {
-            &self.text
-        }
-    }
-}
-
 /// standard commit block、または commit header を持たない working-tree group。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Commit {
@@ -268,124 +230,4 @@ pub struct Hunk {
     pub old_range: Option<SourceRange>,
     /// single-parent unified hunk 以外では `None`。
     pub new_range: Option<SourceRange>,
-}
-
-/// parser がstdinの先頭から構築する document 全体。
-///
-/// slice の要素は削除・並べ替えされない。`is_complete` が `false` の間は末尾 record の subject、
-/// status、mode、count、hunk kind/range、span end が後続 chunk により更新される。incremental
-/// consumer は [`crate::parser::ParseDelta`] の `updated_*` ID を invalidate する。
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Document {
-    lines: Vec<DocumentLine>,
-    commits: Vec<Commit>,
-    files: Vec<FileEntry>,
-    hunks: Vec<Hunk>,
-    complete: bool,
-    trailing_newline: bool,
-}
-
-impl Document {
-    #[must_use]
-    pub fn lines(&self) -> &[DocumentLine] {
-        &self.lines
-    }
-
-    #[must_use]
-    pub fn commits(&self) -> &[Commit] {
-        &self.commits
-    }
-
-    #[must_use]
-    pub fn files(&self) -> &[FileEntry] {
-        &self.files
-    }
-
-    #[must_use]
-    pub fn hunks(&self) -> &[Hunk] {
-        &self.hunks
-    }
-
-    #[must_use]
-    pub fn line(&self, id: LineId) -> Option<&DocumentLine> {
-        self.lines.get(id.index())
-    }
-
-    #[must_use]
-    pub fn commit(&self, id: CommitId) -> Option<&Commit> {
-        self.commits.get(id.index())
-    }
-
-    #[must_use]
-    pub fn file(&self, id: FileId) -> Option<&FileEntry> {
-        self.files.get(id.index())
-    }
-
-    #[must_use]
-    pub fn hunk(&self, id: HunkId) -> Option<&Hunk> {
-        self.hunks.get(id.index())
-    }
-
-    /// EOF を受け取り、末尾 record の span と hunk count 検証まで終えたかを返す。
-    #[must_use]
-    pub const fn is_complete(&self) -> bool {
-        self.complete
-    }
-
-    /// sanitized input の最終 byte が LF だったかを返す。
-    #[must_use]
-    pub const fn has_trailing_newline(&self) -> bool {
-        self.trailing_newline
-    }
-
-    /// file grammar を1件も検出していない plain pager document かを返す。
-    #[must_use]
-    pub fn is_plain(&self) -> bool {
-        self.files.is_empty()
-    }
-
-    pub(crate) fn push_line(&mut self, mut line: DocumentLine) -> LineId {
-        let id = LineId::new(self.lines.len() as u64);
-        line.id = id;
-        self.trailing_newline = line.terminated;
-        self.lines.push(line);
-        id
-    }
-
-    pub(crate) fn push_commit(&mut self, mut commit: Commit) -> CommitId {
-        let id = CommitId::new(self.commits.len() as u64);
-        commit.id = id;
-        self.commits.push(commit);
-        id
-    }
-
-    pub(crate) fn push_file(&mut self, mut file: FileEntry) -> FileId {
-        let id = FileId::new(self.files.len() as u64);
-        file.id = id;
-        self.files.push(file);
-        id
-    }
-
-    pub(crate) fn push_hunk(&mut self, mut hunk: Hunk) -> HunkId {
-        let id = HunkId::new(self.hunks.len() as u64);
-        hunk.id = id;
-        self.hunks.push(hunk);
-        id
-    }
-
-    pub(crate) fn commit_mut(&mut self, id: CommitId) -> Option<&mut Commit> {
-        self.commits.get_mut(id.index())
-    }
-
-    pub(crate) fn file_mut(&mut self, id: FileId) -> Option<&mut FileEntry> {
-        self.files.get_mut(id.index())
-    }
-
-    pub(crate) fn hunk_mut(&mut self, id: HunkId) -> Option<&mut Hunk> {
-        self.hunks.get_mut(id.index())
-    }
-
-    pub(crate) fn mark_complete(&mut self) {
-        self.complete = true;
-    }
 }

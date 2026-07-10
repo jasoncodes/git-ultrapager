@@ -1,25 +1,101 @@
-//! sanitized Git output を commit / file / hunk 構造へ変換する incremental parser。
+//! Raw Git outputをstore-backed commit / file / hunk snapshotへ変換するincremental parser。
 //!
-//! parser は repository や Git process を参照せず、stdin に現れた standard header だけを根拠に
-//! model を構築する。single-parent unified diff は source 行番号まで復元し、combined / word /
-//! submodule / binary / malformed section は file identity と navigation anchor を残して raw 表示へ
-//! downgrade する。
+//! Parserはreaderが[`AppendStore`]へcommit済みのchunkとabsolute offsetだけを受け取る。
+//! [`AnsiStripper::push_indexed`]のcallbackでは表示byteとopaque raw-line spanだけを再利用bufferへ集め、
+//! callback終了後にGit grammarを適用する。Line textは未完の末尾1行と解析中1行だけに置き、確定後は
+//! [`DocumentBuilder`]がraw rangeと固定長metadataを保存する。
+//!
+//! 1行の構造更新後にrecord appendが失敗すると、open file countなどを巻き戻せない。最初のfailureで
+//! parserをpoisonし、その後のpush/finish/snapshotを拒否するため、不整合なsnapshotは公開しない。
+//! RepositoryやGit processは参照せず、stdinに現れたstandard headerだけをgrammarの根拠にする。
 
 use std::mem;
 use std::ops::Range;
 
-use crate::ansi::{AnsiStripper, escape_interactive_bytes, escape_path_bytes};
-use crate::model::{
-    ChangeStatus, Commit, CommitId, CommitKind, Document, DocumentLine, FileEntry, FileId,
-    FileMode, Hunk, HunkId, HunkKind, LineId, LineKind, LineSpan, SourceRange,
+use thiserror::Error;
+
+use crate::ansi::{
+    AnsiStripper, EscapeError, MAX_DEFERRED_OUTPUT_BYTES, RawOffsetOverflow,
+    StreamingInteractiveEscaper, escape_path_bytes,
 };
+use crate::document::{AppendDocumentLine, DocumentBuilder, DocumentError, DocumentSnapshot};
+use crate::document_store::{RawLineSpan, RawLineSpanError};
+use crate::input::{AppendStore, StoreError};
+use crate::model::{
+    ChangeStatus, Commit, CommitId, CommitKind, FileEntry, FileId, FileMode, Hunk, HunkId,
+    HunkKind, LineId, LineKind, LineSpan, SourceRange,
+};
+use crate::storage::{StorageError, StructuralStorage};
+use crate::text::MAX_SYNTAX_LINE_BYTES;
+
+/// Git grammarの判定用に保持するescaped prefix上限。
+///
+/// Syntax対象の最大行と同じ1 MiBまでは従来どおり全文をgrammarへ渡す。それを越えたhunk bodyは
+/// markerだけでsource counterを進め、header/path候補はpartial parseせずfallbackへ落とす。
+const GRAMMAR_PREFIX_BYTES: usize = MAX_SYNTAX_LINE_BYTES;
+
+/// Raw event、ANSI boundary、document recordのどこでparseを継続できなくなったかを表すfailure。
+#[derive(Debug, Error)]
+pub enum ParseError {
+    #[error(transparent)]
+    Document(#[from] DocumentError),
+    #[error(transparent)]
+    RawStore(#[from] StoreError),
+    #[error(transparent)]
+    StructuralStorage(#[from] StorageError),
+    #[error(transparent)]
+    Escape(#[from] EscapeError),
+    #[error(transparent)]
+    RawOffsetOverflow(#[from] RawOffsetOverflow),
+    #[error("raw chunk starts at {actual}, but parser expects offset {expected}")]
+    NonContiguousRawChunk { expected: u64, actual: u64 },
+    #[error("raw chunk range {start}..{end} exceeds the append store high-water mark {stored_len}")]
+    RawChunkNotStored {
+        start: u64,
+        end: u64,
+        stored_len: u64,
+    },
+    #[error("raw chunk bytes for {start}..{end} differ from the append store")]
+    RawChunkMismatch { start: u64, end: u64 },
+    #[error("raw input must be sealed before parser EOF is finalized")]
+    RawInputNotSealed,
+    #[error("parser consumed {parsed_len} raw bytes, but sealed input ends at {stored_len}")]
+    RawLengthMismatch { parsed_len: u64, stored_len: u64 },
+    #[error("raw logical-line tracking failed: {message}")]
+    RawLineBoundary { message: String },
+    #[error(
+        "ANSI output contains {line_breaks} displayed line breaks but tracker produced {spans} spans"
+    )]
+    LineBoundaryMismatch { line_breaks: usize, spans: usize },
+    #[error("EOF boundary tracker and pending displayed line disagree")]
+    FinalLineBoundaryMismatch,
+    #[error("could not allocate {requested} bytes for parser {buffer} buffer")]
+    BufferAllocation {
+        buffer: &'static str,
+        requested: usize,
+    },
+    #[error("parser {buffer} buffer length overflow")]
+    BufferLengthOverflow { buffer: &'static str },
+    #[error("cannot push raw input after parser completion")]
+    Finished,
+    #[error("parser is poisoned by an earlier failure")]
+    Poisoned,
+}
+
+impl From<RawLineSpanError> for ParseError {
+    fn from(error: RawLineSpanError) -> Self {
+        Self::RawLineBoundary {
+            message: error.to_string(),
+        }
+    }
+}
 
 /// `push` / `finish` の1回で追加された append-only record 範囲。
 ///
 /// renderer はこの range だけを index/cache へ反映し、既存 ID の再採番を行わない。status や
 /// `updated_*` は呼び出し前から存在し、今回の chunk で field が変わり得る末尾 record を示す。
 /// false positive を許す conservative invalidation なので、cache は append range の追加前に該当 ID
-/// を invalidate し、[`GitParser::document`] から読み直す。
+/// を invalidate し、[`GitParser::snapshot`] から読み直す。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParseDelta {
     pub lines: Range<usize>,
@@ -33,7 +109,7 @@ pub struct ParseDelta {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct Snapshot {
+struct ParserSnapshot {
     lines: usize,
     commits: usize,
     files: usize,
@@ -43,10 +119,10 @@ struct Snapshot {
     open_hunk: Option<HunkId>,
 }
 
-impl Snapshot {
+impl ParserSnapshot {
     fn from_parser(parser: &GitParser) -> Self {
         Self {
-            lines: parser.document.lines().len(),
+            lines: parser.document.line_count(),
             commits: parser.document.commits().len(),
             files: parser.document.files().len(),
             hunks: parser.document.hunks().len(),
@@ -56,9 +132,9 @@ impl Snapshot {
         }
     }
 
-    fn delta(self, document: &Document, completed: bool, may_update: bool) -> ParseDelta {
+    fn delta(self, document: &DocumentBuilder, completed: bool, may_update: bool) -> ParseDelta {
         ParseDelta {
-            lines: self.lines..document.lines().len(),
+            lines: self.lines..document.line_count(),
             commits: self.commits..document.commits().len(),
             files: self.files..document.files().len(),
             hunks: self.hunks..document.hunks().len(),
@@ -84,99 +160,469 @@ type ParsedPaths = Result<(Option<String>, Option<String>), (Option<String>, Opt
 
 /// Git byte stream を行単位で追記する parser。
 ///
-/// `push` は任意の byte/chunk 境界を受け付け、ANSI sequence と partial line を内部に保持する。
-/// EOF では [`GitParser::finish`] を1回呼ぶ。`finish` と完了後の `push` は idempotent で、既存
-/// document を変更しない。
-#[derive(Debug, Default)]
+/// `push`はreaderがraw storeへappendしたchunkのabsolute startを受け取り、ANSI stateとpartial lineを
+/// chunk間で保持する。EOF eventを受けたcallerはraw storeをsealしてから[`GitParser::finish`]を呼ぶ。
+/// `finish`は成功後に繰り返しても空deltaを返すが、完了後の`push`は[`ParseError::Finished`]となる。
+#[derive(Debug)]
 pub struct GitParser {
-    document: Document,
+    raw: AppendStore,
+    raw_cursor: u64,
+    document: DocumentBuilder,
     ansi: AnsiStripper,
-    pending_line: Vec<u8>,
+    tracker: crate::document_store::RawLineTracker,
+    emitted: Vec<u8>,
+    completed_spans: Vec<RawLineSpan>,
+    stored_chunk: Vec<u8>,
+    pending_line: BoundedLineAccumulator,
     current_commit: Option<CommitId>,
     current_file: Option<FileId>,
     current_hunk: Option<HunkCursor>,
     awaiting_new_file_header: bool,
     awaiting_hunk_header: bool,
-    finished: bool,
+    lifecycle: ParserLifecycle,
+}
+
+/// ANSI除去済みbyteを1 logical line分だけ数え、grammar prefixだけを保持する。
+///
+/// CRLF判定には除去後の末尾1 byteが必要なので、`last_byte`はline確定までescaperへ渡さない。
+/// `prefix`は1 MiB、`escaped_chunk`は1 reader chunkの最大4倍に留まり、line全長には比例しない。
+#[derive(Debug, Default)]
+struct BoundedLineAccumulator {
+    escaper: StreamingInteractiveEscaper,
+    last_byte: Option<u8>,
+    prefix: String,
+    escaped_chunk: String,
+    display_len: usize,
+}
+
+impl BoundedLineAccumulator {
+    fn push_sanitized(&mut self, bytes: &[u8]) -> Result<(), ParseError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        if let Some(previous) = self.last_byte.take() {
+            self.escape_part(&[previous])?;
+        }
+        if bytes.len() > 1 {
+            self.escape_part(&bytes[..bytes.len() - 1])?;
+        }
+        self.last_byte = bytes.last().copied();
+        Ok(())
+    }
+
+    fn finish(&mut self, terminated: bool) -> Result<(), ParseError> {
+        if let Some(last) = self.last_byte.take()
+            && !(terminated && last == b'\r')
+        {
+            self.escape_part(&[last])?;
+        }
+        self.escaped_chunk.clear();
+        let _ = self.escaper.finish_into(&mut self.escaped_chunk)?;
+        self.absorb_escaped()?;
+        Ok(())
+    }
+
+    fn escape_part(&mut self, bytes: &[u8]) -> Result<(), ParseError> {
+        self.escaped_chunk.clear();
+        let _ = self.escaper.push_into(bytes, &mut self.escaped_chunk)?;
+        self.absorb_escaped()
+    }
+
+    fn absorb_escaped(&mut self) -> Result<(), ParseError> {
+        self.display_len = self
+            .display_len
+            .checked_add(self.escaped_chunk.len())
+            .ok_or(ParseError::BufferLengthOverflow {
+                buffer: "escaped line length",
+            })?;
+        let remaining = GRAMMAR_PREFIX_BYTES.saturating_sub(self.prefix.len());
+        if remaining == 0 || self.escaped_chunk.is_empty() {
+            return Ok(());
+        }
+        let mut end = remaining.min(self.escaped_chunk.len());
+        while end > 0 && !self.escaped_chunk.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end > 0 {
+            reserve_string_bytes(&mut self.prefix, end, "grammar prefix")?;
+            self.prefix.push_str(&self.escaped_chunk[..end]);
+        }
+        Ok(())
+    }
+
+    fn is_oversized(&self) -> bool {
+        self.display_len > GRAMMAR_PREFIX_BYTES
+    }
+
+    fn has_pending_input(&self) -> bool {
+        self.last_byte.is_some() || self.display_len > 0 || !self.prefix.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.escaper.reset();
+        self.last_byte = None;
+        self.prefix.clear();
+        self.escaped_chunk.clear();
+        self.display_len = 0;
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParserLifecycle {
+    Active,
+    Finished,
+    Poisoned,
 }
 
 impl GitParser {
-    #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    /// Raw storeとstructural budgetへ結び付いた空parserを作る。
+    ///
+    /// Store cloneをreaderがappendし、このparserには同じoffset/byte sliceを順番どおり渡す。Line tracker
+    /// はstore identityごとに1つだけ発行されるため、同じbuilderから2つのparserは作れない。
+    pub fn new(raw: AppendStore, storage: &StructuralStorage) -> Result<Self, ParseError> {
+        let document = DocumentBuilder::new(raw.clone(), storage)?;
+        let tracker = document.start_line_tracker()?;
+        Ok(Self {
+            raw,
+            raw_cursor: 0,
+            document,
+            ansi: AnsiStripper::default(),
+            tracker,
+            emitted: Vec::new(),
+            completed_spans: Vec::new(),
+            stored_chunk: Vec::new(),
+            pending_line: BoundedLineAccumulator::default(),
+            current_commit: None,
+            current_file: None,
+            current_hunk: None,
+            awaiting_new_file_header: false,
+            awaiting_hunk_header: false,
+            lifecycle: ParserLifecycle::Active,
+        })
     }
 
-    /// stdin の次の chunk を取り込み、新しく追加された record range を返す。
-    pub fn push(&mut self, input: &[u8]) -> ParseDelta {
-        let before = Snapshot::from_parser(self);
-        if self.finished {
-            return before.delta(&self.document, true, false);
+    /// Storeへcommit済みの次chunkを取り込み、新しく追加されたrecord rangeを返す。
+    ///
+    /// 同じabsolute rangeをstoreから再読してbyte列の一致を検証する。Grammarとlazy decodeが別の入力を
+    /// 根拠にするとtyped metadataを信用できないため、不一致はrecordを追加する前に拒否する。
+    pub fn push(&mut self, raw_start: u64, input: &[u8]) -> Result<ParseDelta, ParseError> {
+        match self.lifecycle {
+            ParserLifecycle::Finished => return Err(ParseError::Finished),
+            ParserLifecycle::Poisoned => return Err(ParseError::Poisoned),
+            ParserLifecycle::Active => {}
         }
-
-        let mut sanitized = Vec::with_capacity(input.len());
-        self.ansi.push(input, &mut sanitized);
-        self.consume_sanitized(&sanitized);
-        before.delta(&self.document, false, !input.is_empty())
+        let before = ParserSnapshot::from_parser(self);
+        match self.push_active(raw_start, input) {
+            Ok(()) => Ok(before.delta(&self.document, false, !input.is_empty())),
+            Err(error) => {
+                self.lifecycle = ParserLifecycle::Poisoned;
+                Err(error)
+            }
+        }
     }
 
     /// EOF を確定し、unterminated final line と開いている span を閉じる。
-    pub fn finish(&mut self) -> ParseDelta {
-        let before = Snapshot::from_parser(self);
-        if self.finished {
-            return before.delta(&self.document, true, false);
+    pub fn finish(&mut self) -> Result<ParseDelta, ParseError> {
+        match self.lifecycle {
+            ParserLifecycle::Finished => {
+                return Ok(ParserSnapshot::from_parser(self).delta(&self.document, true, false));
+            }
+            ParserLifecycle::Poisoned => return Err(ParseError::Poisoned),
+            ParserLifecycle::Active => {}
+        }
+        let before = ParserSnapshot::from_parser(self);
+        match self.finish_active() {
+            Ok(()) => {
+                self.lifecycle = ParserLifecycle::Finished;
+                Ok(before.delta(&self.document, true, true))
+            }
+            Err(error) => {
+                self.lifecycle = ParserLifecycle::Poisoned;
+                Err(error)
+            }
+        }
+    }
+
+    /// 現在までにcommit済みのlineとstructural generationをcheap snapshotとして返す。
+    pub fn snapshot(&self) -> Result<DocumentSnapshot, ParseError> {
+        if self.lifecycle == ParserLifecycle::Poisoned {
+            return Err(ParseError::Poisoned);
+        }
+        self.document.snapshot().map_err(ParseError::from)
+    }
+
+    /// EOF処理を完了し、最後のsnapshotを返す。Raw storeが未sealならfailureとなる。
+    pub fn into_document(mut self) -> Result<DocumentSnapshot, ParseError> {
+        let _ = self.finish()?;
+        self.snapshot()
+    }
+
+    fn push_active(&mut self, raw_start: u64, input: &[u8]) -> Result<(), ParseError> {
+        if raw_start != self.raw_cursor {
+            return Err(ParseError::NonContiguousRawChunk {
+                expected: self.raw_cursor,
+                actual: raw_start,
+            });
+        }
+        let input_len =
+            u64::try_from(input.len()).map_err(|_| ParseError::BufferLengthOverflow {
+                buffer: "raw chunk",
+            })?;
+        let raw_end = raw_start
+            .checked_add(input_len)
+            .ok_or(ParseError::RawOffsetOverflow(RawOffsetOverflow))?;
+        let status = self.raw.status()?;
+        if raw_end > status.len {
+            return Err(ParseError::RawChunkNotStored {
+                start: raw_start,
+                end: raw_end,
+                stored_len: status.len,
+            });
+        }
+        self.raw
+            .read_range_into(raw_start..raw_end, &mut self.stored_chunk)?;
+        if self.stored_chunk.as_slice() != input {
+            return Err(ParseError::RawChunkMismatch {
+                start: raw_start,
+                end: raw_end,
+            });
         }
 
-        let mut sanitized_tail = Vec::new();
-        self.ansi.finish_into(&mut sanitized_tail);
-        self.consume_sanitized(&sanitized_tail);
-        if !self.pending_line.is_empty() {
-            let bytes = mem::take(&mut self.pending_line);
-            self.process_line(escape_interactive_bytes(&bytes), false);
+        self.collect_indexed(raw_start, input)?;
+        self.raw_cursor = raw_end;
+        self.consume_collected()
+    }
+
+    fn finish_active(&mut self) -> Result<(), ParseError> {
+        let status = self.raw.status()?;
+        if !status.sealed {
+            return Err(ParseError::RawInputNotSealed);
         }
+        if status.len != self.raw_cursor {
+            return Err(ParseError::RawLengthMismatch {
+                parsed_len: self.raw_cursor,
+                stored_len: status.len,
+            });
+        }
+
+        self.collect_indexed_eof()?;
+        self.consume_collected()?;
+        let final_span = self.tracker.seal_eof(status.len)?;
+        self.consume_final_span(final_span)?;
 
         let end = self.next_line_id();
         self.close_file(end);
         self.close_commit(end);
         self.document.mark_complete();
-        self.finished = true;
-        before.delta(&self.document, true, true)
+        Ok(())
     }
 
-    /// 現在までに確定した append-only document を借用する。
-    #[must_use]
-    pub const fn document(&self) -> &Document {
-        &self.document
-    }
+    /// Indexed callbackはgrammar stateへ触れず、事前確保済みbufferへbyte/spanを移すだけにする。
+    fn collect_indexed(&mut self, raw_start: u64, input: &[u8]) -> Result<(), ParseError> {
+        self.emitted.clear();
+        self.completed_spans.clear();
+        let emitted_bound = input.len().checked_add(MAX_DEFERRED_OUTPUT_BYTES).ok_or(
+            ParseError::BufferLengthOverflow {
+                buffer: "ANSI output",
+            },
+        )?;
+        reserve_items(&mut self.emitted, emitted_bound, "ANSI output")?;
+        let raw_line_breaks = input.iter().filter(|byte| **byte == b'\n').count();
+        reserve_items(&mut self.completed_spans, raw_line_breaks, "raw line spans")?;
 
-    /// EOF 処理を行い、所有する document を返す。
-    #[must_use]
-    pub fn into_document(mut self) -> Document {
-        let _ = self.finish();
-        self.document
-    }
-
-    fn consume_sanitized(&mut self, input: &[u8]) {
-        let mut start = 0;
-        for (index, &byte) in input.iter().enumerate() {
-            if byte != b'\n' {
-                continue;
+        let ansi = &mut self.ansi;
+        let tracker = &mut self.tracker;
+        let emitted = &mut self.emitted;
+        let completed_spans = &mut self.completed_spans;
+        let mut boundary_error = None;
+        ansi.push_indexed(raw_start, input, |offset, byte| {
+            emitted.push(byte);
+            if boundary_error.is_some() {
+                return;
             }
-
-            self.pending_line.extend_from_slice(&input[start..index]);
-            if self.pending_line.last() == Some(&b'\r') {
-                let _ = self.pending_line.pop();
+            match tracker.observe(offset, byte) {
+                Ok(Some(span)) => completed_spans.push(span),
+                Ok(None) => {}
+                Err(error) => boundary_error = Some(error),
             }
-            let bytes = mem::take(&mut self.pending_line);
-            self.process_line(escape_interactive_bytes(&bytes), true);
-            start = index.saturating_add(1);
+        })?;
+        if let Some(error) = boundary_error {
+            return Err(error.into());
         }
-        self.pending_line.extend_from_slice(&input[start..]);
+        Ok(())
     }
 
-    fn process_line(&mut self, text: String, terminated: bool) {
+    fn collect_indexed_eof(&mut self) -> Result<(), ParseError> {
+        self.emitted.clear();
+        self.completed_spans.clear();
+        reserve_items(
+            &mut self.emitted,
+            MAX_DEFERRED_OUTPUT_BYTES,
+            "ANSI EOF output",
+        )?;
+        reserve_items(
+            &mut self.completed_spans,
+            MAX_DEFERRED_OUTPUT_BYTES,
+            "raw EOF line spans",
+        )?;
+
+        let tracker = &mut self.tracker;
+        let emitted = &mut self.emitted;
+        let completed_spans = &mut self.completed_spans;
+        let mut boundary_error = None;
+        self.ansi.finish_indexed(|offset, byte| {
+            emitted.push(byte);
+            if boundary_error.is_some() {
+                return;
+            }
+            match tracker.observe(offset, byte) {
+                Ok(Some(span)) => completed_spans.push(span),
+                Ok(None) => {}
+                Err(error) => boundary_error = Some(error),
+            }
+        });
+        if let Some(error) = boundary_error {
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
+    fn consume_collected(&mut self) -> Result<(), ParseError> {
+        let mut emitted = mem::take(&mut self.emitted);
+        let mut spans = mem::take(&mut self.completed_spans);
+        let mut pending = mem::take(&mut self.pending_line);
+
+        let outcome = self.consume_buffers(&emitted, &mut spans, &mut pending);
+        emitted.clear();
+        spans.clear();
+        self.emitted = emitted;
+        self.completed_spans = spans;
+        self.pending_line = pending;
+        outcome
+    }
+
+    fn consume_buffers(
+        &mut self,
+        emitted: &[u8],
+        spans: &mut Vec<RawLineSpan>,
+        pending: &mut BoundedLineAccumulator,
+    ) -> Result<(), ParseError> {
+        let line_breaks = emitted.iter().filter(|byte| **byte == b'\n').count();
+        if line_breaks != spans.len() {
+            return Err(ParseError::LineBoundaryMismatch {
+                line_breaks,
+                spans: spans.len(),
+            });
+        }
+
+        let mut start = 0_usize;
+        for span in spans.drain(..) {
+            let relative_end = emitted
+                .get(start..)
+                .and_then(|tail| tail.iter().position(|byte| *byte == b'\n'))
+                .ok_or(ParseError::LineBoundaryMismatch {
+                    line_breaks,
+                    spans: line_breaks,
+                })?;
+            let end = start + relative_end;
+            pending.push_sanitized(&emitted[start..end])?;
+            pending.finish(true)?;
+            self.process_accumulated_line(pending, span)?;
+            pending.reset();
+            start = end.saturating_add(1);
+        }
+        pending.push_sanitized(&emitted[start..])
+    }
+
+    fn consume_final_span(&mut self, span: Option<RawLineSpan>) -> Result<(), ParseError> {
+        let mut pending = mem::take(&mut self.pending_line);
+        let outcome = match (span, pending.has_pending_input()) {
+            (None, false) => Ok(()),
+            (Some(span), true) => {
+                pending.finish(false)?;
+                self.process_accumulated_line(&pending, span)
+            }
+            (None, true) | (Some(_), false) => Err(ParseError::FinalLineBoundaryMismatch),
+        };
+        if outcome.is_ok() {
+            pending.reset();
+        }
+        self.pending_line = pending;
+        outcome
+    }
+
+    fn process_accumulated_line(
+        &mut self,
+        pending: &BoundedLineAccumulator,
+        span: RawLineSpan,
+    ) -> Result<(), ParseError> {
+        if pending.is_oversized() {
+            self.process_oversized_line(&pending.prefix, pending.display_len, span)
+        } else {
+            debug_assert_eq!(pending.prefix.len(), pending.display_len);
+            self.process_line(&pending.prefix, span)
+        }
+    }
+
+    /// Grammar prefixを越えたlineを、全文を参照せずappendする。
+    ///
+    /// Unified hunk bodyは先頭markerとcursorだけで分類できるため、行番号・追加削除countを通常行と同じ
+    /// ように進める。それ以外のfile内巨大行はpath/headerの末尾を見ずに解釈すると誤ったstructureを
+    /// 作るためfileをMalformedへ落とす。File外ではcommit headerをpartial parseせずplain textとして
+    /// current commitとの所有関係だけを維持する。
+    fn process_oversized_line(
+        &mut self,
+        prefix: &str,
+        display_len: usize,
+        span: RawLineSpan,
+    ) -> Result<(), ParseError> {
+        if self.current_file.is_none() {
+            return self.append_line(
+                span,
+                display_len,
+                LineKind::Plain,
+                self.current_commit,
+                None,
+                None,
+                None,
+                None,
+            );
+        }
+
+        if self.current_hunk.is_some() {
+            if self.current_file_mode() == Some(FileMode::Rich) {
+                if let Some((kind, old_line, new_line)) = self.consume_rich_hunk_line(prefix) {
+                    return self.append_current_file_line(
+                        span,
+                        display_len,
+                        kind,
+                        old_line,
+                        new_line,
+                    );
+                }
+                self.mark_current_file_mode(FileMode::Malformed);
+                return self.append_current_file_line(
+                    span,
+                    display_len,
+                    LineKind::Fallback,
+                    None,
+                    None,
+                );
+            }
+            let kind = line_kind_for_mode(self.current_file_mode().unwrap_or(FileMode::Malformed));
+            return self.append_current_file_line(span, display_len, kind, None, None);
+        }
+
+        self.awaiting_new_file_header = false;
+        self.awaiting_hunk_header = false;
+        self.mark_current_file_mode(FileMode::Malformed);
+        self.append_current_file_line(span, display_len, LineKind::Fallback, None, None)
+    }
+
+    fn process_line(&mut self, text: &str, span: RawLineSpan) -> Result<(), ParseError> {
         let line_id = self.next_line_id();
 
-        if let Some(object_id) = parse_commit_header(&text) {
+        if let Some(object_id) = parse_commit_header(text) {
             self.close_file(line_id);
             self.close_commit(line_id);
             let commit_id = self.document.push_commit(Commit {
@@ -188,9 +634,9 @@ impl GitParser {
                 file_ids: Vec::new(),
             });
             self.current_commit = Some(commit_id);
-            self.append_line(
-                text,
-                terminated,
+            return self.append_line(
+                span,
+                text.len(),
                 LineKind::CommitHeader,
                 Some(commit_id),
                 None,
@@ -198,12 +644,11 @@ impl GitParser {
                 None,
                 None,
             );
-            return;
         }
 
         // `--submodule=log` は環境によって `diff --git` を出さず、summary 行から始まる。
         // その場合も外側の submodule path を1 file occurrence として navigation 対象にする。
-        if let Some(path) = parse_submodule_path(&text) {
+        if let Some(path) = parse_submodule_path(text) {
             let belongs_to_current = self
                 .current_file
                 .and_then(|id| self.document.file(id))
@@ -214,24 +659,39 @@ impl GitParser {
                     Ok((Some(path.clone()), Some(path))),
                     FileMode::Submodule,
                     line_id,
-                );
+                )?;
             } else {
                 self.mark_current_file_mode(FileMode::Submodule);
             }
-            self.append_current_file_line(text, terminated, LineKind::Submodule, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::Submodule,
+                None,
+                None,
+            );
         }
 
         if let Some(rest) = text.strip_prefix("diff --git ") {
             let paths = parse_diff_git_paths(rest);
             if self.paths_are_inside_current_submodule(&paths) {
                 self.close_hunk(line_id);
-                self.append_current_file_line(text, terminated, LineKind::Submodule, None, None);
-                return;
+                return self.append_current_file_line(
+                    span,
+                    text.len(),
+                    LineKind::Submodule,
+                    None,
+                    None,
+                );
             }
-            self.start_file(paths, FileMode::Rich, line_id);
-            self.append_current_file_line(text, terminated, LineKind::DiffHeader, None, None);
-            return;
+            self.start_file(paths, FileMode::Rich, line_id)?;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::DiffHeader,
+                None,
+                None,
+            );
         }
 
         if let Some(rest) = text
@@ -242,19 +702,24 @@ impl GitParser {
             let paths = path
                 .map(|value| (Some(value.clone()), Some(value)))
                 .ok_or((None, None));
-            self.start_file(paths, FileMode::Combined, line_id);
-            self.append_current_file_line(text, terminated, LineKind::DiffHeader, None, None);
-            return;
+            self.start_file(paths, FileMode::Combined, line_id)?;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::DiffHeader,
+                None,
+                None,
+            );
         }
 
         if self.current_file.is_some() {
-            self.process_file_line(text, terminated, line_id);
+            self.process_file_line(text, span, line_id)
         } else {
-            self.process_non_file_line(text, terminated);
+            self.process_non_file_line(text, span)
         }
     }
 
-    fn process_non_file_line(&mut self, text: String, terminated: bool) {
+    fn process_non_file_line(&mut self, text: &str, span: RawLineSpan) -> Result<(), ParseError> {
         let commit_id = self.current_commit;
         let kind = if let Some(id) = commit_id {
             if text.starts_with("    ") {
@@ -276,15 +741,20 @@ impl GitParser {
             LineKind::Plain
         };
 
-        self.append_line(text, terminated, kind, commit_id, None, None, None, None);
+        self.append_line(span, text.len(), kind, commit_id, None, None, None, None)
     }
 
-    fn process_file_line(&mut self, text: String, terminated: bool, line_id: LineId) {
+    fn process_file_line(
+        &mut self,
+        text: &str,
+        span: RawLineSpan,
+        line_id: LineId,
+    ) -> Result<(), ParseError> {
         if self.awaiting_new_file_header && !text.starts_with("+++ ") {
             self.mark_current_file_mode(FileMode::Malformed);
             self.awaiting_new_file_header = false;
         }
-        if self.awaiting_hunk_header && !text.starts_with("@@") && !is_binary_line(&text) {
+        if self.awaiting_hunk_header && !text.starts_with("@@") && !is_binary_line(text) {
             self.mark_current_file_mode(FileMode::Malformed);
             self.awaiting_hunk_header = false;
         }
@@ -293,117 +763,193 @@ impl GitParser {
             self.awaiting_hunk_header = false;
             self.close_hunk(line_id);
             self.mark_current_file_mode(FileMode::Combined);
-            self.start_fallback_hunk(line_id, HunkKind::Combined);
-            self.append_current_file_line(text, terminated, LineKind::HunkHeader, None, None);
-            return;
+            self.start_fallback_hunk(line_id, HunkKind::Combined)?;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::HunkHeader,
+                None,
+                None,
+            );
         }
 
         if text.starts_with("@@") {
             self.awaiting_hunk_header = false;
             self.close_hunk(line_id);
-            if let Some((old_range, new_range)) = parse_unified_hunk_header(&text) {
+            if let Some((old_range, new_range)) = parse_unified_hunk_header(text) {
                 let mode = self.current_file_mode().unwrap_or(FileMode::Malformed);
                 if mode.is_rich() {
-                    self.start_unified_hunk(line_id, old_range, new_range);
+                    self.start_unified_hunk(line_id, old_range, new_range)?;
                 } else {
-                    self.start_fallback_hunk(line_id, hunk_kind_for_mode(mode));
+                    self.start_fallback_hunk(line_id, hunk_kind_for_mode(mode))?;
                 }
             } else {
                 self.mark_current_file_mode(FileMode::Malformed);
-                self.start_fallback_hunk(line_id, HunkKind::Malformed);
+                self.start_fallback_hunk(line_id, HunkKind::Malformed)?;
             }
-            self.append_current_file_line(text, terminated, LineKind::HunkHeader, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::HunkHeader,
+                None,
+                None,
+            );
         }
 
         if text == "\\ No newline at end of file" {
-            self.append_current_file_line(text, terminated, LineKind::NoNewlineMarker, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::NoNewlineMarker,
+                None,
+                None,
+            );
         }
 
-        if is_binary_line(&text) {
+        if is_binary_line(text) {
             self.awaiting_hunk_header = false;
             self.mark_current_file_mode(FileMode::Binary);
-            self.append_current_file_line(text, terminated, LineKind::Binary, None, None);
-            return;
+            return self.append_current_file_line(span, text.len(), LineKind::Binary, None, None);
         }
 
         if self.current_hunk.is_some() {
             if self.current_file_mode() == Some(FileMode::Rich) {
-                if let Some((kind, old_line, new_line)) = self.consume_rich_hunk_line(&text) {
-                    self.append_current_file_line(text, terminated, kind, old_line, new_line);
-                } else if is_word_diff_line(&text) {
+                if let Some((kind, old_line, new_line)) = self.consume_rich_hunk_line(text) {
+                    return self.append_current_file_line(
+                        span,
+                        text.len(),
+                        kind,
+                        old_line,
+                        new_line,
+                    );
+                } else if is_word_diff_line(text) {
                     self.mark_current_file_mode(FileMode::WordDiff);
-                    self.append_current_file_line(text, terminated, LineKind::Fallback, None, None);
-                } else if is_submodule_line(&text) {
+                    return self.append_current_file_line(
+                        span,
+                        text.len(),
+                        LineKind::Fallback,
+                        None,
+                        None,
+                    );
+                } else if is_submodule_line(text) {
                     self.mark_current_file_mode(FileMode::Submodule);
-                    self.append_current_file_line(
-                        text,
-                        terminated,
+                    return self.append_current_file_line(
+                        span,
+                        text.len(),
                         LineKind::Submodule,
                         None,
                         None,
                     );
                 } else {
                     self.mark_current_file_mode(FileMode::Malformed);
-                    self.append_current_file_line(text, terminated, LineKind::Fallback, None, None);
+                    return self.append_current_file_line(
+                        span,
+                        text.len(),
+                        LineKind::Fallback,
+                        None,
+                        None,
+                    );
                 }
             } else {
                 let kind =
                     line_kind_for_mode(self.current_file_mode().unwrap_or(FileMode::Malformed));
-                self.append_current_file_line(text, terminated, kind, None, None);
+                return self.append_current_file_line(span, text.len(), kind, None, None);
             }
-            return;
         }
 
         // inline submodule diff の `index` / `---` / `+++` は外側 file の path/status を
         // 上書きしてはならない。hunk header は上で navigation anchor として記録済みである。
         if self.current_file_mode() == Some(FileMode::Submodule) {
-            self.append_current_file_line(text, terminated, LineKind::Submodule, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::Submodule,
+                None,
+                None,
+            );
         }
 
-        if is_gitlink_metadata(&text) {
+        if is_gitlink_metadata(text) {
             self.mark_current_file_mode(FileMode::Submodule);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
 
         if let Some(path) = text.strip_prefix("rename from ") {
             self.update_extended_path(path, true, ChangeStatus::Renamed);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
         if let Some(path) = text.strip_prefix("rename to ") {
             self.update_extended_path(path, false, ChangeStatus::Renamed);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
         if let Some(path) = text.strip_prefix("copy from ") {
             self.update_extended_path(path, true, ChangeStatus::Copied);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
         if let Some(path) = text.strip_prefix("copy to ") {
             self.update_extended_path(path, false, ChangeStatus::Copied);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
         if text.starts_with("new file mode ") {
             self.update_status(ChangeStatus::Added);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
         if text.starts_with("deleted file mode ") {
             self.update_status(ChangeStatus::Deleted);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
         if let Some(path) = text.strip_prefix("--- ") {
             self.awaiting_new_file_header = true;
             self.update_source_path(path, true);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
         if let Some(path) = text.strip_prefix("+++ ") {
             if !self.awaiting_new_file_header {
@@ -412,12 +958,17 @@ impl GitParser {
             self.awaiting_new_file_header = false;
             self.awaiting_hunk_header = true;
             self.update_source_path(path, false);
-            self.append_current_file_line(text, terminated, LineKind::FileMetadata, None, None);
-            return;
+            return self.append_current_file_line(
+                span,
+                text.len(),
+                LineKind::FileMetadata,
+                None,
+                None,
+            );
         }
 
         let kind = line_kind_for_mode(self.current_file_mode().unwrap_or(FileMode::Malformed));
-        self.append_current_file_line(text, terminated, kind, None, None);
+        self.append_current_file_line(span, text.len(), kind, None, None)
     }
 
     fn consume_rich_hunk_line(
@@ -475,7 +1026,12 @@ impl GitParser {
         Some((kind, old_line, new_line))
     }
 
-    fn start_file(&mut self, paths: ParsedPaths, requested_mode: FileMode, line_id: LineId) {
+    fn start_file(
+        &mut self,
+        paths: ParsedPaths,
+        requested_mode: FileMode,
+        line_id: LineId,
+    ) -> Result<(), ParseError> {
         self.close_file(line_id);
         let commit_id = self.ensure_working_commit(line_id);
         let (old_path, new_path, mode) = match paths {
@@ -499,13 +1055,11 @@ impl GitParser {
             hunk_ids: Vec::new(),
             additions: counts,
             deletions: counts,
-        });
-        if let Some(commit) = self.document.commit_mut(commit_id) {
-            commit.file_ids.push(file_id);
-        }
+        })?;
         self.current_file = Some(file_id);
         self.awaiting_new_file_header = false;
         self.awaiting_hunk_header = false;
+        Ok(())
     }
 
     fn ensure_working_commit(&mut self, line_id: LineId) -> CommitId {
@@ -530,9 +1084,9 @@ impl GitParser {
         line_id: LineId,
         old_range: SourceRange,
         new_range: SourceRange,
-    ) {
+    ) -> Result<(), ParseError> {
         let Some(file_id) = self.current_file else {
-            return;
+            return Ok(());
         };
         let hunk_id = self.document.push_hunk(Hunk {
             id: HunkId::new(0),
@@ -542,10 +1096,7 @@ impl GitParser {
             span: LineSpan::open(line_id),
             old_range: Some(old_range),
             new_range: Some(new_range),
-        });
-        if let Some(file) = self.document.file_mut(file_id) {
-            file.hunk_ids.push(hunk_id);
-        }
+        })?;
         self.current_hunk = Some(HunkCursor {
             id: hunk_id,
             old_next: old_range.start,
@@ -553,11 +1104,12 @@ impl GitParser {
             old_remaining: old_range.count,
             new_remaining: new_range.count,
         });
+        Ok(())
     }
 
-    fn start_fallback_hunk(&mut self, line_id: LineId, kind: HunkKind) {
+    fn start_fallback_hunk(&mut self, line_id: LineId, kind: HunkKind) -> Result<(), ParseError> {
         let Some(file_id) = self.current_file else {
-            return;
+            return Ok(());
         };
         let hunk_id = self.document.push_hunk(Hunk {
             id: HunkId::new(0),
@@ -567,10 +1119,7 @@ impl GitParser {
             span: LineSpan::open(line_id),
             old_range: None,
             new_range: None,
-        });
-        if let Some(file) = self.document.file_mut(file_id) {
-            file.hunk_ids.push(hunk_id);
-        }
+        })?;
         self.current_hunk = Some(HunkCursor {
             id: hunk_id,
             old_next: 0,
@@ -578,6 +1127,7 @@ impl GitParser {
             old_remaining: 0,
             new_remaining: 0,
         });
+        Ok(())
     }
 
     fn close_hunk(&mut self, end: LineId) {
@@ -750,64 +1300,99 @@ impl GitParser {
 
     fn append_current_file_line(
         &mut self,
-        text: String,
-        terminated: bool,
+        span: RawLineSpan,
+        display_len: usize,
         kind: LineKind,
         old_line_number: Option<u64>,
         new_line_number: Option<u64>,
-    ) {
+    ) -> Result<(), ParseError> {
         let file_id = self.current_file;
         let commit_id = file_id
             .and_then(|id| self.document.file(id))
             .map(|file| file.commit_id);
         let hunk_id = self.current_hunk.map(|cursor| cursor.id);
         self.append_line(
-            text,
-            terminated,
+            span,
+            display_len,
             kind,
             commit_id,
             file_id,
             hunk_id,
             old_line_number,
             new_line_number,
-        );
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
     fn append_line(
         &mut self,
-        text: String,
-        terminated: bool,
+        span: RawLineSpan,
+        display_len: usize,
         kind: LineKind,
         commit_id: Option<CommitId>,
         file_id: Option<FileId>,
         hunk_id: Option<HunkId>,
         old_line_number: Option<u64>,
         new_line_number: Option<u64>,
-    ) {
-        let _ = self.document.push_line(DocumentLine {
-            id: LineId::new(0),
-            text,
-            kind,
-            commit_id,
-            file_id,
-            hunk_id,
-            old_line_number,
-            new_line_number,
-            terminated,
-        });
+    ) -> Result<(), ParseError> {
+        let _ = self.document.append_line(
+            span,
+            AppendDocumentLine {
+                display_len,
+                kind,
+                commit_id,
+                file_id,
+                hunk_id,
+                old_line_number,
+                new_line_number,
+            },
+        )?;
+        Ok(())
     }
 
     fn next_line_id(&self) -> LineId {
-        LineId::new(self.document.lines().len() as u64)
+        LineId::new(self.document.line_count() as u64)
     }
 }
 
-/// byte slice 全体を解析し、EOF 済み document を返す。
-#[must_use]
-pub fn parse_bytes(input: &[u8]) -> Document {
-    let mut parser = GitParser::new();
-    let _ = parser.push(input);
+fn reserve_items<T>(
+    buffer: &mut Vec<T>,
+    requested: usize,
+    name: &'static str,
+) -> Result<(), ParseError> {
+    buffer
+        .try_reserve(requested)
+        .map_err(|_| ParseError::BufferAllocation {
+            buffer: name,
+            requested,
+        })
+}
+
+fn reserve_string_bytes(
+    buffer: &mut String,
+    additional: usize,
+    name: &'static str,
+) -> Result<(), ParseError> {
+    let requested = buffer
+        .len()
+        .checked_add(additional)
+        .ok_or(ParseError::BufferLengthOverflow { buffer: name })?;
+    buffer
+        .try_reserve(additional)
+        .map_err(|_| ParseError::BufferAllocation {
+            buffer: name,
+            requested,
+        })
+}
+
+/// Byte slice全体を独立raw storeへappendし、EOF済みsnapshotとして返す。
+pub fn parse_bytes(input: &[u8]) -> Result<DocumentSnapshot, ParseError> {
+    let raw = AppendStore::new();
+    let storage = StructuralStorage::new()?;
+    let mut parser = GitParser::new(raw.clone(), &storage)?;
+    let raw_start = raw.append(input)?;
+    let _ = parser.push(raw_start, input)?;
+    let _ = raw.seal()?;
     parser.into_document()
 }
 
@@ -965,7 +1550,12 @@ fn parse_source_range(value: &str, marker: u8) -> Option<SourceRange> {
         return None;
     }
     if count > 0 {
-        let _ = start.checked_add(count.saturating_sub(1))?;
+        let last = start.checked_add(count.saturating_sub(1))?;
+        // Fixed line metadataは`u64::MAX`を`None` sentinelに使う。最後に発行する番号がsentinelへ
+        // 到達するrangeはrich lineとして保存できないため、header全体をmalformed fallbackへ送る。
+        if last == u64::MAX {
+            return None;
+        }
     }
     Some(SourceRange { start, count })
 }
@@ -1082,5 +1672,61 @@ fn line_kind_for_mode(mode: FileMode) -> LineKind {
         FileMode::Submodule => LineKind::Submodule,
         FileMode::Rich => LineKind::FileMetadata,
         FileMode::Combined | FileMode::WordDiff | FileMode::Malformed => LineKind::Fallback,
+    }
+}
+
+#[cfg(test)]
+mod bounded_line_tests {
+    use super::*;
+    use crate::document::{DocumentLineMetadataReader, DocumentLineReader};
+
+    fn push(parser: &mut GitParser, raw: &AppendStore, bytes: &[u8]) {
+        let start = raw.append(bytes).unwrap();
+        let _ = parser.push(start, bytes).unwrap();
+    }
+
+    #[test]
+    fn sixty_four_mib_hunk_line_keeps_parser_buffers_bounded_and_advances_source_numbers() {
+        let raw = AppendStore::new();
+        let storage = StructuralStorage::new().unwrap();
+        let mut parser = GitParser::new(raw.clone(), &storage).unwrap();
+        push(
+            &mut parser,
+            &raw,
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,2 @@\n",
+        );
+
+        let chunk = vec![b'a'; 32 * 1024];
+        push(&mut parser, &raw, b"+");
+        for _ in 0..(64 * 1024 * 1024 / chunk.len()) {
+            push(&mut parser, &raw, &chunk);
+        }
+        assert_eq!(parser.pending_line.prefix.len(), GRAMMAR_PREFIX_BYTES);
+        assert!(parser.pending_line.prefix.capacity() <= GRAMMAR_PREFIX_BYTES * 2);
+        assert!(parser.pending_line.escaped_chunk.capacity() <= chunk.len() * 8);
+        assert!(parser.emitted.capacity() <= chunk.len() * 2);
+        assert!(parser.stored_chunk.capacity() <= chunk.len() * 2);
+
+        push(&mut parser, &raw, b"\n+next\n");
+        raw.seal().unwrap();
+        let snapshot = parser.into_document().unwrap();
+        let mut metadata_reader = DocumentLineMetadataReader::new();
+        let additions = (0..snapshot.line_count())
+            .filter_map(|index| {
+                let id = snapshot.line_id_at(index).unwrap();
+                metadata_reader.read(&snapshot, id).unwrap()
+            })
+            .filter(|line| line.kind == LineKind::Addition)
+            .collect::<Vec<_>>();
+
+        assert_eq!(additions.len(), 2);
+        assert_eq!(additions[0].new_line_number, Some(1));
+        assert_eq!(additions[1].new_line_number, Some(2));
+        let second = DocumentLineReader::new()
+            .read_owned(&snapshot, additions[1].id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.text, "+next");
+        assert_eq!(snapshot.files()[0].additions, Some(2));
     }
 }

@@ -5,7 +5,7 @@ use git_ultrapager::decorations::DecorationSet;
 use git_ultrapager::parser::parse_bytes;
 use git_ultrapager::state::AppState;
 use git_ultrapager::theme::{ColorLevel, Theme};
-use git_ultrapager::ui::render;
+use git_ultrapager::ui::{FrameLines, render};
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::{Buffer, Cell};
@@ -61,14 +61,17 @@ fn render_snapshot(
     theme_choice: ThemeChoice,
     color_level: ColorLevel,
 ) -> String {
-    let document = Arc::new(parse_bytes(UNICODE_DIFF.as_bytes()));
-    let state = AppState::new(document, width, height, 4, WhitespaceChoice::Ignore, true);
+    let document = Arc::new(parse_bytes(UNICODE_DIFF.as_bytes()).expect("fixture parse failed"));
+    let state = AppState::new(document, width, height, 4, WhitespaceChoice::Ignore, true)
+        .expect("state layout failed");
     let theme = Theme::new(theme_choice, color_level);
-    let decorations = DecorationSet::compute(state.document(), &theme, state.whitespace());
+    let decorations = DecorationSet::compute(state.document(), &theme, state.whitespace())
+        .expect("decoration computation failed");
+    let lines = FrameLines::load(&state).expect("frame line decode failed");
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend の初期化に失敗した");
     terminal
-        .draw(|frame| render(frame, &state, &theme, &decorations))
+        .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
         .expect("cell grid の描画に失敗した");
 
     semantic_grid(terminal.backend().buffer())

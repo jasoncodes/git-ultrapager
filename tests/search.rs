@@ -3,8 +3,9 @@ use std::num::NonZeroUsize;
 
 use git_ultrapager::search::{
     CommitIncrementalError, IncrementalQueryStatus, RepeatCommand, ScanOutcome, ScanRequest,
-    ScanResult, SearchAnchor, SearchDirection, SearchHistory, SearchLine, SearchSession,
-    SearchSource, compile_smart_case, match_spans_in_line, repeat_anchor, scan_lines, scan_source,
+    ScanResult, SearchAnchor, SearchDirection, SearchHistory, SearchLine, SearchLineRead,
+    SearchSession, SearchSource, compile_smart_case, match_spans_in_line, repeat_anchor,
+    scan_lines, scan_source,
 };
 use git_ultrapager::text::MAX_SEARCH_LINE_BYTES;
 
@@ -25,16 +26,29 @@ impl SearchSource<usize> for CountingSource {
         self.lines.len()
     }
 
-    fn line(&mut self, index: usize) -> Result<SearchLine<'_, usize>, Self::Error> {
+    fn read_line(
+        &mut self,
+        index: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SearchLineRead<'_, usize>, Self::Error> {
+        if cancelled() {
+            return Ok(SearchLineRead::Cancelled);
+        }
         self.accesses.set(self.accesses.get().saturating_add(1));
         if self.fail_at == Some(index) {
             return Err("page read failed");
         }
-        self.lines
+        let line = self
+            .lines
             .get(index)
             .copied()
             .map(|text| SearchLine::new(index, text))
-            .ok_or("line missing")
+            .ok_or("line missing")?;
+        if line.text.len() > MAX_SEARCH_LINE_BYTES {
+            Ok(SearchLineRead::Oversized { line_id: line.id })
+        } else {
+            Ok(SearchLineRead::Searchable(line))
+        }
     }
 }
 
@@ -44,6 +58,35 @@ struct ReusingBufferSource {
     buffer: String,
 }
 
+struct ClassifiedSource {
+    lines: Vec<Option<&'static str>>,
+    accesses: Vec<usize>,
+}
+
+impl SearchSource<usize> for ClassifiedSource {
+    type Error = ();
+
+    fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn read_line(
+        &mut self,
+        index: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SearchLineRead<'_, usize>, Self::Error> {
+        if cancelled() {
+            return Ok(SearchLineRead::Cancelled);
+        }
+        let access = self.accesses.get_mut(index).ok_or(())?;
+        *access = access.saturating_add(1);
+        match self.lines.get(index).ok_or(())? {
+            Some(text) => Ok(SearchLineRead::Searchable(SearchLine::new(index, text))),
+            None => Ok(SearchLineRead::Oversized { line_id: index }),
+        }
+    }
+}
+
 impl SearchSource<usize> for ReusingBufferSource {
     type Error = ();
 
@@ -51,7 +94,14 @@ impl SearchSource<usize> for ReusingBufferSource {
         self.line_count
     }
 
-    fn line(&mut self, index: usize) -> Result<SearchLine<'_, usize>, Self::Error> {
+    fn read_line(
+        &mut self,
+        index: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SearchLineRead<'_, usize>, Self::Error> {
+        if cancelled() {
+            return Ok(SearchLineRead::Cancelled);
+        }
         if index >= self.line_count {
             return Err(());
         }
@@ -59,7 +109,10 @@ impl SearchSource<usize> for ReusingBufferSource {
         self.buffer.clear();
         self.buffer
             .push_str(if index == 0 { "needle" } else { "haystack" });
-        Ok(SearchLine::new(index, &self.buffer))
+        Ok(SearchLineRead::Searchable(SearchLine::new(
+            index,
+            &self.buffer,
+        )))
     }
 }
 
@@ -164,6 +217,94 @@ fn accessor_scan_does_not_preload_a_large_virtual_document() {
         ScanOutcome::Completed(ScanResult { found: Some(_), .. })
     ));
     assert_eq!(source.accesses, 1);
+}
+
+#[test]
+fn anchor_line_is_read_once_in_each_direction() {
+    let compiled = compile_smart_case("needle").expect("valid regex");
+    let mut forward = ClassifiedSource {
+        lines: vec![Some("before"), Some("needle")],
+        accesses: vec![0; 2],
+    };
+    let outcome = scan_source(
+        &compiled,
+        &mut forward,
+        ScanRequest::new(SearchDirection::Forward, SearchAnchor::at(1, 0), count(1)),
+        &|| false,
+    );
+    assert!(matches!(
+        outcome,
+        ScanOutcome::Completed(ScanResult { found: Some(_), .. })
+    ));
+    assert_eq!(forward.accesses, vec![0, 1]);
+
+    let mut backward = ClassifiedSource {
+        lines: vec![Some("before"), Some("needle")],
+        accesses: vec![0; 2],
+    };
+    let outcome = scan_source(
+        &compiled,
+        &mut backward,
+        ScanRequest::new(
+            SearchDirection::Backward,
+            SearchAnchor::AfterDocument,
+            count(1),
+        ),
+        &|| false,
+    );
+    assert!(matches!(
+        outcome,
+        ScanOutcome::Completed(ScanResult { found: Some(_), .. })
+    ));
+    assert_eq!(backward.accesses, vec![0, 1]);
+}
+
+#[test]
+fn oversized_anchor_is_skipped_once_in_both_directions() {
+    let compiled = compile_smart_case("needle").expect("valid regex");
+    let mut forward = ClassifiedSource {
+        lines: vec![Some("before"), None, Some("needle")],
+        accesses: vec![0; 3],
+    };
+    let outcome = scan_source(
+        &compiled,
+        &mut forward,
+        ScanRequest::new(SearchDirection::Forward, SearchAnchor::at(1, 7), count(1)),
+        &|| false,
+    );
+    let ScanOutcome::Completed(result) = outcome else {
+        panic!("forward scan completed");
+    };
+    assert_eq!(result.skipped_oversized_lines, 1);
+    assert_eq!(
+        result.found.expect("match after oversized anchor").line_id,
+        2
+    );
+    assert_eq!(forward.accesses, vec![0, 1, 1]);
+
+    let mut backward = ClassifiedSource {
+        lines: vec![Some("needle"), None, Some("after")],
+        accesses: vec![0; 3],
+    };
+    let outcome = scan_source(
+        &compiled,
+        &mut backward,
+        ScanRequest::new(
+            SearchDirection::Backward,
+            SearchAnchor::at(1, usize::MAX),
+            count(1),
+        ),
+        &|| false,
+    );
+    let ScanOutcome::Completed(result) = outcome else {
+        panic!("backward scan completed");
+    };
+    assert_eq!(result.skipped_oversized_lines, 1);
+    assert_eq!(
+        result.found.expect("match before oversized anchor").line_id,
+        0
+    );
+    assert_eq!(backward.accesses, vec![1, 1, 0]);
 }
 
 #[test]

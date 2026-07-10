@@ -7,6 +7,12 @@
 
 use thiserror::Error;
 
+/// Chunk末尾で次回入力まで保持し、次の`push_indexed`または`finish_indexed`で追加出力し得る最大byte数。
+///
+/// 4-byte UTF-8 scalarは3byte受信した時点で未完となり、4byte目が来るまで先頭3byteを保持する。
+/// Parserは現在chunk長へこの値を足してcallback出力bufferを先に確保し、callback内の再確保を避ける。
+pub(crate) const MAX_DEFERRED_OUTPUT_BYTES: usize = 3;
+
 /// ANSI sequence 除去器が次の chunk まで保持する状態。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum State {
@@ -382,6 +388,164 @@ pub(crate) fn escape_interactive_bytes_into_counted(
     escape_bytes_into(input, true, output)
 }
 
+/// Chunk境界をまたぐUTF-8 scalarを最大4 byteだけ保留し、interactive向けescapeを逐次生成する。
+///
+/// [`escape_interactive_bytes_into_counted`]と同じbyte列を返すが、logical line全体を入力・出力の
+/// どちらにも保持しない。`push_into`は`output`へ追記し、`finish_into`はEOF時に未完だったUTF-8
+/// prefixをbyte単位の`\\xNN`へ変換する。Callerはlogical lineごとに1 instanceを使い、完了後に
+/// [`Self::reset`]して次のlineへ移る。
+#[derive(Clone, Debug, Default)]
+pub(crate) struct StreamingInteractiveEscaper {
+    pending: Option<StreamingUtf8Pending>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StreamingUtf8Pending {
+    bytes: [u8; 4],
+    len: u8,
+    tail: Utf8Tail,
+}
+
+impl StreamingUtf8Pending {
+    fn after_lead(byte: u8) -> Option<Self> {
+        let tail = Utf8Tail::after_lead(byte)?;
+        let mut bytes = [0_u8; 4];
+        bytes[0] = byte;
+        Some(Self {
+            bytes,
+            len: 1,
+            tail,
+        })
+    }
+
+    fn accepts(self, byte: u8) -> bool {
+        (self.tail.next_min..=self.tail.next_max).contains(&byte)
+    }
+
+    fn push(&mut self, byte: u8) {
+        self.bytes[usize::from(self.len)] = byte;
+        self.len += 1;
+        self.tail.remaining -= 1;
+        if self.tail.remaining > 0 {
+            self.tail.next_min = 0x80;
+            self.tail.next_max = 0xbf;
+        }
+    }
+
+    const fn is_complete(self) -> bool {
+        self.tail.remaining == 0
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl StreamingInteractiveEscaper {
+    /// Chunkを変換し、`output`末尾へ追加したbyte数を返す。
+    ///
+    /// 1入力byteが最大4 ASCII byteへ展開されるため、その上限だけをfallibleに予約する。UTF-8 scalar
+    /// の途中でchunkが終わった場合は最大3 byteをinstance内に残し、この呼び出しの出力には含めない。
+    pub(crate) fn push_into(
+        &mut self,
+        input: &[u8],
+        output: &mut String,
+    ) -> Result<usize, EscapeError> {
+        let pending_len = self
+            .pending
+            .as_ref()
+            .map_or(0, |pending| usize::from(pending.len));
+        let worst_input =
+            input
+                .len()
+                .checked_add(pending_len)
+                .ok_or(EscapeError::LengthOverflow {
+                    input_len: input.len(),
+                })?;
+        let worst_added = worst_input
+            .checked_mul(4)
+            .ok_or(EscapeError::LengthOverflow {
+                input_len: input.len(),
+            })?;
+        let requested =
+            output
+                .len()
+                .checked_add(worst_added)
+                .ok_or(EscapeError::LengthOverflow {
+                    input_len: input.len(),
+                })?;
+        output
+            .try_reserve(worst_added)
+            .map_err(|_| EscapeError::Allocation { requested })?;
+
+        let before = output.len();
+        for &byte in input {
+            self.push_byte(byte, output)?;
+        }
+        Ok(output.len() - before)
+    }
+
+    /// 未完のUTF-8 prefixをescapeして`output`へ追加し、追加byte数を返す。
+    pub(crate) fn finish_into(&mut self, output: &mut String) -> Result<usize, EscapeError> {
+        let Some(pending) = self.pending.take() else {
+            return Ok(0);
+        };
+        let added = usize::from(pending.len)
+            .checked_mul(4)
+            .ok_or(EscapeError::LengthOverflow {
+                input_len: usize::from(pending.len),
+            })?;
+        let requested = output
+            .len()
+            .checked_add(added)
+            .ok_or(EscapeError::LengthOverflow {
+                input_len: usize::from(pending.len),
+            })?;
+        output
+            .try_reserve(added)
+            .map_err(|_| EscapeError::Allocation { requested })?;
+        for &byte in pending.as_bytes() {
+            push_hex_escape(output, byte);
+        }
+        Ok(added)
+    }
+
+    /// 保留scalarを破棄し、別logical lineの先頭stateへ戻す。
+    pub(crate) fn reset(&mut self) {
+        self.pending = None;
+    }
+
+    fn push_byte(&mut self, byte: u8, output: &mut String) -> Result<(), EscapeError> {
+        if let Some(mut pending) = self.pending.take() {
+            if pending.accepts(byte) {
+                pending.push(byte);
+                if pending.is_complete() {
+                    let valid = std::str::from_utf8(pending.as_bytes())
+                        .map_err(|_| EscapeError::InvalidUtf8Boundary)?;
+                    push_valid_text(output, valid, true);
+                } else {
+                    self.pending = Some(pending);
+                }
+                return Ok(());
+            }
+            for &invalid in pending.as_bytes() {
+                push_hex_escape(output, invalid);
+            }
+        }
+
+        if byte.is_ascii() {
+            let text = [byte];
+            let valid = std::str::from_utf8(&text).map_err(|_| EscapeError::InvalidUtf8Boundary)?;
+            push_valid_text(output, valid, true);
+        } else if let Some(pending) = StreamingUtf8Pending::after_lead(byte) {
+            self.pending = Some(pending);
+        } else {
+            push_hex_escape(output, byte);
+        }
+        Ok(())
+    }
+}
+
 /// path を1行の header / overlay に表示できる UTF-8 text へ変換する。
 ///
 /// path 内では LF と tab も layout を変更してはならないため、通常の control byte と同じ
@@ -719,6 +883,21 @@ mod tests {
 
             prop_assert_eq!(actual, expected);
             prop_assert_eq!(actual, output.len());
+        }
+
+        #[test]
+        fn streaming_escape_matches_eager_across_arbitrary_byte_boundaries(
+            input in prop::collection::vec(any::<u8>(), 0..4096),
+            chunk_size in 1_usize..65,
+        ) {
+            let expected = escape_interactive_bytes(&input);
+            let mut escaper = StreamingInteractiveEscaper::default();
+            let mut actual = String::new();
+            for chunk in input.chunks(chunk_size) {
+                let _ = escaper.push_into(chunk, &mut actual).unwrap();
+            }
+            let _ = escaper.finish_into(&mut actual).unwrap();
+            prop_assert_eq!(actual, expected);
         }
 
         #[test]

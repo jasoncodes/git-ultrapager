@@ -4,7 +4,7 @@
 //! output と interactive viewport が同じ折り返し・gutterを使う。syntax/search/intraline style は
 //! byte span layerとして後から合成するため、ここでは構造 roleとstable IDだけを保持する。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::ops::Range;
 use std::sync::Arc;
@@ -14,9 +14,14 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
-use crate::decorations::{DecorationSet, LineDecoration};
-use crate::model::{CommitId, Document, DocumentLine, FileId, HunkId, LineId, LineKind};
-use crate::text::wrap_hard;
+use crate::decorations::{DecorationComputeError, DecorationSet, LineDecoration};
+use crate::document::{
+    DocumentError, DocumentLineMetadata, DocumentLineMetadataReader, DocumentLineReader,
+    DocumentLineRef, DocumentSnapshot,
+};
+use crate::large_line::{LargeLineError, LargeLineStats, LargeLineTextReader};
+use crate::model::{CommitId, FileId, HunkId, LineId, LineKind};
+use crate::text::{MAX_SYNTAX_LINE_BYTES, wrap_hard};
 use crate::theme::{SemanticRole, Theme};
 
 /// Layout parameterの検証またはlogical lineのreflowに失敗した理由。
@@ -38,6 +43,57 @@ pub enum LayoutError {
     /// Gutterと本文1cellをterminal幅へ収められない。
     #[error("terminal width {actual} is smaller than the required width {required}")]
     TooNarrow { actual: usize, required: usize },
+    /// 表示幅を消費しないtextが1 rowへ集中し、bounded row buffer上限を越えた。
+    #[error("one visual row exceeds the bounded {limit}-byte streaming buffer")]
+    PathologicalRowBytes { limit: usize },
+    /// Bounded rowまたはmapping bufferの確保に失敗した。
+    #[error("could not allocate {requested} bytes for a streaming visual row")]
+    StreamingRowAllocation { requested: usize },
+    /// Full per-line layoutが保持するrow数の保守的上限を越える。
+    #[error(
+        "estimated eager visual rows {estimated_rows} exceed the per-line limit {limit}; use streaming layout"
+    )]
+    EagerRowLimitExceeded { estimated_rows: usize, limit: usize },
+    /// Full per-line layoutのtext、row、mapping概算がderived-data shareを越える。
+    #[error(
+        "estimated eager line-layout weight {estimated_bytes} bytes exceeds the per-line limit {limit} bytes; use streaming layout"
+    )]
+    EagerLayoutWeightExceeded {
+        estimated_bytes: usize,
+        limit: usize,
+    },
+    /// Viewport由来ではない件数でbounded windowを作ろうとした。
+    #[error("streaming row window requested {requested} rows, exceeding the limit {limit}")]
+    StreamingWindowRowLimit { requested: usize, limit: usize },
+    /// Current row 1件をcallerのbyte limitへ収められない。
+    #[error(
+        "streaming row window needs {required} bytes for its current row, exceeding limit {limit}"
+    )]
+    StreamingWindowByteLimit { required: usize, limit: usize },
+}
+
+/// Snapshotのlogical lineを読む処理と、そのlineをvisual rowへ変換する処理のfailure。
+///
+/// Terminal geometryの不備は[`LayoutError`]、raw storeまたはline tableの読取失敗は
+/// [`DocumentError`]として区別する。`MissingLine`はlayoutと異なるsnapshotをwriterへ渡した場合や、
+/// snapshotのhigh-water mark内に対応recordがない場合を表す。`UnavailableLineIndex`はsnapshotの
+/// line countとstable ID変換の不整合を表す。
+#[derive(Debug, Error)]
+pub enum DocumentLayoutError {
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
+    #[error(transparent)]
+    Document(#[from] DocumentError),
+    #[error(transparent)]
+    LargeLine(#[from] LargeLineError),
+    #[error("document snapshot does not contain logical line {line_id}")]
+    MissingLine { line_id: LineId },
+    #[error("document snapshot cannot represent logical line index {index} as a stable ID")]
+    UnavailableLineIndex { index: usize },
+    #[error("logical line {line_id} requires bounded streaming layout")]
+    StreamingRequired { line_id: LineId },
+    #[error("logical line {line_id} produced no visual rows")]
+    MissingVisualRows { line_id: LineId },
 }
 
 /// Source行の左右の行番号欄に割り当てるcell数。
@@ -135,9 +191,18 @@ impl LineLayout {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SpanMapping {
-    logical: Range<usize>,
-    rendered: Range<usize>,
+pub struct SpanMapping {
+    pub logical: Range<usize>,
+    pub rendered: Range<usize>,
+    tab: bool,
+}
+
+impl SpanMapping {
+    /// Mapping元が1 byteのtabで、rendered rangeがその展開cellかを返す。
+    #[must_use]
+    pub const fn is_tab(&self) -> bool {
+        self.tab
+    }
 }
 
 /// Document を特定幅へreflowしたimmutable layout。
@@ -211,6 +276,12 @@ impl DocumentLayout {
 }
 
 impl VisualRow {
+    /// Logical/rendered byte対応を表示順で返す。Tab mappingは複数rowへ同じlogical rangeを持ち得る。
+    #[must_use]
+    pub fn span_mappings(&self) -> &[SpanMapping] {
+        &self.span_map
+    }
+
     /// Logical-line byte spanを、このvisual rowの`text` byte spanへ写す。
     ///
     /// Spanがtabを含み、その展開cellが複数rowへ分かれた場合は各rowで該当部分を返す。
@@ -249,16 +320,52 @@ impl VisualRow {
         }
         ranges
     }
+
+    /// Logical byte rangeの1 byte以上をこのrowが描画するかを返す。
+    ///
+    /// Tab mappingは同じ1 byteを複数rowへ写すため、単純な`content_range`比較ではなくmapping自体を
+    /// 調べる。Range変換結果をallocateせず、whitespace markerの先頭row判定に使う。
+    #[must_use]
+    pub fn renders_logical_range(&self, logical: &Range<usize>) -> bool {
+        self.span_map.iter().any(|mapping| {
+            logical.start < mapping.logical.end && logical.end > mapping.logical.start
+        })
+    }
+
+    /// 1 logical byte offsetをこのrowのcontent rangeが含むかを返す。
+    ///
+    /// Range末尾は次rowの先頭なので含めない。Line末尾だけはstream全体を読み終えたcallerが最後のrowへ
+    /// fallbackする。
+    #[must_use]
+    pub fn renders_logical_offset(&self, offset: usize) -> bool {
+        self.content_range.contains(&offset)
+            || (self.content_range.is_empty() && self.content_range.start == offset)
+    }
+}
+
+/// 1 rowを`Arc`で保持する時のowned text/mapping capacityを含むweight。
+#[must_use]
+pub fn visual_row_weight(row: &VisualRow) -> usize {
+    std::mem::size_of::<VisualRow>()
+        .saturating_add(2 * std::mem::size_of::<usize>())
+        .saturating_add(std::mem::size_of::<NavigatorRow>())
+        .saturating_add(std::mem::size_of::<Arc<VisualRow>>())
+        .saturating_add(row.text.capacity())
+        .saturating_add(
+            row.span_map
+                .capacity()
+                .saturating_mul(std::mem::size_of::<SpanMapping>()),
+        )
 }
 
 /// Sanitized済みの1 logical lineをterminal widthへhard-wrapする。
 ///
-/// この関数は`Document`や前後行を参照しない。Source行のgutter幅はfile全体で揃える必要が
+/// この関数は`DocumentSnapshot`や前後行を参照しない。Source行のgutter幅はfile全体で揃える必要が
 /// あるため、呼び出し側が同じfileから算出した`GutterSpec`を明示的に渡す。`tab_width == 0`
 /// は`InvalidTabWidth`、現在行の番号を収められないgutterは`UndersizedGutter`、本文を1cell
 /// も確保できないterminal幅は`TooNarrow`を返す。
 pub fn layout_line(
-    line: &DocumentLine,
+    line: &DocumentLineRef<'_>,
     width: usize,
     tab_width: usize,
     gutter: GutterSpec,
@@ -277,14 +384,38 @@ pub fn layout_line(
 /// だけで使い、公開APIは失敗時に構築途中のbufferを外へ返さない。
 fn append_line_rows(
     rows: &mut Vec<VisualRow>,
-    line: &DocumentLine,
+    line: &DocumentLineRef<'_>,
     width: usize,
     tab_width: usize,
     gutter: GutterSpec,
 ) -> Result<(), LayoutError> {
     validate_tab_width(tab_width)?;
-    if is_source_line(line.kind) {
+    let source = is_source_line(line.kind);
+    if source {
         validate_gutter(line, gutter)?;
+    }
+    let content_width = content_width_for(line.kind, width, gutter)?;
+    let content_len = if source {
+        line.content().len()
+    } else {
+        line.text.len()
+    };
+    let estimated_rows = estimated_eager_rows(content_len, content_width, tab_width);
+    if estimated_rows > MAX_EAGER_VISUAL_ROWS_PER_LINE {
+        return Err(LayoutError::EagerRowLimitExceeded {
+            estimated_rows,
+            limit: MAX_EAGER_VISUAL_ROWS_PER_LINE,
+        });
+    }
+    let estimated_bytes =
+        estimated_eager_layout_bytes(content_len, estimated_rows, line.kind, gutter, tab_width);
+    if estimated_bytes > MAX_EAGER_LINE_LAYOUT_BYTES {
+        return Err(LayoutError::EagerLayoutWeightExceeded {
+            estimated_bytes,
+            limit: MAX_EAGER_LINE_LAYOUT_BYTES,
+        });
+    }
+    if source {
         append_source_rows(
             rows,
             line,
@@ -299,19 +430,37 @@ fn append_line_rows(
     Ok(())
 }
 
-/// Document を terminal width へhard-wrapする。
+/// Snapshot全体をstable line ID順にdecodeし、terminal widthへhard-wrapする。
+///
+/// Gutter幅はfile metadataの最大行番号から先に作り、各lineのdecodeには1つのreaderを再利用する。
+/// Geometryの不備、line storeのread failure、snapshot内recordの欠落を[`DocumentLayoutError`]で返す。
 pub fn layout_document(
-    document: &Document,
+    document: &DocumentSnapshot,
     width: usize,
     tab_width: usize,
-) -> Result<DocumentLayout, LayoutError> {
+) -> Result<DocumentLayout, DocumentLayoutError> {
     // Empty documentでも無効なlayout parameterを成功扱いにしない。これにより入力内容によって
     // 同じtab幅の成否が変わらず、`layout_line`とfailure contractが揃う。
     validate_tab_width(tab_width)?;
     let gutter_specs = file_gutter_specs(document);
     let mut layout = DocumentLayout::default();
 
-    for line in document.lines() {
+    let mut reader = DocumentLineReader::new();
+    let mut metadata_reader = DocumentLineMetadataReader::new();
+    for index in 0..document.line_count() {
+        let line_id = document
+            .line_id_at(index)
+            .ok_or(DocumentLayoutError::UnavailableLineIndex { index })?;
+        let metadata = metadata_reader
+            .read(document, line_id)?
+            .ok_or(DocumentLayoutError::MissingLine { line_id })?;
+        let gutter = gutter_spec_for_metadata(document, metadata);
+        if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
+            return Err(DocumentLayoutError::StreamingRequired { line_id });
+        }
+        let line = reader
+            .read(document, line_id)?
+            .ok_or(DocumentLayoutError::MissingLine { line_id })?;
         let row_start = layout.rows.len();
         layout.first_row_by_line.insert(line.id, row_start);
         if let Some(id) = line.commit_id {
@@ -327,10 +476,949 @@ pub fn layout_document(
         let gutter = line
             .file_id
             .and_then(|id| gutter_specs.get(&id).copied())
-            .unwrap_or_default();
-        append_line_rows(&mut layout.rows, line, width, tab_width, gutter)?;
+            .unwrap_or(gutter);
+        append_line_rows(&mut layout.rows, &line, width, tab_width, gutter)?;
     }
     Ok(layout)
+}
+
+/// Fixed metadataとgeometryだけで、全文decode前にbounded streaming経路が必要かを返す。
+///
+/// Raw/displayのどちらかが1 MiBを越えるlineに加え、tabを全byteへ仮定した保守的cell数から
+/// 5,000 rowsを越え得るlineを対象にする。False positiveはstreamingへ寄るだけで、eager allocationを
+/// 過小評価しない。
+pub fn line_requires_streaming_layout(
+    metadata: DocumentLineMetadata,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+) -> Result<bool, LayoutError> {
+    validate_tab_width(tab_width)?;
+    if is_source_line(metadata.kind) {
+        validate_gutter_metadata(metadata, gutter)?;
+    }
+    let content_width = content_width_for(metadata.kind, width, gutter)?;
+    if metadata.exceeds_eager_text_limit(MAX_SYNTAX_LINE_BYTES) {
+        return Ok(true);
+    }
+    let Some(display_len) = metadata.display_len.exact() else {
+        return Ok(true);
+    };
+    let content_len = display_len.saturating_sub(usize::from(is_source_line(metadata.kind)));
+    let estimated_rows = estimated_eager_rows(content_len, content_width, tab_width);
+    let estimated_bytes = estimated_eager_layout_bytes(
+        content_len,
+        estimated_rows,
+        metadata.kind,
+        gutter,
+        tab_width,
+    );
+    Ok(estimated_rows > MAX_EAGER_VISUAL_ROWS_PER_LINE
+        || estimated_bytes > MAX_EAGER_LINE_LAYOUT_BYTES)
+}
+
+/// Startup判定用にvisual row数を`limit`まで数える。
+///
+/// Logical lineは先頭から順にdecodeするが、row数が`limit`へ達した時点で止める。Auto pagingの
+/// thresholdはterminal高なので、入力全体の`DocumentLayout`や全row textを作らず判定できる。
+/// 戻り値が`limit`なら実際のrow数はそれ以上、未満ならsnapshot全体の正確なrow数である。
+pub fn count_rendered_rows_up_to(
+    document: &DocumentSnapshot,
+    width: usize,
+    tab_width: usize,
+    limit: usize,
+) -> Result<usize, DocumentLayoutError> {
+    validate_tab_width(tab_width)?;
+    if limit == 0 {
+        return Ok(0);
+    }
+    let mut reader = DocumentLineReader::new();
+    let mut metadata_reader = DocumentLineMetadataReader::new();
+    let mut count = 0_usize;
+    for index in 0..document.line_count() {
+        let line_id = document
+            .line_id_at(index)
+            .ok_or(DocumentLayoutError::UnavailableLineIndex { index })?;
+        let metadata = metadata_reader
+            .read(document, line_id)?
+            .ok_or(DocumentLayoutError::MissingLine { line_id })?;
+        let gutter = gutter_spec_for_metadata(document, metadata);
+        if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
+            let remaining = limit.saturating_sub(count);
+            let (rows, _) = count_large_line_rows_up_to(
+                document, line_id, width, tab_width, gutter, remaining,
+            )?;
+            count = count.saturating_add(rows).min(limit);
+            if count == limit {
+                break;
+            }
+            continue;
+        }
+        let line = reader
+            .read(document, line_id)?
+            .ok_or(DocumentLayoutError::MissingLine { line_id })?;
+        let rows = layout_line(
+            &line,
+            width,
+            tab_width,
+            gutter_spec_for_line(document, &line),
+        )?
+        .len();
+        count = count.saturating_add(rows).min(limit);
+        if count == limit {
+            break;
+        }
+    }
+    Ok(count)
+}
+
+/// Streaming row 1件のtext、mapping、structを合わせた保持上限。
+pub const MAX_STREAMING_VISUAL_ROW_BYTES: usize = 512 * 1024;
+
+/// Eager `LineLayout` 1件へ保持できるvisual row数の保守的上限。
+///
+/// 1 MiB未満でもterminal幅1ならrow objectが100万件近く生じる。Viewport/directはこの上限を越える
+/// lineを[`LargeLineRows`]へ送り、全文row vectorの構築を避ける。
+pub const MAX_EAGER_VISUAL_ROWS_PER_LINE: usize = 5_000;
+/// Eager per-line layoutが一時expanded textと完成rowを同時に保持できる概算上限。
+pub const MAX_EAGER_LINE_LAYOUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Tabが複数rowへ分割されるlineで、同じlogical byteを何番目に描くrowへanchorするかを表す。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LargeRowAnchor {
+    pub byte_offset: usize,
+    pub fragment: usize,
+}
+
+/// 1回の巨大行移動で実際に進んだrow数とline境界到達を返す。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LargeLineStep {
+    pub anchor: LargeRowAnchor,
+    pub rows_moved: usize,
+    /// Requested countを使い切る前に先頭または末尾へclampした時だけtrue。
+    pub reached_line_boundary: bool,
+}
+
+/// Navigatorのcurrent rowから共有するbounded viewport window。
+#[derive(Clone, Debug)]
+pub struct LargeLineRowWindow {
+    pub top: LargeRowAnchor,
+    /// `Arc` cloneだけでframeへ渡せるため、row text/span mapをcache ledger外へdeep-copyしない。
+    pub rows: Vec<Arc<VisualRow>>,
+    pub reached_line_end: bool,
+    /// Row countより先に`byte_limit`へ達し、windowを短くしたか。
+    pub byte_limited: bool,
+    pub retained_bytes: usize,
+    pub stats: LargeLineStats,
+}
+
+/// 1回のwindowが保持できるrow数。Terminal heightから十分離れた値で、`usize::MAX` allocationを拒む。
+pub const MAX_STREAMING_WINDOW_ROWS: usize = 5_000;
+/// 1 navigatorのcurrent、look-ahead、budget境界の保留rowを合わせた上限。
+pub const MAX_STREAMING_WINDOW_BYTES: usize = MAX_EAGER_LINE_LAYOUT_BYTES;
+
+#[derive(Clone, Debug)]
+struct NavigatorRow {
+    index: usize,
+    anchor: LargeRowAnchor,
+    row: Arc<VisualRow>,
+}
+
+/// 1 logical line内のforward decode位置とbounded look-ahead windowを保持するnavigator。
+///
+/// `normalize`は任意anchorを先頭から探すが、正規化後の`step_forward`、`next_row`、`collect_window`は
+/// 同じdecoder stateを再利用する。Repeated j/eは既読prefixを再読しない。Backwardはtarget indexを
+/// 求めて新しいbounded passを開始し、countに比例する`Vec`を作らない。
+#[derive(Debug)]
+pub struct LargeLineNavigator {
+    document: DocumentSnapshot,
+    line_id: LineId,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+    stream: LargeLineRows,
+    accumulated_stats: LargeLineStats,
+    current: Option<NavigatorRow>,
+    forward: VecDeque<NavigatorRow>,
+    blocked: Option<NavigatorRow>,
+    reported_anchor: LargeRowAnchor,
+    last_scanned: Option<(Range<usize>, LargeRowAnchor)>,
+    next_index: usize,
+    stream_ended: bool,
+}
+
+impl LargeLineNavigator {
+    /// Lineを先頭から開き、`anchor`を現在geometryへ正規化する。
+    pub fn new(
+        document: &DocumentSnapshot,
+        line_id: LineId,
+        width: usize,
+        tab_width: usize,
+        gutter: GutterSpec,
+        anchor: LargeRowAnchor,
+    ) -> Result<Self, DocumentLayoutError> {
+        let stream = LargeLineRows::new(document, line_id, width, tab_width, gutter)?;
+        let mut navigator = Self {
+            document: document.clone(),
+            line_id,
+            width,
+            tab_width,
+            gutter,
+            stream,
+            accumulated_stats: LargeLineStats::default(),
+            current: None,
+            forward: VecDeque::new(),
+            blocked: None,
+            reported_anchor: LargeRowAnchor::default(),
+            last_scanned: None,
+            next_index: 0,
+            stream_ended: false,
+        };
+        let _ = navigator.normalize(anchor)?;
+        Ok(navigator)
+    }
+
+    /// Requested byteを含むrowへ移し、byte/fragmentを実在範囲へclampする。
+    pub fn normalize(
+        &mut self,
+        requested: LargeRowAnchor,
+    ) -> Result<LargeRowAnchor, DocumentLayoutError> {
+        if self.current.is_some() && self.reported_anchor == requested {
+            return Ok(self.reported_anchor);
+        }
+        self.reset_stream()?;
+        let mut last = None;
+        let mut last_match = None;
+        let mut first_end_candidate = None;
+        let mut matching_count = 0_usize;
+        let mut maximum_end = 0_usize;
+
+        while let Some(entry) = self.read_stream_row()? {
+            maximum_end = maximum_end.max(entry.row.content_range.end);
+            if first_end_candidate.is_none() && entry.row.content_range.end >= requested.byte_offset
+            {
+                first_end_candidate = Some(entry.clone());
+            }
+            if entry.row.renders_logical_offset(requested.byte_offset) {
+                if matching_count == requested.fragment {
+                    let normalized = LargeRowAnchor {
+                        byte_offset: requested.byte_offset,
+                        fragment: matching_count,
+                    };
+                    self.set_current(entry, normalized);
+                    return Ok(normalized);
+                }
+                matching_count = matching_count.saturating_add(1);
+                last_match = Some(entry);
+                continue;
+            }
+            if let Some(matched) = last_match.take() {
+                self.push_forward(entry)?;
+                let normalized = LargeRowAnchor {
+                    byte_offset: requested.byte_offset,
+                    fragment: matching_count.saturating_sub(1),
+                };
+                self.set_current(matched, normalized);
+                return Ok(normalized);
+            }
+            last = Some(entry);
+        }
+
+        let Some(last) = last_match.or(last) else {
+            return Err(DocumentLayoutError::MissingVisualRows {
+                line_id: self.line_id,
+            });
+        };
+        let normalized = LargeRowAnchor {
+            byte_offset: requested.byte_offset.min(maximum_end),
+            fragment: matching_count.saturating_sub(1),
+        };
+        let selected = if matching_count > 0 || requested.byte_offset >= maximum_end {
+            last
+        } else {
+            first_end_candidate.unwrap_or(last)
+        };
+        if selected.index != self.next_index.saturating_sub(1) {
+            self.position_at_index(selected.index)?;
+            self.reported_anchor = normalized;
+        } else {
+            self.set_current(selected, normalized);
+        }
+        Ok(normalized)
+    }
+
+    #[must_use]
+    pub const fn current_anchor(&self) -> LargeRowAnchor {
+        self.reported_anchor
+    }
+
+    /// Current rowをtext/span-mapのcopyなしで共有する。
+    #[must_use]
+    pub fn current_row(&self) -> Option<Arc<VisualRow>> {
+        self.current.as_ref().map(|entry| Arc::clone(&entry.row))
+    }
+
+    /// 次rowへ1件進み、line末尾なら`None`を返す。Decoder positionは次回呼び出しへ残る。
+    pub fn next_row(
+        &mut self,
+    ) -> Result<Option<(LargeRowAnchor, Arc<VisualRow>)>, DocumentLayoutError> {
+        let Some(next) = self.take_forward_row()? else {
+            return Ok(None);
+        };
+        let anchor = next.anchor;
+        let row = Arc::clone(&next.row);
+        self.set_current(next, anchor);
+        Ok(Some((anchor, row)))
+    }
+
+    /// Current anchorから最大`count` rows進み、末尾ではclampする。
+    pub fn step_forward(&mut self, count: usize) -> Result<LargeLineStep, DocumentLayoutError> {
+        if count == 0 {
+            return Ok(LargeLineStep {
+                anchor: self.reported_anchor,
+                rows_moved: 0,
+                reached_line_boundary: false,
+            });
+        }
+        let mut moved = 0_usize;
+        while moved < count {
+            let Some(next) = self.take_forward_row()? else {
+                break;
+            };
+            let anchor = next.anchor;
+            self.set_current(next, anchor);
+            moved = moved.saturating_add(1);
+        }
+        if moved == 0
+            && let Some(current) = &self.current
+        {
+            self.reported_anchor = current.anchor;
+        }
+        Ok(LargeLineStep {
+            anchor: self.reported_anchor,
+            rows_moved: moved,
+            reached_line_boundary: moved < count,
+        })
+    }
+
+    /// Current anchorから最大`count` rows戻り、先頭ではclampする。
+    pub fn step_backward(&mut self, count: usize) -> Result<LargeLineStep, DocumentLayoutError> {
+        if count == 0 {
+            return Ok(LargeLineStep {
+                anchor: self.reported_anchor,
+                rows_moved: 0,
+                reached_line_boundary: false,
+            });
+        }
+        let current_index = self
+            .current
+            .as_ref()
+            .ok_or(DocumentLayoutError::MissingVisualRows {
+                line_id: self.line_id,
+            })?
+            .index;
+        let target = current_index.saturating_sub(count);
+        let moved = current_index - target;
+        self.position_at_index(target)?;
+        Ok(LargeLineStep {
+            anchor: self.reported_anchor,
+            rows_moved: moved,
+            reached_line_boundary: moved < count,
+        })
+    }
+
+    /// Line末尾rowへ進む。既にdecode済みのforward positionから続行する。
+    pub fn last(&mut self) -> Result<LargeRowAnchor, DocumentLayoutError> {
+        let _ = self.step_forward(usize::MAX)?;
+        Ok(self.reported_anchor)
+    }
+
+    /// Line末尾を`body_height` rowsへbottom-alignしたtop anchorへ移る。
+    pub fn bottom_aligned_top(
+        &mut self,
+        body_height: usize,
+    ) -> Result<LargeRowAnchor, DocumentLayoutError> {
+        let _ = self.last()?;
+        Ok(self.step_backward(body_height.saturating_sub(1))?.anchor)
+    }
+
+    /// Current rowから最大`row_limit`件をArc共有し、windowがline末尾を含むか返す。
+    pub fn collect_window(
+        &mut self,
+        row_limit: usize,
+    ) -> Result<LargeLineRowWindow, DocumentLayoutError> {
+        self.collect_window_bounded(row_limit, MAX_STREAMING_WINDOW_BYTES)
+    }
+
+    /// Row countとretained byteの両方でlook-aheadを止める。
+    ///
+    /// `byte_limit`はmodule上限へclampする。Current rowが収まらなければ
+    /// [`LayoutError::StreamingWindowByteLimit`]を返す。次rowを読む前に1 row分のheadroomを残し、
+    /// 実測weightがprepared shareへ収まらなければ`blocked`へ1件だけ置くため、decoder positionを
+    /// 巻き戻さない。
+    pub fn collect_window_bounded(
+        &mut self,
+        row_limit: usize,
+        byte_limit: usize,
+    ) -> Result<LargeLineRowWindow, DocumentLayoutError> {
+        if row_limit > MAX_STREAMING_WINDOW_ROWS {
+            return Err(LayoutError::StreamingWindowRowLimit {
+                requested: row_limit,
+                limit: MAX_STREAMING_WINDOW_ROWS,
+            }
+            .into());
+        }
+        let byte_limit = byte_limit.min(MAX_STREAMING_WINDOW_BYTES);
+        let mut rows = Vec::new();
+        let current = self
+            .current
+            .as_ref()
+            .ok_or(DocumentLayoutError::MissingVisualRows {
+                line_id: self.line_id,
+            })?;
+        let current_row = Arc::clone(&current.row);
+        let mut prepared_bytes = visual_row_weight(&current_row);
+        if prepared_bytes > byte_limit {
+            return Err(LayoutError::StreamingWindowByteLimit {
+                required: prepared_bytes,
+                limit: byte_limit,
+            }
+            .into());
+        }
+        prepared_bytes = self.forward.iter().fold(prepared_bytes, |total, entry| {
+            total.saturating_add(visual_row_weight(&entry.row))
+        });
+        let prepared_limit = byte_limit.saturating_sub(MAX_STREAMING_VISUAL_ROW_BYTES);
+        let mut byte_limited = prepared_bytes > prepared_limit;
+
+        while row_limit > 0 && self.forward.len() < row_limit && !self.stream_ended {
+            if let Some(blocked) = self.blocked.take() {
+                let weight = visual_row_weight(&blocked.row);
+                if prepared_bytes.saturating_add(weight) > prepared_limit {
+                    self.blocked = Some(blocked);
+                    byte_limited = true;
+                    break;
+                }
+                prepared_bytes = prepared_bytes.saturating_add(weight);
+                self.push_forward(blocked)?;
+                continue;
+            }
+            if prepared_bytes.saturating_add(MAX_STREAMING_VISUAL_ROW_BYTES) > byte_limit {
+                byte_limited = true;
+                break;
+            }
+            let Some(next) = self.read_stream_row()? else {
+                break;
+            };
+            let weight = visual_row_weight(&next.row);
+            if prepared_bytes.saturating_add(weight) > prepared_limit {
+                self.blocked = Some(next);
+                byte_limited = true;
+                break;
+            }
+            prepared_bytes = prepared_bytes.saturating_add(weight);
+            self.push_forward(next)?;
+        }
+
+        if row_limit > 0 {
+            rows.try_reserve_exact(1)
+                .map_err(|_| LayoutError::StreamingRowAllocation {
+                    requested: std::mem::size_of::<Arc<VisualRow>>(),
+                })?;
+            rows.push(current_row);
+            for entry in self.forward.iter().take(row_limit.saturating_sub(1)) {
+                rows.try_reserve_exact(1)
+                    .map_err(|_| LayoutError::StreamingRowAllocation {
+                        requested: rows
+                            .len()
+                            .saturating_add(1)
+                            .saturating_mul(std::mem::size_of::<Arc<VisualRow>>()),
+                    })?;
+                rows.push(Arc::clone(&entry.row));
+            }
+        }
+        let retained_bytes = prepared_bytes.saturating_add(
+            self.blocked
+                .as_ref()
+                .map_or(0, |entry| visual_row_weight(&entry.row)),
+        );
+        let reached_line_end = row_limit > 0
+            && self.stream_ended
+            && self.blocked.is_none()
+            && self.forward.len() < row_limit;
+        Ok(LargeLineRowWindow {
+            top: self.reported_anchor,
+            rows,
+            reached_line_end,
+            byte_limited,
+            retained_bytes,
+            stats: self.stats(),
+        })
+    }
+
+    /// Navigator生成後に行った全passのraw read合計と最大同時bufferを返す。
+    #[must_use]
+    pub fn stats(&self) -> LargeLineStats {
+        let current = self.stream.stats();
+        LargeLineStats {
+            raw_bytes_read: self
+                .accumulated_stats
+                .raw_bytes_read
+                .saturating_add(current.raw_bytes_read),
+            peak_buffered_bytes: self
+                .accumulated_stats
+                .peak_buffered_bytes
+                .max(current.peak_buffered_bytes),
+        }
+    }
+
+    fn take_forward_row(&mut self) -> Result<Option<NavigatorRow>, DocumentLayoutError> {
+        if let Some(row) = self.forward.pop_front() {
+            return Ok(Some(row));
+        }
+        if let Some(row) = self.blocked.take() {
+            return Ok(Some(row));
+        }
+        self.read_stream_row()
+    }
+
+    fn push_forward(&mut self, row: NavigatorRow) -> Result<(), DocumentLayoutError> {
+        self.forward
+            .try_reserve_exact(1)
+            .map_err(|_| LayoutError::StreamingRowAllocation {
+                requested: self
+                    .forward
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(std::mem::size_of::<NavigatorRow>()),
+            })?;
+        self.forward.push_back(row);
+        Ok(())
+    }
+
+    fn read_stream_row(&mut self) -> Result<Option<NavigatorRow>, DocumentLayoutError> {
+        let Some(row) = self.stream.next_row()? else {
+            self.stream_ended = true;
+            return Ok(None);
+        };
+        let byte_offset = row.content_range.start;
+        let fragment = self.last_scanned.as_ref().map_or(0, |(range, anchor)| {
+            if range.contains(&byte_offset) {
+                if anchor.byte_offset == byte_offset {
+                    anchor.fragment.saturating_add(1)
+                } else {
+                    // Tabが前rowの途中で始まった場合、その前rowはcanonical anchorが別byteでも
+                    // 同じtab byteを描くfragment 0である。現在rowはfragment 1から始める。
+                    1
+                }
+            } else {
+                0
+            }
+        });
+        let anchor = LargeRowAnchor {
+            byte_offset,
+            fragment,
+        };
+        let index = self.next_index;
+        self.next_index = self.next_index.saturating_add(1);
+        self.last_scanned = Some((row.content_range.clone(), anchor));
+        Ok(Some(NavigatorRow {
+            index,
+            anchor,
+            row: Arc::new(row),
+        }))
+    }
+
+    fn position_at_index(&mut self, target: usize) -> Result<(), DocumentLayoutError> {
+        self.reset_stream()?;
+        loop {
+            let Some(entry) = self.read_stream_row()? else {
+                return Err(DocumentLayoutError::MissingVisualRows {
+                    line_id: self.line_id,
+                });
+            };
+            if entry.index == target {
+                let anchor = entry.anchor;
+                self.set_current(entry, anchor);
+                return Ok(());
+            }
+        }
+    }
+
+    fn set_current(&mut self, entry: NavigatorRow, reported: LargeRowAnchor) {
+        self.current = Some(entry);
+        self.reported_anchor = reported;
+    }
+
+    fn reset_stream(&mut self) -> Result<(), DocumentLayoutError> {
+        let completed = self.stream.stats();
+        self.accumulated_stats.raw_bytes_read = self
+            .accumulated_stats
+            .raw_bytes_read
+            .saturating_add(completed.raw_bytes_read);
+        self.accumulated_stats.peak_buffered_bytes = self
+            .accumulated_stats
+            .peak_buffered_bytes
+            .max(completed.peak_buffered_bytes);
+        self.stream = LargeLineRows::new(
+            &self.document,
+            self.line_id,
+            self.width,
+            self.tab_width,
+            self.gutter,
+        )?;
+        self.current = None;
+        self.forward.clear();
+        self.blocked = None;
+        self.last_scanned = None;
+        self.next_index = 0;
+        self.stream_ended = false;
+        Ok(())
+    }
+}
+
+/// 指定anchorからbounded shared windowを1回だけ収集する。
+pub fn collect_large_line_row_window(
+    document: &DocumentSnapshot,
+    line_id: LineId,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+    anchor: LargeRowAnchor,
+    max_rows: usize,
+) -> Result<LargeLineRowWindow, DocumentLayoutError> {
+    validate_tab_width(tab_width)?;
+    if max_rows == 0 {
+        return Ok(LargeLineRowWindow {
+            top: anchor,
+            rows: Vec::new(),
+            reached_line_end: false,
+            byte_limited: false,
+            retained_bytes: 0,
+            stats: LargeLineStats::default(),
+        });
+    }
+    let mut navigator =
+        LargeLineNavigator::new(document, line_id, width, tab_width, gutter, anchor)?;
+    navigator.collect_window(max_rows)
+}
+
+fn count_large_line_rows_up_to(
+    document: &DocumentSnapshot,
+    line_id: LineId,
+    width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+    limit: usize,
+) -> Result<(usize, LargeLineStats), DocumentLayoutError> {
+    if limit == 0 {
+        return Ok((0, LargeLineStats::default()));
+    }
+    let mut stream = LargeLineRows::new(document, line_id, width, tab_width, gutter)?;
+    let mut count = 0_usize;
+    while stream.next_row()?.is_some() {
+        count = count.saturating_add(1).min(limit);
+        if count == limit {
+            break;
+        }
+    }
+    Ok((count, stream.stats()))
+}
+
+/// 1巨大行を1 visual rowずつ構築するstate。
+#[derive(Debug)]
+struct LargeLineRows {
+    reader: LargeLineTextReader,
+    metadata: DocumentLineMetadata,
+    content_width: usize,
+    tab_width: usize,
+    gutter: GutterSpec,
+    source: bool,
+    row_text: String,
+    row_mappings: Vec<SpanMapping>,
+    row_width: usize,
+    row_started: bool,
+    rows_emitted: usize,
+    rendered_content_start: usize,
+    queued_text: String,
+    queued_range: Option<Range<usize>>,
+    queued_width: usize,
+    tab_remaining: usize,
+    tab_range: Range<usize>,
+    content_column: usize,
+    input_finished: bool,
+}
+
+impl LargeLineRows {
+    fn new(
+        document: &DocumentSnapshot,
+        line_id: LineId,
+        width: usize,
+        tab_width: usize,
+        gutter: GutterSpec,
+    ) -> Result<Self, DocumentLayoutError> {
+        validate_tab_width(tab_width)?;
+        let mut reader = LargeLineTextReader::new();
+        let mut metadata_reader = DocumentLineMetadataReader::new();
+        let metadata = metadata_reader
+            .read(document, line_id)?
+            .ok_or(DocumentLayoutError::MissingLine { line_id })?;
+        let source = is_source_line(metadata.kind);
+        if source {
+            validate_gutter_metadata(metadata, gutter)?;
+        }
+        let content_width = content_width_for(metadata.kind, width, gutter)?;
+        let started_metadata = reader.start(document, line_id, usize::from(source))?;
+        debug_assert_eq!(metadata, started_metadata);
+        Ok(Self {
+            reader,
+            metadata,
+            content_width,
+            tab_width,
+            gutter,
+            source,
+            row_text: String::new(),
+            row_mappings: Vec::new(),
+            row_width: 0,
+            row_started: false,
+            rows_emitted: 0,
+            rendered_content_start: 0,
+            queued_text: String::new(),
+            queued_range: None,
+            queued_width: 0,
+            tab_remaining: 0,
+            tab_range: 0..0,
+            content_column: 0,
+            input_finished: false,
+        })
+    }
+
+    fn next_row(&mut self) -> Result<Option<VisualRow>, DocumentLayoutError> {
+        loop {
+            if self.tab_remaining > 0 {
+                self.ensure_row_started();
+                self.append_piece(" ", self.tab_range.clone(), 1, true)?;
+                self.tab_remaining -= 1;
+                if self.row_width >= self.content_width {
+                    return self.finish_row().map(Some);
+                }
+                continue;
+            }
+
+            if self.queued_range.is_some() {
+                if self.row_started
+                    && self.row_width > 0
+                    && self.row_width.saturating_add(self.queued_width) > self.content_width
+                {
+                    return self.finish_row().map(Some);
+                }
+                self.ensure_row_started();
+                let range = self.queued_range.take().unwrap_or(0..0);
+                let text = std::mem::take(&mut self.queued_text);
+                self.append_piece(&text, range, self.queued_width, false)?;
+                self.queued_text = text;
+                self.queued_text.clear();
+                self.queued_width = 0;
+                if self.row_width >= self.content_width {
+                    return self.finish_row().map(Some);
+                }
+                continue;
+            }
+
+            if self.input_finished {
+                if self.row_started || self.rows_emitted == 0 {
+                    self.ensure_row_started();
+                    return self.finish_row().map(Some);
+                }
+                return Ok(None);
+            }
+
+            let Some(unit) = self.reader.next_unit()? else {
+                self.input_finished = true;
+                continue;
+            };
+            if unit.text == "\t" {
+                self.tab_range = unit.logical_range;
+                self.tab_remaining = self.tab_width - (self.content_column % self.tab_width);
+                self.content_column = self.content_column.saturating_add(self.tab_remaining);
+                continue;
+            }
+            self.queued_text.clear();
+            self.queued_text.try_reserve(unit.text.len()).map_err(|_| {
+                LayoutError::StreamingRowAllocation {
+                    requested: unit.text.len(),
+                }
+            })?;
+            self.queued_text.push_str(unit.text);
+            self.queued_range = Some(unit.logical_range);
+            self.queued_width = UnicodeWidthStr::width(self.queued_text.as_str());
+            self.content_column = self.content_column.saturating_add(self.queued_width);
+        }
+    }
+
+    fn ensure_row_started(&mut self) {
+        if self.row_started {
+            return;
+        }
+        self.row_text.clear();
+        self.row_mappings.clear();
+        self.row_width = 0;
+        let continuation = self.rows_emitted > 0;
+        if self.source {
+            let old_number = if continuation {
+                String::new()
+            } else {
+                self.metadata
+                    .old_line_number
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            };
+            let new_number = if continuation {
+                String::new()
+            } else {
+                self.metadata
+                    .new_line_number
+                    .map(|value| value.to_string())
+                    .unwrap_or_default()
+            };
+            let marker = if continuation {
+                ' '
+            } else {
+                match self.metadata.kind {
+                    LineKind::Addition => '+',
+                    LineKind::Deletion => '-',
+                    _ => ' ',
+                }
+            };
+            self.row_text = format!(
+                "{old_number:>old_width$} {new_number:>new_width$} │{marker}",
+                old_width = self.gutter.old_width(),
+                new_width = self.gutter.new_width(),
+            );
+            self.rendered_content_start = self.row_text.len();
+            if !continuation {
+                self.row_mappings.push(SpanMapping {
+                    logical: 0..1,
+                    rendered: self.rendered_content_start.saturating_sub(1)
+                        ..self.rendered_content_start,
+                    tab: false,
+                });
+            }
+        } else {
+            self.rendered_content_start = 0;
+        }
+        self.row_started = true;
+    }
+
+    fn append_piece(
+        &mut self,
+        text: &str,
+        logical: Range<usize>,
+        width: usize,
+        tab: bool,
+    ) -> Result<(), LayoutError> {
+        let next_len = self.row_text.len().saturating_add(text.len());
+        let merges_previous = self.row_mappings.last().is_some_and(|previous| {
+            previous.logical == logical
+                && previous.rendered.end == self.row_text.len()
+                && previous.tab == tab
+        });
+        let mapping_count = self
+            .row_mappings
+            .len()
+            .saturating_add(usize::from(!merges_previous));
+        let prospective_weight = std::mem::size_of::<VisualRow>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<NavigatorRow>())
+            .saturating_add(std::mem::size_of::<Arc<VisualRow>>())
+            .saturating_add(next_len)
+            .saturating_add(mapping_count.saturating_mul(std::mem::size_of::<SpanMapping>()));
+        if prospective_weight > MAX_STREAMING_VISUAL_ROW_BYTES {
+            return Err(LayoutError::PathologicalRowBytes {
+                limit: MAX_STREAMING_VISUAL_ROW_BYTES,
+            });
+        }
+        self.row_text.try_reserve_exact(text.len()).map_err(|_| {
+            LayoutError::StreamingRowAllocation {
+                requested: next_len,
+            }
+        })?;
+        let rendered_start = self.row_text.len();
+        self.row_text.push_str(text);
+        let rendered = rendered_start..self.row_text.len();
+        if merges_previous {
+            let previous =
+                self.row_mappings
+                    .last_mut()
+                    .ok_or(LayoutError::StreamingRowAllocation {
+                        requested: prospective_weight,
+                    })?;
+            previous.rendered.end = rendered.end;
+        } else {
+            self.row_mappings.try_reserve_exact(1).map_err(|_| {
+                LayoutError::StreamingRowAllocation {
+                    requested: self
+                        .row_mappings
+                        .len()
+                        .saturating_add(1)
+                        .saturating_mul(std::mem::size_of::<SpanMapping>()),
+                }
+            })?;
+            self.row_mappings.push(SpanMapping {
+                logical,
+                rendered,
+                tab,
+            });
+        }
+        self.row_width = self.row_width.saturating_add(width);
+        Ok(())
+    }
+
+    fn finish_row(&mut self) -> Result<VisualRow, DocumentLayoutError> {
+        let retained_weight = std::mem::size_of::<VisualRow>()
+            .saturating_add(2 * std::mem::size_of::<usize>())
+            .saturating_add(std::mem::size_of::<NavigatorRow>())
+            .saturating_add(std::mem::size_of::<Arc<VisualRow>>())
+            .saturating_add(self.row_text.capacity())
+            .saturating_add(
+                self.row_mappings
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<SpanMapping>()),
+            );
+        if retained_weight > MAX_STREAMING_VISUAL_ROW_BYTES {
+            return Err(LayoutError::PathologicalRowBytes {
+                limit: MAX_STREAMING_VISUAL_ROW_BYTES,
+            }
+            .into());
+        }
+        let continuation = self.rows_emitted > 0;
+        let content_range = mapping_bounds(&self.row_mappings).unwrap_or_else(|| {
+            let offset = usize::from(self.source);
+            offset..offset
+        });
+        let text = std::mem::take(&mut self.row_text);
+        let rendered_content_range = self.rendered_content_start..text.len();
+        let row = VisualRow {
+            line_id: self.metadata.id,
+            commit_id: self.metadata.commit_id,
+            file_id: self.metadata.file_id,
+            hunk_id: self.metadata.hunk_id,
+            text,
+            role: role_for_line(self.metadata.kind),
+            content_range,
+            rendered_content_range,
+            continuation,
+            span_map: std::mem::take(&mut self.row_mappings),
+        };
+        self.row_started = false;
+        self.row_width = 0;
+        self.rows_emitted = self.rows_emitted.saturating_add(1);
+        Ok(row)
+    }
+
+    fn stats(&self) -> LargeLineStats {
+        self.reader.stats()
+    }
 }
 
 fn validate_tab_width(tab_width: usize) -> Result<(), LayoutError> {
@@ -340,7 +1428,71 @@ fn validate_tab_width(tab_width: usize) -> Result<(), LayoutError> {
     Ok(())
 }
 
-fn validate_gutter(line: &DocumentLine, gutter: GutterSpec) -> Result<(), LayoutError> {
+fn content_width_for(
+    kind: LineKind,
+    width: usize,
+    gutter: GutterSpec,
+) -> Result<usize, LayoutError> {
+    if is_source_line(kind) {
+        let prefix_width = gutter.old_width() + 1 + gutter.new_width() + 3;
+        width
+            .checked_sub(prefix_width)
+            .filter(|value| *value >= 1)
+            .ok_or(LayoutError::TooNarrow {
+                actual: width,
+                required: prefix_width + 1,
+            })
+    } else if width == 0 {
+        Err(LayoutError::TooNarrow {
+            actual: 0,
+            required: 1,
+        })
+    } else {
+        Ok(width)
+    }
+}
+
+fn estimated_eager_rows(content_len: usize, content_width: usize, tab_width: usize) -> usize {
+    if content_len == 0 {
+        return 1;
+    }
+    let maximum_cells = content_len.saturating_mul(tab_width);
+    maximum_cells.div_ceil(content_width).max(1)
+}
+
+fn estimated_eager_layout_bytes(
+    content_len: usize,
+    row_count: usize,
+    kind: LineKind,
+    gutter: GutterSpec,
+    tab_width: usize,
+) -> usize {
+    let expanded_bytes = content_len.saturating_mul(tab_width);
+    // 全byteがtabならinput byteごとに1 mapping、plain textでもwrap境界ごとにmappingが分割される。
+    // ExpandedTextと完成VisualRowがloop中に同時生存するためmapping payloadを2世代分数える。
+    let mapping_count = content_len
+        .saturating_add(row_count)
+        .saturating_add(usize::from(is_source_line(kind)));
+    let mapping_bytes = mapping_count
+        .saturating_mul(std::mem::size_of::<SpanMapping>())
+        .saturating_mul(2);
+    let row_metadata = row_count.saturating_mul(
+        std::mem::size_of::<VisualRow>()
+            .saturating_add(std::mem::size_of::<crate::text::WrappedSegment>()),
+    );
+    let gutter_bytes = if is_source_line(kind) {
+        gutter.old_width() + gutter.new_width() + 6
+    } else {
+        0
+    };
+    expanded_bytes
+        .saturating_mul(2)
+        .saturating_add(mapping_bytes)
+        .saturating_add(row_metadata)
+        .saturating_add(row_count.saturating_mul(gutter_bytes))
+}
+
+fn validate_gutter(line: &DocumentLineRef<'_>, gutter: GutterSpec) -> Result<(), LayoutError> {
     let required_old_width = line
         .old_line_number
         .map_or(0, |number| usize::from(decimal_width(number)));
@@ -360,9 +1512,30 @@ fn validate_gutter(line: &DocumentLine, gutter: GutterSpec) -> Result<(), Layout
     Ok(())
 }
 
+fn validate_gutter_metadata(
+    line: DocumentLineMetadata,
+    gutter: GutterSpec,
+) -> Result<(), LayoutError> {
+    let required_old_width = line
+        .old_line_number
+        .map_or(0, |number| usize::from(decimal_width(number)));
+    let required_new_width = line
+        .new_line_number
+        .map_or(0, |number| usize::from(decimal_width(number)));
+    if required_old_width > gutter.old_width() || required_new_width > gutter.new_width() {
+        return Err(LayoutError::UndersizedGutter {
+            old_width: gutter.old_width(),
+            required_old_width,
+            new_width: gutter.new_width(),
+            required_new_width,
+        });
+    }
+    Ok(())
+}
+
 fn append_source_rows(
     rows: &mut Vec<VisualRow>,
-    line: &DocumentLine,
+    line: &DocumentLineRef<'_>,
     width: usize,
     tab_width: usize,
     old_width: usize,
@@ -418,6 +1591,7 @@ fn append_source_rows(
                 SpanMapping {
                     logical: 0..1,
                     rendered: rendered_content_start.saturating_sub(1)..rendered_content_start,
+                    tab: false,
                 },
             );
         }
@@ -441,7 +1615,7 @@ fn append_source_rows(
 
 fn append_metadata_rows(
     rows: &mut Vec<VisualRow>,
-    line: &DocumentLine,
+    line: &DocumentLineRef<'_>,
     width: usize,
     tab_width: usize,
 ) -> Result<(), LayoutError> {
@@ -451,7 +1625,7 @@ fn append_metadata_rows(
             required: 1,
         });
     }
-    let expanded = expand_tabs_with_mapping(&line.text, tab_width);
+    let expanded = expand_tabs_with_mapping(line.text, tab_width);
     for (index, segment) in wrap_hard(&expanded.text, width).into_iter().enumerate() {
         let text = expanded.text[segment.byte_range.clone()].to_owned();
         let span_map = map_expanded_segment(&expanded, segment.byte_range, 0, 0);
@@ -497,6 +1671,7 @@ fn expand_tabs_with_mapping(input: &str, tab_width: usize) -> ExpandedText {
             mappings.push(SpanMapping {
                 logical: plain_start..logical_start,
                 rendered: rendered_end - byte_count..rendered_end,
+                tab: false,
             });
         }
         let rendered_start = text.len();
@@ -506,6 +1681,7 @@ fn expand_tabs_with_mapping(input: &str, tab_width: usize) -> ExpandedText {
         mappings.push(SpanMapping {
             logical: logical_start..logical_start + grapheme.len(),
             rendered: rendered_start..text.len(),
+            tab: true,
         });
         plain_start = logical_start + grapheme.len();
     }
@@ -515,12 +1691,14 @@ fn expand_tabs_with_mapping(input: &str, tab_width: usize) -> ExpandedText {
         mappings.push(SpanMapping {
             logical: plain_start..input.len(),
             rendered: text.len() - byte_count..text.len(),
+            tab: false,
         });
     }
     if input.is_empty() {
         mappings.push(SpanMapping {
             logical: 0..0,
             rendered: 0..0,
+            tab: false,
         });
     }
     ExpandedText { text, mappings }
@@ -556,6 +1734,7 @@ fn map_expanded_segment(
                 logical,
                 rendered: rendered_offset + start.saturating_sub(segment.start)
                     ..rendered_offset + end.saturating_sub(segment.start),
+                tab: mapping.tab,
             })
         })
         .collect()
@@ -565,21 +1744,43 @@ fn mapping_bounds(mappings: &[SpanMapping]) -> Option<Range<usize>> {
     Some(mappings.first()?.logical.start..mappings.last()?.logical.end)
 }
 
-fn file_gutter_specs(document: &Document) -> HashMap<FileId, GutterSpec> {
-    let mut widths = HashMap::new();
-    for line in document.lines() {
-        let Some(file_id) = line.file_id else {
-            continue;
-        };
-        let entry = widths.entry(file_id).or_insert(GutterSpec::MINIMUM);
-        if let Some(number) = line.old_line_number {
-            entry.old_width = entry.old_width.max(decimal_width(number));
-        }
-        if let Some(number) = line.new_line_number {
-            entry.new_width = entry.new_width.max(decimal_width(number));
-        }
-    }
-    widths
+fn file_gutter_specs(document: &DocumentSnapshot) -> HashMap<FileId, GutterSpec> {
+    // Line scanで最大値を再計算するとlayout前に全text decodeが必要になる。Parserがfile単位で
+    // 保持したboundsだけを読むため、ここはfile数に比例し、line数やraw byte数に依存しない。
+    document
+        .files()
+        .iter()
+        .map(|file| {
+            let bounds = document.file_line_bounds(file.id).unwrap_or_default();
+            let old_width = bounds.max_old_line_number.map_or(0, decimal_width);
+            let new_width = bounds.max_new_line_number.map_or(0, decimal_width);
+            (file.id, GutterSpec::new(old_width, new_width))
+        })
+        .collect()
+}
+
+fn gutter_spec_for_line(document: &DocumentSnapshot, line: &DocumentLineRef<'_>) -> GutterSpec {
+    line.file_id
+        .and_then(|file_id| document.file_line_bounds(file_id))
+        .map(|bounds| {
+            GutterSpec::new(
+                bounds.max_old_line_number.map_or(0, decimal_width),
+                bounds.max_new_line_number.map_or(0, decimal_width),
+            )
+        })
+        .unwrap_or_default()
+}
+
+fn gutter_spec_for_metadata(document: &DocumentSnapshot, line: DocumentLineMetadata) -> GutterSpec {
+    line.file_id
+        .and_then(|file_id| document.file_line_bounds(file_id))
+        .map(|bounds| {
+            GutterSpec::new(
+                bounds.max_old_line_number.map_or(0, decimal_width),
+                bounds.max_new_line_number.map_or(0, decimal_width),
+            )
+        })
+        .unwrap_or_default()
 }
 
 fn decimal_width(number: u64) -> u8 {
@@ -630,59 +1831,159 @@ where
     writer.flush()
 }
 
-/// Syntax・intralineを合成し、指定logical-line範囲のvisual rowだけをTTYへ書く。
+/// Syntax・intralineを合成し、指定logical-line範囲だけを逐次layoutしてTTYへ書く。
 ///
 /// Precedenceはinteractive rendererと同じく、diff構造、syntax foreground、intraline backgroundの
-/// 順とする。Searchはinteractive stateだけのためdirect outputへは含めない。
+/// 順とする。Searchはinteractive stateだけのためdirect outputへは含めない。1つのreaderと1 logical
+/// line分の[`LineLayout`]だけを保持し、範囲より前のtextやvisual rowを再構築しない。Layoutとsnapshotを
+/// 別引数にしないため、同じstable IDを持つ別documentのrowを混在させる経路も作らない。
 pub fn write_direct_decorated_range<W: Write>(
     writer: &mut W,
-    layout: &DocumentLayout,
-    document: &Document,
+    document: &DocumentSnapshot,
     decorations: &DecorationSet,
     theme: &Theme,
     line_range: Range<usize>,
-) -> io::Result<()> {
-    for (row_index, row) in layout.rows().iter().enumerate() {
-        let Ok(line_index) = usize::try_from(row.line_id.get()) else {
-            continue;
-        };
-        if !line_range.contains(&line_index) {
+    width: usize,
+    tab_width: usize,
+) -> Result<(), DirectWriteError> {
+    validate_tab_width(tab_width)?;
+    if !decorations.belongs_to(document) {
+        return Err(DirectWriteError::DecorationLineageMismatch);
+    }
+    let range_end = line_range.end.min(document.line_count());
+    if line_range.start >= range_end {
+        return writer.flush().map_err(DirectWriteError::Io);
+    }
+    let mut reader = DocumentLineReader::new();
+    let mut metadata_reader = DocumentLineMetadataReader::new();
+    for index in line_range.start..range_end {
+        let line_id = document
+            .line_id_at(index)
+            .ok_or(DirectWriteError::UnavailableLineIndex { index })?;
+        let metadata = metadata_reader
+            .read(document, line_id)?
+            .ok_or(DirectWriteError::MissingLine { line_id })?;
+        let gutter = gutter_spec_for_metadata(document, metadata);
+        if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
+            let mut stream = LargeLineRows::new(document, line_id, width, tab_width, gutter)?;
+            let mut previous = None;
+            while let Some(row) = stream.next_row()? {
+                write_streaming_decorated_row(
+                    writer,
+                    previous.as_ref(),
+                    &row,
+                    metadata.kind,
+                    decorations,
+                    theme,
+                )?;
+                previous = Some(row);
+            }
             continue;
         }
-        write_decorated_row(writer, layout, document, decorations, theme, row_index, row)?;
+        let line = reader
+            .read(document, line_id)?
+            .ok_or(DirectWriteError::MissingLine { line_id })?;
+        let gutter = gutter_spec_for_line(document, &line);
+        let line_layout = layout_line(&line, width, tab_width, gutter)?;
+        for (row_index, row) in line_layout.rows().iter().enumerate() {
+            write_decorated_row(
+                writer,
+                line_layout.rows(),
+                &line,
+                decorations,
+                theme,
+                row_index,
+                row,
+            )?;
+        }
     }
-    writer.flush()
+    writer.flush().map_err(DirectWriteError::Io)
+}
+
+fn write_large_undecorated_row<W: Write>(
+    writer: &mut W,
+    row: &VisualRow,
+    kind: LineKind,
+    theme: &Theme,
+) -> io::Result<()> {
+    let gutter_end = if is_source_line(kind) {
+        row.rendered_content_range.start.saturating_sub(1)
+    } else {
+        0
+    };
+    if gutter_end > 0 {
+        write_style(writer, theme.style(SemanticRole::LineNumber))?;
+        writer.write_all(&row.text.as_bytes()[..gutter_end])?;
+    }
+    write_style(writer, theme.style(row.role))?;
+    writer.write_all(&row.text.as_bytes()[gutter_end..])?;
+    writer.write_all(b"\x1b[0m\n")
 }
 
 fn write_decorated_row<W: Write>(
     writer: &mut W,
-    layout: &DocumentLayout,
-    document: &Document,
+    line_rows: &[VisualRow],
+    line: &DocumentLineRef<'_>,
     decorations: &DecorationSet,
     theme: &Theme,
     row_index: usize,
     row: &VisualRow,
 ) -> io::Result<()> {
-    let Some(line) = document.line(row.line_id) else {
-        write_style(writer, theme.style(row.role))?;
-        writer.write_all(row.text.as_bytes())?;
-        return writer.write_all(b"\x1b[0m\n");
-    };
     let decoration = decorations.line(row.line_id);
     let syntax = direct_syntax_ranges(row, decoration);
-    let intraline = direct_intraline_ranges(row, line, decoration);
+    let intraline = direct_intraline_ranges(row, line.kind, decoration);
     let replacements =
-        direct_whitespace_replacements(layout, row, row_index, line, decoration, decorations);
-    let gutter_end = if is_source_line(line.kind) {
+        direct_whitespace_replacements(line_rows, row, row_index, line, decoration, decorations);
+    write_composed_row(
+        writer,
+        row,
+        line.kind,
+        theme,
+        &syntax,
+        &intraline,
+        &replacements,
+    )
+}
+
+fn write_streaming_decorated_row<W: Write>(
+    writer: &mut W,
+    previous: Option<&VisualRow>,
+    row: &VisualRow,
+    kind: LineKind,
+    decorations: &DecorationSet,
+    theme: &Theme,
+) -> io::Result<()> {
+    let decoration = decorations.line(row.line_id);
+    let syntax = direct_syntax_ranges(row, decoration);
+    let intraline = direct_intraline_ranges(row, kind, decoration);
+    let replacements = direct_streaming_whitespace_replacements(
+        previous,
+        row,
+        decoration,
+        decorations.whitespace(),
+    );
+    write_composed_row(writer, row, kind, theme, &syntax, &intraline, &replacements)
+}
+
+fn write_composed_row<W: Write>(
+    writer: &mut W,
+    row: &VisualRow,
+    kind: LineKind,
+    theme: &Theme,
+    syntax: &[(Range<usize>, &crate::highlight::SyntaxSpan)],
+    intraline: &[Range<usize>],
+    replacements: &HashMap<usize, char>,
+) -> io::Result<()> {
+    let gutter_end = if is_source_line(kind) {
         row.rendered_content_range.start.saturating_sub(1)
     } else {
         0
     };
     let mut boundaries = vec![0, row.text.len(), gutter_end];
-    for (range, _) in &syntax {
+    for (range, _) in syntax {
         boundaries.extend([range.start, range.end]);
     }
-    for range in &intraline {
+    for range in intraline {
         boundaries.extend([range.start, range.end]);
     }
     boundaries.retain(|offset| *offset <= row.text.len() && row.text.is_char_boundary(*offset));
@@ -715,7 +2016,7 @@ fn write_decorated_row<W: Write>(
             .iter()
             .any(|candidate| candidate.start <= range.start && range.end <= candidate.end)
         {
-            let role = match line.kind {
+            let role = match kind {
                 LineKind::Deletion => SemanticRole::IntralineRemoved,
                 LineKind::Addition => SemanticRole::IntralineAdded,
                 _ => row.role,
@@ -723,7 +2024,7 @@ fn write_decorated_row<W: Write>(
             style = style.patch(theme.style(role));
         }
         write_style(writer, style)?;
-        let rendered = replace_direct_whitespace(&row.text, range, &replacements);
+        let rendered = replace_direct_whitespace(&row.text, range, replacements);
         writer.write_all(rendered.as_bytes())?;
     }
     writer.write_all(b"\x1b[0m\n")
@@ -733,9 +2034,11 @@ fn direct_syntax_ranges<'decoration>(
     row: &VisualRow,
     decoration: Option<&'decoration LineDecoration>,
 ) -> Vec<(Range<usize>, &'decoration crate::highlight::SyntaxSpan)> {
-    decoration
-        .into_iter()
-        .flat_map(LineDecoration::syntax_spans)
+    let spans = decoration.map_or(&[][..], LineDecoration::syntax_spans);
+    let first = spans.partition_point(|span| span.byte_range.end <= row.content_range.start);
+    let end = spans.partition_point(|span| span.byte_range.start < row.content_range.end);
+    spans[first..end]
+        .iter()
         .flat_map(|span| {
             row.rendered_ranges_for_logical(span.byte_range.clone())
                 .into_iter()
@@ -746,24 +2049,26 @@ fn direct_syntax_ranges<'decoration>(
 
 fn direct_intraline_ranges(
     row: &VisualRow,
-    line: &DocumentLine,
+    kind: LineKind,
     decoration: Option<&LineDecoration>,
 ) -> Vec<Range<usize>> {
-    if !matches!(line.kind, LineKind::Deletion | LineKind::Addition) {
+    if !matches!(kind, LineKind::Deletion | LineKind::Addition) {
         return Vec::new();
     }
-    decoration
-        .into_iter()
-        .flat_map(LineDecoration::intraline_ranges)
+    let spans = decoration.map_or(&[][..], LineDecoration::intraline_ranges);
+    let first = spans.partition_point(|range| range.end <= row.content_range.start);
+    let end = spans.partition_point(|range| range.start < row.content_range.end);
+    spans[first..end]
+        .iter()
         .flat_map(|range| row.rendered_ranges_for_logical(range.clone()))
         .collect()
 }
 
 fn direct_whitespace_replacements(
-    layout: &DocumentLayout,
+    line_rows: &[VisualRow],
     row: &VisualRow,
     row_index: usize,
-    line: &DocumentLine,
+    line: &DocumentLineRef<'_>,
     decoration: Option<&LineDecoration>,
     decorations: &DecorationSet,
 ) -> HashMap<usize, char> {
@@ -774,17 +2079,24 @@ fn direct_whitespace_replacements(
     let Some(decoration) = decoration else {
         return replacements;
     };
-    for changed in decoration.intraline_ranges() {
-        let Some(text) = line.text.get(changed.clone()) else {
+    let spans = decoration.intraline_ranges();
+    let first = spans.partition_point(|range| range.end <= row.content_range.start);
+    let end = spans.partition_point(|range| range.start < row.content_range.end);
+    for changed in &spans[first..end] {
+        let visible =
+            changed.start.max(row.content_range.start)..changed.end.min(row.content_range.end);
+        let Some(text) = line.text.get(visible.clone()) else {
             continue;
         };
         for (relative, character) in text.char_indices() {
             if !matches!(character, ' ' | '\t') {
                 continue;
             }
-            let logical = changed.start + relative;
-            let first_row = layout.row_for_anchor(line.id, logical) == Some(row_index);
-            for mapped in row.rendered_ranges_for_logical(logical..logical + character.len_utf8()) {
+            let logical = visible.start + relative;
+            let logical_range = logical..logical + character.len_utf8();
+            let first_row =
+                row_index == 0 || !line_rows[row_index - 1].renders_logical_range(&logical_range);
+            for mapped in row.rendered_ranges_for_logical(logical_range) {
                 for rendered in mapped.clone() {
                     if row.text.as_bytes().get(rendered) != Some(&b' ') {
                         continue;
@@ -796,6 +2108,68 @@ fn direct_whitespace_replacements(
                     };
                     replacements.insert(rendered, glyph);
                 }
+            }
+        }
+    }
+    replacements
+}
+
+fn direct_streaming_whitespace_replacements(
+    previous: Option<&VisualRow>,
+    row: &VisualRow,
+    decoration: Option<&LineDecoration>,
+    whitespace: crate::cli::WhitespaceChoice,
+) -> HashMap<usize, char> {
+    let mut replacements = HashMap::new();
+    if whitespace != crate::cli::WhitespaceChoice::Show {
+        return replacements;
+    }
+    let Some(decoration) = decoration else {
+        return replacements;
+    };
+    let changed = decoration.intraline_ranges();
+    if changed.is_empty() {
+        return replacements;
+    }
+
+    for mapping in row.span_mappings() {
+        if !changed
+            .iter()
+            .any(|range| range.start < mapping.logical.end && range.end > mapping.logical.start)
+        {
+            continue;
+        }
+        if mapping.is_tab() {
+            let first_fragment =
+                previous.is_none_or(|row| !row.renders_logical_range(&mapping.logical));
+            for rendered in mapping.rendered.clone() {
+                if row.text.as_bytes().get(rendered) != Some(&b' ') {
+                    continue;
+                }
+                let glyph = if first_fragment && rendered == mapping.rendered.start {
+                    '→'
+                } else {
+                    '·'
+                };
+                replacements.insert(rendered, glyph);
+            }
+            continue;
+        }
+
+        let Some(text) = row.text.get(mapping.rendered.clone()) else {
+            continue;
+        };
+        for (relative, character) in text.char_indices() {
+            if character != ' ' {
+                continue;
+            }
+            let logical = mapping.logical.start.saturating_add(relative);
+            let logical_range = logical..logical.saturating_add(1);
+            if changed
+                .iter()
+                .any(|range| range.start < logical_range.end && range.end > logical_range.start)
+            {
+                replacements.insert(mapping.rendered.start + relative, '·');
             }
         }
     }
@@ -824,19 +2198,47 @@ fn replace_direct_whitespace(
 }
 
 /// File grammarへ入る前のplain/commit metadata lineを、既出document全体のreflowなしで直接書く。
+/// 指定rangeをstable ID順に1行ずつdecodeし、reader bufferと1行分のrow bufferだけを再利用する。
 /// Source lineはfile entry単位のgutter確定が必要なので、このAPIへ渡さない。
 pub fn write_direct_metadata_lines<W: Write>(
     writer: &mut W,
-    lines: &[DocumentLine],
+    document: &DocumentSnapshot,
+    line_range: Range<usize>,
     width: usize,
     tab_width: usize,
     theme: &Theme,
 ) -> Result<(), DirectWriteError> {
+    validate_tab_width(tab_width)?;
+    let mut reader = DocumentLineReader::new();
+    let mut metadata_reader = DocumentLineMetadataReader::new();
     let mut rows = Vec::new();
-    for line in lines {
-        append_metadata_rows(&mut rows, line, width, tab_width)?;
+    for index in line_range.start..line_range.end.min(document.line_count()) {
+        let line_id = document
+            .line_id_at(index)
+            .ok_or(DirectWriteError::UnavailableLineIndex { index })?;
+        let metadata = metadata_reader
+            .read(document, line_id)?
+            .ok_or(DirectWriteError::MissingLine { line_id })?;
+        let gutter = gutter_spec_for_metadata(document, metadata);
+        if line_requires_streaming_layout(metadata, width, tab_width, gutter)? {
+            let mut stream = LargeLineRows::new(document, line_id, width, tab_width, gutter)?;
+            while let Some(row) = stream.next_row()? {
+                write_large_undecorated_row(writer, &row, metadata.kind, theme)?;
+            }
+            continue;
+        }
+        let line = reader
+            .read(document, line_id)?
+            .ok_or(DirectWriteError::MissingLine { line_id })?;
+        rows.clear();
+        append_metadata_rows(&mut rows, &line, width, tab_width)?;
+        for row in &rows {
+            write_style(writer, theme.style(row.role))?;
+            writer.write_all(row.text.as_bytes())?;
+            writer.write_all(b"\x1b[0m\n")?;
+        }
     }
-    write_direct_rows(writer, &rows, theme)?;
+    writer.flush()?;
     Ok(())
 }
 
@@ -846,7 +2248,43 @@ pub enum DirectWriteError {
     #[error(transparent)]
     Layout(#[from] LayoutError),
     #[error(transparent)]
+    Document(#[from] DocumentError),
+    #[error(transparent)]
+    Decoration(#[from] DecorationComputeError),
+    #[error(transparent)]
+    LargeLine(#[from] LargeLineError),
+    #[error("decoration set belongs to a different document lineage")]
+    DecorationLineageMismatch,
+    #[error("document snapshot does not contain logical line {line_id}")]
+    MissingLine { line_id: LineId },
+    #[error("document snapshot cannot represent logical line index {index} as a stable ID")]
+    UnavailableLineIndex { index: usize },
+    #[error("logical line {line_id} requires bounded streaming layout")]
+    StreamingRequired { line_id: LineId },
+    #[error("logical line {line_id} produced no visual rows")]
+    MissingVisualRows { line_id: LineId },
+    #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+impl From<DocumentLayoutError> for DirectWriteError {
+    fn from(error: DocumentLayoutError) -> Self {
+        match error {
+            DocumentLayoutError::Layout(error) => Self::Layout(error),
+            DocumentLayoutError::Document(error) => Self::Document(error),
+            DocumentLayoutError::LargeLine(error) => Self::LargeLine(error),
+            DocumentLayoutError::MissingLine { line_id } => Self::MissingLine { line_id },
+            DocumentLayoutError::UnavailableLineIndex { index } => {
+                Self::UnavailableLineIndex { index }
+            }
+            DocumentLayoutError::StreamingRequired { line_id } => {
+                Self::StreamingRequired { line_id }
+            }
+            DocumentLayoutError::MissingVisualRows { line_id } => {
+                Self::MissingVisualRows { line_id }
+            }
+        }
+    }
 }
 
 fn write_style<W: Write>(writer: &mut W, style: Style) -> io::Result<()> {
@@ -924,8 +2362,46 @@ mod tests {
     use super::*;
     use crate::cli::WhitespaceChoice;
     use crate::decorations::DecorationSet;
-    use crate::parser::parse_bytes;
+    use crate::document::OwnedDocumentLine;
+    use crate::document_store::CHUNKED_LINE_RAW_BYTES;
+    use crate::parser::parse_bytes as parse_snapshot;
     use crate::theme::ColorLevel;
+
+    fn parse_bytes(input: &[u8]) -> DocumentSnapshot {
+        parse_snapshot(input).unwrap()
+    }
+
+    fn read_lines(document: &DocumentSnapshot) -> Vec<OwnedDocumentLine> {
+        let mut reader = DocumentLineReader::new();
+        (0..document.line_count())
+            .map(|index| {
+                let line_id = document.line_id_at(index).unwrap();
+                reader.read_owned(document, line_id).unwrap().unwrap()
+            })
+            .collect()
+    }
+
+    fn line_with_kind(document: &DocumentSnapshot, kind: LineKind) -> OwnedDocumentLine {
+        read_lines(document)
+            .into_iter()
+            .find(|line| line.kind == kind)
+            .unwrap()
+    }
+
+    fn plain_metadata(display_len: u32, raw_len: u64) -> DocumentLineMetadata {
+        DocumentLineMetadata {
+            id: LineId::new(0),
+            kind: LineKind::Plain,
+            commit_id: None,
+            file_id: None,
+            hunk_id: None,
+            old_line_number: None,
+            new_line_number: None,
+            terminated: true,
+            raw_len,
+            display_len: crate::document::LineDisplayLength::Exact(display_len),
+        }
+    }
 
     #[test]
     fn gutter_spec_is_compact_and_keeps_the_minimum_alignment() {
@@ -939,14 +2415,21 @@ mod tests {
     fn zero_tab_width_is_rejected_for_tab_free_and_empty_documents() {
         let document = parse_bytes(b"metadata without tabs\n");
         let expected = LayoutError::InvalidTabWidth { actual: 0 };
+        let line = line_with_kind(&document, LineKind::Plain);
         assert_eq!(
-            layout_line(&document.lines()[0], 80, 0, GutterSpec::MINIMUM).unwrap_err(),
+            layout_line(&line.as_borrowed(), 80, 0, GutterSpec::MINIMUM).unwrap_err(),
             expected,
         );
-        assert_eq!(layout_document(&document, 80, 0).unwrap_err(), expected);
+        assert!(matches!(
+            layout_document(&document, 80, 0),
+            Err(DocumentLayoutError::Layout(error)) if error == expected
+        ));
 
         let empty = parse_bytes(b"");
-        assert_eq!(layout_document(&empty, 80, 0).unwrap_err(), expected);
+        assert!(matches!(
+            layout_document(&empty, 80, 0),
+            Err(DocumentLayoutError::Layout(error)) if error == expected
+        ));
     }
 
     #[test]
@@ -954,14 +2437,10 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -12345 +54321 @@\n value\n",
         );
-        let context = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Context)
-            .unwrap();
+        let context = line_with_kind(&document, LineKind::Context);
 
         assert_eq!(
-            layout_line(context, 0, 4, GutterSpec::new(3, 4)).unwrap_err(),
+            layout_line(&context.as_borrowed(), 0, 4, GutterSpec::new(3, 4)).unwrap_err(),
             LayoutError::UndersizedGutter {
                 old_width: 3,
                 required_old_width: 5,
@@ -987,14 +2466,15 @@ mod tests {
         let tab_width = 4;
         let whole = layout_document(&document, width, tab_width).unwrap();
         let gutter_specs = file_gutter_specs(&document);
+        let lines = read_lines(&document);
         let mut per_line = Vec::new();
 
-        for line in document.lines() {
+        for line in &lines {
             let gutter = line
                 .file_id
                 .and_then(|id| gutter_specs.get(&id).copied())
                 .unwrap_or_default();
-            let line_layout = layout_line(line, width, tab_width, gutter).unwrap();
+            let line_layout = layout_line(&line.as_borrowed(), width, tab_width, gutter).unwrap();
             let cloned = line_layout.clone();
             assert_eq!(line_layout.rows().as_ptr(), cloned.rows().as_ptr());
 
@@ -1010,12 +2490,11 @@ mod tests {
         let metadata = &per_line[0];
         assert_eq!(metadata.rows()[0].text, "ab  界cd");
 
-        let deletion = document
-            .lines()
+        let deletion = lines
             .iter()
             .find(|line| line.kind == LineKind::Deletion)
             .unwrap();
-        let deletion_layout = &per_line[deletion.id.index()];
+        let deletion_layout = &per_line[usize::try_from(deletion.id.get()).unwrap()];
         assert_eq!(
             deletion_layout
                 .rows()
@@ -1059,9 +2538,10 @@ mod tests {
     #[test]
     fn line_layout_reports_the_same_too_narrow_errors_as_document_layout() {
         let metadata = parse_bytes(b"metadata\n");
+        let metadata_line = line_with_kind(&metadata, LineKind::Plain);
         assert_eq!(
             layout_line(
-                &metadata.lines()[0],
+                &metadata_line.as_borrowed(),
                 0,
                 4,
                 GutterSpec::new(u8::MAX, u8::MAX),
@@ -1071,31 +2551,30 @@ mod tests {
                 required: 1,
             })
         );
-        assert_eq!(
-            layout_document(&metadata, 0, 4).unwrap_err(),
-            LayoutError::TooNarrow {
+        assert!(matches!(
+            layout_document(&metadata, 0, 4),
+            Err(DocumentLayoutError::Layout(LayoutError::TooNarrow {
                 actual: 0,
                 required: 1,
-            }
-        );
+            }))
+        ));
 
         let source = parse_bytes(
-            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +12345 @@\n+value\n",
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,0 +12345 @@\n+value\n",
         );
-        let addition = source
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Addition)
-            .unwrap();
+        let addition = line_with_kind(&source, LineKind::Addition);
         let expected = LayoutError::TooNarrow {
             actual: 12,
             required: 13,
         };
         assert_eq!(
-            layout_line(addition, 12, 4, GutterSpec::new(3, 5)).unwrap_err(),
+            layout_line(&addition.as_borrowed(), 12, 4, GutterSpec::new(3, 5),).unwrap_err(),
             expected,
         );
-        assert_eq!(layout_document(&source, 12, 4).unwrap_err(), expected);
+        assert!(matches!(
+            layout_document(&source, 12, 4),
+            Err(DocumentLayoutError::Layout(error)) if error == expected
+        ));
     }
 
     #[test]
@@ -1155,11 +2634,7 @@ mod tests {
             .concat();
         assert_eq!(rendered_source, "foo");
 
-        let addition = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Addition)
-            .unwrap();
+        let addition = line_with_kind(&document, LineKind::Addition);
         let row = layout.row_for_anchor(addition.id, 2).unwrap();
         assert!(layout.rows()[row].text.ends_with("fo"));
     }
@@ -1179,26 +2654,615 @@ mod tests {
     }
 
     #[test]
+    fn startup_row_count_stops_at_the_requested_threshold() {
+        let document = parse_bytes(b"first\nsecond\nthird\n");
+        assert_eq!(count_rendered_rows_up_to(&document, 80, 4, 2).unwrap(), 2);
+        assert_eq!(count_rendered_rows_up_to(&document, 80, 4, 10).unwrap(), 3);
+    }
+
+    #[test]
+    fn streaming_preflight_covers_raw_ansi_narrow_rows_tabs_and_mapping_weight() {
+        let one_mib = MAX_SYNTAX_LINE_BYTES as u32;
+        let raw_ansi = plain_metadata(0, (MAX_SYNTAX_LINE_BYTES + 1) as u64);
+        assert!(line_requires_streaming_layout(raw_ansi, 80, 4, GutterSpec::default()).unwrap());
+
+        let narrow = plain_metadata(one_mib, u64::from(one_mib));
+        assert!(line_requires_streaming_layout(narrow, 1, 4, GutterSpec::default()).unwrap());
+
+        let tab_heavy_rows = estimated_eager_rows(MAX_SYNTAX_LINE_BYTES, 1_000, 4);
+        assert!(tab_heavy_rows <= MAX_EAGER_VISUAL_ROWS_PER_LINE);
+        assert!(
+            estimated_eager_layout_bytes(
+                MAX_SYNTAX_LINE_BYTES,
+                tab_heavy_rows,
+                LineKind::Plain,
+                GutterSpec::default(),
+                4,
+            ) > MAX_EAGER_LINE_LAYOUT_BYTES
+        );
+        assert!(line_requires_streaming_layout(narrow, 1_000, 4, GutterSpec::default()).unwrap());
+
+        let one_row_width = MAX_SYNTAX_LINE_BYTES * 4;
+        assert_eq!(
+            estimated_eager_rows(MAX_SYNTAX_LINE_BYTES, one_row_width, 4),
+            1
+        );
+        assert!(
+            line_requires_streaming_layout(narrow, one_row_width, 4, GutterSpec::default())
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn full_document_layout_rejects_raw_huge_display_short_lines_before_decode() {
+        let mut input = b"\x1b]title;".to_vec();
+        input.extend(std::iter::repeat_n(
+            b'x',
+            MAX_SYNTAX_LINE_BYTES + CHUNKED_LINE_RAW_BYTES,
+        ));
+        input.extend_from_slice(b"\x07\n");
+        let document = parse_bytes(&input);
+        let metadata = DocumentLineMetadataReader::new()
+            .read(&document, LineId::new(0))
+            .unwrap()
+            .unwrap();
+        assert_eq!(metadata.display_len.exact(), Some(0));
+        assert!(metadata.raw_len > MAX_SYNTAX_LINE_BYTES as u64);
+        assert!(matches!(
+            layout_document(&document, 80, 4),
+            Err(DocumentLayoutError::StreamingRequired { line_id })
+                if line_id == LineId::new(0)
+        ));
+    }
+
+    #[test]
+    fn public_large_line_step_yields_before_scanning_an_ansi_only_line() {
+        let mut input = b"\x1b]title;".to_vec();
+        input.extend(std::iter::repeat_n(
+            b'x',
+            MAX_SYNTAX_LINE_BYTES + CHUNKED_LINE_RAW_BYTES,
+        ));
+        input.extend_from_slice(b"\x07\n");
+        let document = parse_bytes(&input);
+        let mut reader = LargeLineTextReader::new();
+        let _ = reader.start(&document, LineId::new(0), 0).unwrap();
+
+        assert!(matches!(
+            reader.next_step().unwrap(),
+            crate::large_line::LargeLineReadStep::Progress
+        ));
+        assert_eq!(reader.stats().raw_bytes_read, CHUNKED_LINE_RAW_BYTES as u64);
+    }
+
+    #[test]
+    fn direct_range_writers_emit_only_selected_stable_lines() {
+        let document = parse_bytes(b"first\nsecond\nthird\n");
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(&document, &theme, WhitespaceChoice::Ignore).unwrap();
+
+        let mut decorated = Vec::new();
+        write_direct_decorated_range(&mut decorated, &document, &decorations, &theme, 1..2, 80, 4)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(crate::ansi::strip_ansi(&decorated)).unwrap(),
+            "second\n"
+        );
+
+        let mut metadata = Vec::new();
+        write_direct_metadata_lines(&mut metadata, &document, 1..3, 80, 4, &theme).unwrap();
+        assert_eq!(
+            String::from_utf8(crate::ansi::strip_ansi(&metadata)).unwrap(),
+            "second\nthird\n"
+        );
+    }
+
+    #[test]
+    fn decorated_range_layout_is_derived_from_the_supplied_snapshot() {
+        let document = parse_bytes(b"new first\nnew second\n");
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(&document, &theme, WhitespaceChoice::Ignore).unwrap();
+        let mut output = Vec::new();
+        write_direct_decorated_range(
+            &mut output,
+            &document,
+            &decorations,
+            &theme,
+            0..document.line_count(),
+            80,
+            4,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(crate::ansi::strip_ansi(&output)).unwrap(),
+            "new first\nnew second\n"
+        );
+    }
+
+    #[test]
+    fn decorated_direct_writer_rejects_another_document_lineage() {
+        let first = parse_bytes(b"first\n");
+        let second = parse_bytes(b"second\n");
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
+        let decorations = DecorationSet::compute(&first, &theme, WhitespaceChoice::Ignore).unwrap();
+        let error = write_direct_decorated_range(
+            &mut Vec::new(),
+            &second,
+            &decorations,
+            &theme,
+            0..1,
+            80,
+            4,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, DirectWriteError::DecorationLineageMismatch));
+    }
+
+    #[test]
     fn decorated_direct_output_visualizes_changed_whitespace() {
         let document = parse_bytes(
             b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-\tfoo\n+    foo\n",
         );
-        let layout = layout_document(&document, 60, 4).unwrap();
         let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
-        let decorations = DecorationSet::compute(&document, &theme, WhitespaceChoice::Show);
+        let decorations =
+            DecorationSet::compute(&document, &theme, WhitespaceChoice::Show).unwrap();
         let mut output = Vec::new();
         write_direct_decorated_range(
             &mut output,
-            &layout,
             &document,
             &decorations,
             &theme,
-            0..document.lines().len(),
+            0..document.line_count(),
+            60,
+            4,
         )
         .unwrap();
         let plain = crate::ansi::strip_ansi(&output);
         let rendered = String::from_utf8(plain).unwrap();
         assert!(rendered.contains("-→···foo"), "{rendered}");
         assert!(rendered.contains("+····foo"), "{rendered}");
+    }
+
+    #[test]
+    fn wrapped_changed_tab_emits_one_arrow_across_all_mapped_rows() {
+        let document = parse_bytes(
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-\told\n+new\n",
+        );
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(&document, &theme, WhitespaceChoice::Show).unwrap();
+        let mut output = Vec::new();
+        write_direct_decorated_range(
+            &mut output,
+            &document,
+            &decorations,
+            &theme,
+            0..document.line_count(),
+            12,
+            4,
+        )
+        .unwrap();
+        let rendered = String::from_utf8(crate::ansi::strip_ansi(&output)).unwrap();
+        assert_eq!(rendered.matches('→').count(), 1, "{rendered}");
+        assert_eq!(rendered.matches('·').count(), 3, "{rendered}");
+    }
+
+    #[test]
+    fn streaming_decorated_rows_preserve_tab_and_plain_whitespace_markers() {
+        let old_tail = "let old_value = 1; ".repeat(320);
+        let new_tail = "let new_value = 2; ".repeat(320);
+        let input = format!(
+            "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-\t{old_tail}\n+    {new_tail}\n"
+        );
+        let document = parse_bytes(input.as_bytes());
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::TrueColor);
+        let decorations =
+            DecorationSet::compute(&document, &theme, WhitespaceChoice::Show).unwrap();
+        let deletion = line_with_kind(&document, LineKind::Deletion);
+        let metadata = DocumentLineMetadataReader::new()
+            .read(&document, deletion.id)
+            .unwrap()
+            .unwrap();
+        let gutter = gutter_spec_for_metadata(&document, metadata);
+        assert!(line_requires_streaming_layout(metadata, 11, 4, gutter).unwrap());
+        assert!(
+            !decorations
+                .line(deletion.id)
+                .unwrap()
+                .intraline_ranges()
+                .is_empty()
+        );
+
+        let mut eager = Vec::new();
+        write_direct_decorated_range(
+            &mut eager,
+            &document,
+            &decorations,
+            &theme,
+            0..document.line_count(),
+            80,
+            4,
+        )
+        .unwrap();
+        let mut streaming = Vec::new();
+        write_direct_decorated_range(
+            &mut streaming,
+            &document,
+            &decorations,
+            &theme,
+            0..document.line_count(),
+            11,
+            4,
+        )
+        .unwrap();
+        let eager = String::from_utf8(crate::ansi::strip_ansi(&eager)).unwrap();
+        let streaming = String::from_utf8(crate::ansi::strip_ansi(&streaming)).unwrap();
+
+        assert_eq!(streaming.matches('→').count(), eager.matches('→').count());
+        assert_eq!(streaming.matches('·').count(), eager.matches('·').count());
+        assert_eq!(streaming.matches('→').count(), 1);
+    }
+
+    #[test]
+    fn streaming_rows_match_regular_layout_for_ansi_unicode_combining_emoji_and_tabs() {
+        let document = parse_bytes(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,1 @@\n+\u{1b}[31mA\t界e\u{301}👩‍💻 xyz\u{1b}[0m\n"
+                .as_bytes(),
+        );
+        let line = line_with_kind(&document, LineKind::Addition);
+        let gutter = gutter_spec_for_line(&document, &line.as_borrowed());
+        let expected = layout_line(&line.as_borrowed(), 15, 4, gutter).unwrap();
+        let mut stream = LargeLineRows::new(&document, line.id, 15, 4, gutter).unwrap();
+        let mut actual = Vec::new();
+        while let Some(row) = stream.next_row().unwrap() {
+            actual.push(row);
+        }
+
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.iter().zip(expected.rows()) {
+            assert_eq!(actual.text, expected.text);
+            assert_eq!(actual.content_range, expected.content_range);
+            assert_eq!(
+                actual.rendered_content_range,
+                expected.rendered_content_range
+            );
+            assert_eq!(actual.continuation, expected.continuation);
+            for offset in actual.content_range.clone() {
+                assert_eq!(
+                    actual.rendered_ranges_for_logical(offset..offset + 1),
+                    expected.rendered_ranges_for_logical(offset..offset + 1),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_grapheme_fallback_keeps_eager_boundaries_after_discarding_its_prefix() {
+        let mut input = String::from("👩");
+        input.extend(std::iter::repeat_n('\u{301}', 32_770));
+        input.push('\u{200d}');
+        input.push('👩');
+        input.push('\n');
+        let document = parse_bytes(input.as_bytes());
+        let line = DocumentLineReader::new()
+            .read_owned(&document, LineId::new(0))
+            .unwrap()
+            .unwrap();
+        let expected = wrap_hard(&line.text, 3);
+        let mut stream =
+            LargeLineRows::new(&document, line.id, 3, 4, GutterSpec::default()).unwrap();
+        let mut actual = Vec::new();
+        while let Some(row) = stream.next_row().unwrap() {
+            actual.push(row);
+        }
+
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.content_range.clone())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|segment| segment.byte_range.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            actual
+                .iter()
+                .map(|row| row.text.as_str())
+                .collect::<Vec<_>>(),
+            expected
+                .iter()
+                .map(|segment| &line.text[segment.byte_range.clone()])
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn large_line_startup_count_stops_after_the_first_raw_chunk() {
+        let mut input = vec![b'x'; MAX_SYNTAX_LINE_BYTES + CHUNKED_LINE_RAW_BYTES];
+        input.push(b'\n');
+        let document = parse_bytes(&input);
+        let line_id = document.line_id_at(0).unwrap();
+
+        let (rows, stats) =
+            count_large_line_rows_up_to(&document, line_id, 10, 4, GutterSpec::default(), 2)
+                .unwrap();
+
+        assert_eq!(rows, 2);
+        assert!(stats.raw_bytes_read <= CHUNKED_LINE_RAW_BYTES as u64);
+        assert!(stats.peak_buffered_bytes < 1024 * 1024);
+        assert!(stats.raw_bytes_read < input.len() as u64);
+    }
+
+    #[test]
+    fn empty_large_row_window_does_not_read_toward_its_anchor() {
+        let mut input = vec![b'x'; MAX_SYNTAX_LINE_BYTES + CHUNKED_LINE_RAW_BYTES];
+        input.push(b'\n');
+        let document = parse_bytes(&input);
+        let line_id = document.line_id_at(0).unwrap();
+
+        let window = collect_large_line_row_window(
+            &document,
+            line_id,
+            10,
+            4,
+            GutterSpec::default(),
+            LargeRowAnchor {
+                byte_offset: MAX_SYNTAX_LINE_BYTES,
+                fragment: 0,
+            },
+            0,
+        )
+        .unwrap();
+
+        assert!(window.rows.is_empty());
+        assert_eq!(window.stats, LargeLineStats::default());
+    }
+
+    #[test]
+    fn navigator_reuses_forward_decoder_progress_across_repeated_single_row_steps() {
+        let mut input = vec![b'x'; 2 * MAX_SYNTAX_LINE_BYTES];
+        input.push(b'\n');
+        let document = parse_bytes(&input);
+        let line_id = document.line_id_at(0).unwrap();
+        let mut navigator = LargeLineNavigator::new(
+            &document,
+            line_id,
+            80,
+            4,
+            GutterSpec::default(),
+            LargeRowAnchor::default(),
+        )
+        .unwrap();
+
+        for _ in 0..1_000 {
+            assert!(navigator.next_row().unwrap().is_some());
+        }
+        let stats = navigator.stats();
+        assert!(stats.raw_bytes_read <= 3 * CHUNKED_LINE_RAW_BYTES as u64);
+        assert!(stats.raw_bytes_read < input.len() as u64);
+    }
+
+    #[test]
+    fn navigator_handles_unbounded_step_counts_without_count_sized_storage() {
+        let document = parse_bytes(format!("{}\n", "x".repeat(20_000)).as_bytes());
+        let line_id = document.line_id_at(0).unwrap();
+        let mut navigator = LargeLineNavigator::new(
+            &document,
+            line_id,
+            10,
+            4,
+            GutterSpec::default(),
+            LargeRowAnchor::default(),
+        )
+        .unwrap();
+
+        let end = navigator.step_forward(usize::MAX).unwrap();
+        assert!(end.reached_line_boundary);
+        assert!(end.anchor.byte_offset > 0);
+        let start = navigator.step_backward(usize::MAX).unwrap();
+        assert!(start.reached_line_boundary);
+        assert_eq!(start.anchor, LargeRowAnchor::default());
+    }
+
+    #[test]
+    fn navigator_window_stays_within_byte_budget_for_zero_width_heavy_rows() {
+        let mut input = String::new();
+        for _ in 0..8 {
+            input.push('a');
+            input.extend(std::iter::repeat_n('\u{301}', 120_000));
+        }
+        input.push('\n');
+        let document = parse_bytes(input.as_bytes());
+        let line_id = document.line_id_at(0).unwrap();
+        let mut navigator = LargeLineNavigator::new(
+            &document,
+            line_id,
+            1,
+            4,
+            GutterSpec::default(),
+            LargeRowAnchor::default(),
+        )
+        .unwrap();
+
+        let window = navigator
+            .collect_window_bounded(5_000, 1024 * 1024)
+            .unwrap();
+        assert!(window.byte_limited);
+        assert!(window.rows.len() < 5_000);
+        assert!(window.retained_bytes <= 1024 * 1024);
+        assert!(
+            window
+                .rows
+                .iter()
+                .all(|row| visual_row_weight(row) <= MAX_STREAMING_VISUAL_ROW_BYTES)
+        );
+        assert!(matches!(
+            navigator.collect_window(usize::MAX),
+            Err(DocumentLayoutError::Layout(
+                LayoutError::StreamingWindowRowLimit { .. }
+            ))
+        ));
+        assert!(matches!(
+            navigator.collect_window_bounded(1, 0),
+            Err(DocumentLayoutError::Layout(
+                LayoutError::StreamingWindowByteLimit { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn direct_writer_emits_every_byte_of_a_large_plain_line_in_order() {
+        let content = "ab界\t".repeat((MAX_SYNTAX_LINE_BYTES / 6) + 2);
+        let document = parse_bytes(format!("{content}\n").as_bytes());
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(&document, &theme, WhitespaceChoice::Ignore).unwrap();
+        let mut output = Vec::new();
+        write_direct_decorated_range(&mut output, &document, &decorations, &theme, 0..1, 80, 4)
+            .unwrap();
+        let rendered = String::from_utf8(crate::ansi::strip_ansi(&output)).unwrap();
+        let without_wraps = rendered.replace('\n', "");
+        let expected = crate::text::expand_tabs(&content, 4);
+        assert_eq!(without_wraps, expected);
+    }
+
+    #[test]
+    fn large_row_window_selects_a_wrapped_tab_fragment_without_retaining_prefix_rows() {
+        let document = parse_bytes(
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,1 @@\n+\tfoo\n",
+        );
+        let addition = line_with_kind(&document, LineKind::Addition);
+        let gutter = gutter_spec_for_line(&document, &addition.as_borrowed());
+        let window = collect_large_line_row_window(
+            &document,
+            addition.id,
+            12,
+            4,
+            gutter,
+            LargeRowAnchor {
+                byte_offset: 1,
+                fragment: 1,
+            },
+            1,
+        )
+        .unwrap();
+        let rows = window.rows;
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].continuation);
+        assert_eq!(
+            rows[0]
+                .rendered_ranges_for_logical(1..2)
+                .into_iter()
+                .map(|range| rows[0].text[range].to_owned())
+                .collect::<String>(),
+            "  "
+        );
+    }
+
+    #[test]
+    fn large_row_anchor_at_normal_wrap_boundary_selects_the_following_row() {
+        let document = parse_bytes(b"abcdefgh\n");
+        let line_id = document.line_id_at(0).unwrap();
+        let window = collect_large_line_row_window(
+            &document,
+            line_id,
+            4,
+            4,
+            GutterSpec::default(),
+            LargeRowAnchor {
+                byte_offset: 4,
+                fragment: 0,
+            },
+            1,
+        )
+        .unwrap();
+        let rows = window.rows;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].text, "efgh");
+    }
+
+    #[test]
+    fn tab_fragment_does_not_count_the_preceding_row_whose_range_only_ends_at_tab() {
+        let document = parse_bytes(
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,1 @@\n+a\t\n",
+        );
+        let addition = line_with_kind(&document, LineKind::Addition);
+        let gutter = gutter_spec_for_line(&document, &addition.as_borrowed());
+        let window = collect_large_line_row_window(
+            &document,
+            addition.id,
+            11,
+            4,
+            gutter,
+            LargeRowAnchor {
+                byte_offset: 2,
+                fragment: 0,
+            },
+            1,
+        )
+        .unwrap();
+        let rows = window.rows;
+
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].continuation);
+        assert_eq!(rows[0].text.chars().last(), Some(' '));
+        assert!(!rows[0].text.ends_with('a'));
+    }
+
+    #[test]
+    fn navigator_counts_a_tab_started_inside_the_previous_row_as_fragment_zero() {
+        let document = parse_bytes(
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -0,0 +1,1 @@\n+a\t\n",
+        );
+        let addition = line_with_kind(&document, LineKind::Addition);
+        let gutter = gutter_spec_for_line(&document, &addition.as_borrowed());
+        let mut navigator = LargeLineNavigator::new(
+            &document,
+            addition.id,
+            12,
+            4,
+            gutter,
+            LargeRowAnchor::default(),
+        )
+        .unwrap();
+
+        let (anchor, row) = navigator.next_row().unwrap().unwrap();
+        assert_eq!(
+            anchor,
+            LargeRowAnchor {
+                byte_offset: 2,
+                fragment: 1,
+            }
+        );
+        assert_eq!(
+            row.rendered_ranges_for_logical(2..3)
+                .into_iter()
+                .map(|range| row.text[range].to_owned())
+                .collect::<String>(),
+            "  "
+        );
+    }
+
+    #[test]
+    fn pathological_zero_width_cluster_run_returns_a_bounded_error() {
+        let mut input = String::from("a");
+        input.extend(std::iter::repeat_n('\u{301}', 600_000));
+        input.push('\n');
+        let document = parse_bytes(input.as_bytes());
+        let line_id = document.line_id_at(0).unwrap();
+
+        let error =
+            count_large_line_rows_up_to(&document, line_id, 80, 4, GutterSpec::default(), 1)
+                .unwrap_err();
+        assert!(matches!(
+            error,
+            DocumentLayoutError::Layout(LayoutError::PathologicalRowBytes { .. })
+        ));
     }
 }

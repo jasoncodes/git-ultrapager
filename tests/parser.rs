@@ -1,7 +1,72 @@
 use git_ultrapager::ansi::{AnsiStripper, escape_interactive_bytes, escape_path_bytes};
+use git_ultrapager::direct::layout_document;
+use git_ultrapager::document::{DocumentLineReader, DocumentSnapshot, OwnedDocumentLine};
+use git_ultrapager::input::AppendStore;
 use git_ultrapager::model::{ChangeStatus, CommitKind, FileMode, HunkKind, LineKind};
-use git_ultrapager::parser::{GitParser, decode_git_path, parse_bytes};
+use git_ultrapager::parser::{
+    GitParser, ParseDelta, ParseError, decode_git_path, parse_bytes as parse_bytes_result,
+};
+use git_ultrapager::storage::StructuralStorage;
 use pretty_assertions::assert_eq;
+
+fn parse_bytes(input: &[u8]) -> DocumentSnapshot {
+    parse_bytes_result(input).unwrap()
+}
+
+fn decoded_lines(document: &DocumentSnapshot) -> Vec<OwnedDocumentLine> {
+    let mut reader = DocumentLineReader::new();
+    (0..document.line_count())
+        .map(|index| {
+            let id = document.line_id_at(index).unwrap();
+            reader.read_owned(document, id).unwrap().unwrap()
+        })
+        .collect()
+}
+
+fn streaming_parser() -> (AppendStore, GitParser) {
+    let raw = AppendStore::new();
+    let storage = StructuralStorage::new().unwrap();
+    let parser = GitParser::new(raw.clone(), &storage).unwrap();
+    (raw, parser)
+}
+
+fn push_stored(
+    raw: &AppendStore,
+    parser: &mut GitParser,
+    bytes: &[u8],
+) -> Result<ParseDelta, ParseError> {
+    let start = raw.append(bytes).unwrap();
+    parser.push(start, bytes)
+}
+
+#[test]
+fn parser_publishes_store_backed_snapshot_from_absolute_offsets() {
+    let raw = AppendStore::new();
+    let storage = StructuralStorage::new().unwrap();
+    let mut parser = GitParser::new(raw.clone(), &storage).unwrap();
+    let start = raw.append(b"plain\n").unwrap();
+
+    let delta = parser.push(start, b"plain\n").unwrap();
+    assert_eq!(delta.lines, 0..1);
+    let snapshot = parser.snapshot().unwrap();
+    assert_eq!(snapshot.line_count(), 1);
+}
+
+#[test]
+fn parser_rejects_chunk_bytes_that_differ_from_the_raw_store() {
+    let raw = AppendStore::new();
+    let storage = StructuralStorage::new().unwrap();
+    let mut parser = GitParser::new(raw.clone(), &storage).unwrap();
+    let start = raw.append(b"plain plain plain!\n").unwrap();
+    let before = parser.snapshot().unwrap();
+
+    assert!(matches!(
+        parser.push(start, b"diff --git a/x b/x\n"),
+        Err(ParseError::RawChunkMismatch { start: 0, end: 19 })
+    ));
+    assert!(matches!(parser.snapshot(), Err(ParseError::Poisoned)));
+    assert!(before.is_empty());
+}
 
 #[test]
 fn ansi_sequence_is_removed_across_chunk_boundaries() {
@@ -99,6 +164,9 @@ index 1111111..2222222 100644
     assert_eq!(file.additions, Some(2));
     assert_eq!(file.deletions, Some(1));
     assert!(file.span.is_closed());
+    let bounds = document.file_line_bounds(file.id).unwrap();
+    assert_eq!(bounds.max_old_line_number, Some(11));
+    assert_eq!(bounds.max_new_line_number, Some(12));
 
     let hunk = &document.hunks()[0];
     assert_eq!(hunk.kind, HunkKind::Unified);
@@ -111,8 +179,8 @@ index 1111111..2222222 100644
         Some((10, 3))
     );
 
-    let source_lines: Vec<_> = document
-        .lines()
+    let lines = decoded_lines(&document);
+    let source_lines: Vec<_> = lines
         .iter()
         .filter(|line| {
             matches!(
@@ -184,24 +252,20 @@ diff --git a/new_name.rs b/new_name.rs
 fn parser_keeps_partial_lines_and_escape_sequences_between_pushes() {
     let input =
         b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-\x1b[31mold\x1b[0m\n+new";
-    let mut parser = GitParser::new();
+    let (raw, mut parser) = streaming_parser();
     for chunk in input.chunks(3) {
-        let _ = parser.push(chunk);
+        let _ = push_stored(&raw, &mut parser, chunk).unwrap();
     }
-    let _ = parser.finish();
-    let document = parser.document();
+    let _ = raw.seal().unwrap();
+    let _ = parser.finish().unwrap();
+    let document = parser.snapshot().unwrap();
+    let lines = decoded_lines(&document);
 
     assert_eq!(document.files()[0].deletions, Some(1));
     assert_eq!(document.files()[0].additions, Some(1));
-    let deletion = document
-        .lines()
-        .iter()
-        .find(|line| line.kind == LineKind::Deletion);
+    let deletion = lines.iter().find(|line| line.kind == LineKind::Deletion);
     assert_eq!(deletion.map(|line| line.text.as_str()), Some("-old"));
-    assert_eq!(
-        document.lines().last().map(|line| line.terminated),
-        Some(false)
-    );
+    assert_eq!(lines.last().map(|line| line.terminated), Some(false));
     assert!(!document.has_trailing_newline());
 }
 
@@ -288,10 +352,73 @@ fn overflowing_hunk_range_downgrades_instead_of_repeating_line_numbers() {
     assert_eq!(document.files()[0].mode, FileMode::Malformed);
     assert_eq!(document.hunks()[0].kind, HunkKind::Malformed);
     assert!(
-        document
-            .lines()
+        decoded_lines(&document)
             .iter()
             .all(|line| line.old_line_number.is_none())
+    );
+
+    for header in [
+        "@@ -18446744073709551615,1 +1,1 @@",
+        "@@ -18446744073709551614,2 +1,1 @@",
+    ] {
+        let input = format!("diff --git a/x b/x\n--- a/x\n+++ b/x\n{header}\n-old\n+new\n");
+        let document = parse_bytes(input.as_bytes());
+        assert_eq!(document.files()[0].mode, FileMode::Malformed);
+        assert_eq!(document.hunks()[0].kind, HunkKind::Malformed);
+        assert!(
+            decoded_lines(&document)
+                .iter()
+                .all(|line| line.old_line_number.is_none())
+        );
+    }
+}
+
+#[test]
+fn incomplete_hunk_body_loses_source_semantics_after_malformed_downgrade() {
+    let (raw, mut parser) = streaming_parser();
+    let _ = push_stored(
+        &raw,
+        &mut parser,
+        b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n-old\n+new\n",
+    )
+    .unwrap();
+    let active = parser.snapshot().unwrap();
+    assert_eq!(active.files()[0].mode, FileMode::Rich);
+    assert!(decoded_lines(&active).iter().any(|line| {
+        line.text == "-old" && line.kind == LineKind::Deletion && line.old_line_number == Some(1)
+    }));
+
+    let _ = raw.seal().unwrap();
+    let document = parser.into_document().unwrap();
+    let file = &document.files()[0];
+    let body = decoded_lines(&document)
+        .into_iter()
+        .filter(|line| matches!(line.text.as_str(), "-old" | "+new"))
+        .collect::<Vec<_>>();
+
+    assert_eq!(file.mode, FileMode::Malformed);
+    assert_eq!(document.hunks()[0].kind, HunkKind::Malformed);
+    assert!(body.iter().all(|line| line.kind == LineKind::Fallback));
+    assert!(
+        body.iter()
+            .all(|line| line.old_line_number.is_none() && line.new_line_number.is_none())
+    );
+    let bounds = document.file_line_bounds(file.id).unwrap();
+    assert_eq!(bounds.max_old_line_number, None);
+    assert_eq!(bounds.max_new_line_number, None);
+
+    let layout = layout_document(&document, 80, 4).unwrap();
+    for line in &body {
+        let row = layout.row_for_line(line.id).unwrap();
+        assert_eq!(layout.rows()[row].text, line.text);
+    }
+
+    // Final snapshotのCOW downgradeは、workerが既に保持するactive snapshotを書き換えない。
+    assert_eq!(active.files()[0].mode, FileMode::Rich);
+    assert!(
+        decoded_lines(&active)
+            .iter()
+            .any(|line| line.kind == LineKind::Addition)
     );
 }
 
@@ -317,19 +444,17 @@ fn source_header_without_hunk_downgrades_only_that_file() {
 
 #[test]
 fn parse_delta_identifies_existing_tail_records_that_need_invalidation() {
-    let mut parser = GitParser::new();
-    let first = parser.push(b"diff --git a/x b/x\n@@ -1 +1 @@\n");
+    let (raw, mut parser) = streaming_parser();
+    let first = push_stored(&raw, &mut parser, b"diff --git a/x b/x\n@@ -1 +1 @@\n").unwrap();
     assert_eq!(first.updated_commit, None);
     assert_eq!(first.updated_file, None);
     assert_eq!(first.updated_hunk, None);
 
-    let second = parser.push(b"-old\n+new\n");
-    assert_eq!(
-        second.updated_commit,
-        Some(parser.document().commits()[0].id)
-    );
-    assert_eq!(second.updated_file, Some(parser.document().files()[0].id));
-    assert_eq!(second.updated_hunk, Some(parser.document().hunks()[0].id));
+    let second = push_stored(&raw, &mut parser, b"-old\n+new\n").unwrap();
+    let document = parser.snapshot().unwrap();
+    assert_eq!(second.updated_commit, Some(document.commits()[0].id));
+    assert_eq!(second.updated_file, Some(document.files()[0].id));
+    assert_eq!(second.updated_hunk, Some(document.hunks()[0].id));
 }
 
 #[test]
@@ -421,18 +546,84 @@ fn every_byte_value_and_chunk_boundary_is_safe_to_parse() {
     }
 
     for chunk_size in [1, 2, 3, 7, 31, 256] {
-        let mut parser = GitParser::new();
+        let (raw, mut parser) = streaming_parser();
         for chunk in input.chunks(chunk_size) {
-            let _ = parser.push(chunk);
+            let _ = push_stored(&raw, &mut parser, chunk).unwrap();
         }
-        let _ = parser.finish();
-        assert!(parser.document().is_complete());
+        let _ = raw.seal().unwrap();
+        let _ = parser.finish().unwrap();
+        let document = parser.snapshot().unwrap();
+        assert!(document.is_complete());
         assert!(
-            parser
-                .document()
-                .lines()
+            decoded_lines(&document)
                 .iter()
                 .all(|line| !line.text.contains('\u{1b}'))
         );
     }
+}
+
+#[test]
+fn parser_poison_hides_partial_state_after_raw_contract_failures() {
+    let (raw, mut parser) = streaming_parser();
+    let _ = raw.append(b"x").unwrap();
+
+    let error = parser.push(1, b"x").unwrap_err();
+    assert!(matches!(error, ParseError::NonContiguousRawChunk { .. }));
+    assert!(matches!(parser.snapshot(), Err(ParseError::Poisoned)));
+    assert!(matches!(parser.push(0, b"x"), Err(ParseError::Poisoned)));
+    assert!(matches!(parser.finish(), Err(ParseError::Poisoned)));
+
+    let (raw, mut parser) = streaming_parser();
+    let unstored = parser.push(0, b"x").unwrap_err();
+    assert!(matches!(unstored, ParseError::RawChunkNotStored { .. }));
+    assert!(matches!(parser.snapshot(), Err(ParseError::Poisoned)));
+    drop(raw);
+}
+
+#[test]
+fn finish_requires_the_exact_sealed_raw_high_water_mark() {
+    let (_raw, mut unsealed) = streaming_parser();
+    assert!(matches!(
+        unsealed.finish(),
+        Err(ParseError::RawInputNotSealed)
+    ));
+    assert!(matches!(unsealed.snapshot(), Err(ParseError::Poisoned)));
+
+    let (raw, mut ahead) = streaming_parser();
+    let _ = raw.append(b"unreported").unwrap();
+    let _ = raw.seal().unwrap();
+    assert!(matches!(
+        ahead.finish(),
+        Err(ParseError::RawLengthMismatch { .. })
+    ));
+    assert!(matches!(ahead.snapshot(), Err(ParseError::Poisoned)));
+}
+
+#[test]
+fn successful_finish_is_idempotent_but_later_push_is_rejected() {
+    let (raw, mut parser) = streaming_parser();
+    let first = push_stored(&raw, &mut parser, b"plain\n").unwrap();
+    assert_eq!(first.lines, 0..1);
+    let _ = raw.seal().unwrap();
+
+    let completed = parser.finish().unwrap();
+    assert!(completed.completed);
+    let repeated = parser.finish().unwrap();
+    assert_eq!(repeated.lines, 1..1);
+    assert!(repeated.completed);
+    assert!(matches!(parser.push(6, b""), Err(ParseError::Finished)));
+    assert!(parser.snapshot().unwrap().is_complete());
+}
+
+#[test]
+fn displayed_newlines_crlf_and_lone_cr_follow_sanitized_boundaries() {
+    let document = parse_bytes(b"a\x1b]hidden\ninside\x07b\r\nc\r");
+    let lines = decoded_lines(&document);
+
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].text, "ab");
+    assert!(lines[0].terminated);
+    assert_eq!(lines[1].text, "c\\x0D");
+    assert!(!lines[1].terminated);
+    assert!(!document.has_trailing_newline());
 }

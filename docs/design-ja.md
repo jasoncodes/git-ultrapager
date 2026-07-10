@@ -108,9 +108,12 @@ source 行は old/new の2列行番号を持つ。context 行は両方、削除�
 reflow して論理 anchor を維持する。metadata、commit、file header、hunk header は gutter を持たず
 全幅を使う。
 
-長い行は word boundary を探さず、利用可能な最終 cell で hard wrap する。継続 row は行番号と
-diff marker を空欄にし、source 本文開始列へ揃える。`j/k/e/y` は論理行ではなく visual row 単位で
-移動する。横 scroll と no-wrap mode は持たない。terminal resize 時は全行を reflow する。
+長い行は word boundary を探さず、利用可能な最終 cell で hard wrap する。
+継続 row は行番号と diff marker を空欄にし、source 本文開始列へ揃える。
+`j/k/e/y` は論理行ではなく visual row 単位で移動する。
+通常は Unicode grapheme 境界を保ち、1 grapheme が64 KiBを超える場合だけ Unicode scalar 境界で分割する。
+横 scroll と no-wrap mode は持たない。
+terminal resize 時は全行を reflow する。
 
 sticky header は file status、path、global occurrence `3/12`、`+18 −4` を表示する。EOF 前の総数は
 `?` とし、複数 commit では短縮 commit ID を添える。commit 前文では commit と subject を表示する。
@@ -124,8 +127,9 @@ BOF/EOF、無効 key、検索不一致、parse fallback では bell を鳴らさ
 
 `Tab` は sticky header と本文を置き換える全高 file-list overlay を開く。最下段の status bar は残す。
 commit group の下に Git 出力順の file occurrence を並べ、filter 後も相対順を変えない。entry は
-`status +added -deleted path` の1 visual rowとし、長い path は左側を `…/` で省略して basename を
-残す。選択 entry の完全 path は overlay 上部 detail line で折り返す。
+`status +added -deleted path` の1 visual rowとし、長い path は左側を `…/` で省略して basename を残す。
+選択 entry の path は overlay 上部 detail line で折り返す。
+描画時に走査する path は先頭または末尾64 KiBまでとし、それを超える detail は末尾に `…` を付けて省略する。
 
 一覧 navigation は `j/k/e/y`、矢印、page key を使い、`Enter` で対象へ jump して閉じる。`/` は
 decode 後 path に大文字小文字を無視した subsequence filter を適用する。filter input 中の printable
@@ -165,9 +169,10 @@ status に示す。未着 data を待つ navigation は forward search、`Ng`、
 
 ## 9. Search と text input
 
-`/` と `?` は Git が出力した全 logical text を Rust regex で検索し、生成した行番号、sticky header、
-status bar は対象外とする。pattern に大文字がなければ case-insensitive、1文字でもあれば
-case-sensitive とする。logical line の折り返し前 text に照合し、match が複数 rowへ渡っても1件とする。
+`/` と `?` は Git が出力した logical text を Rust regex で検索し、生成した行番号、sticky header、status bar は対象外とする。
+ANSI 除去と escape を終えた1 logical line が16 MiBを超える場合は raw data を decode せず検索対象から省き、status の skipped count へ加える。
+pattern に大文字がなければ case-insensitive、1文字でもあれば case-sensitive とする。
+logical line の折り返し前 text に照合し、match が複数 row へ渡っても1件とする。
 
 入力中は有効な regex ごとに incremental preview し、`Enter` で確定、`Esc` で開始前の viewport と
 直前 pattern へ戻す。不正 regex は error を表示し、直前の有効結果を維持する。空 pattern の
@@ -178,10 +183,14 @@ case-sensitive とする。logical line の折り返し前 text に照合し、m
 BOF/EOF で位置を維持する。forward search が読み込み済み末尾に達したら incoming data の待機に入り、
 match 到着時に jump、EOF で not found とする。`Esc` または新しい navigation intent で解除する。
 
-viewport 内の全 match を弱く、current match を強く表示する。同一 logical line の複数 match も1件ずつ
-移動する。zero-width match は row marker と status の `line:column` で current だけを示し、反復時は
-少なくとも1 Unicode scalar進める。検索起点は viewport 左上の最初に見える grapheme とし、一致 row
-を本文領域先頭へ置く。
+current match を強く表示し、同一 logical line の複数 match も1件ずつ移動する。
+ほかの visible match は1 frameあたり16,384 span、visible range 直前4 KiBの lookbehind を上限に弱く表示する。
+Raw line が1 MiBを超える場合は main thread で text を decode せず、弱い表示を省略する。
+Raw line が1 MiB以下でも、escape 後の display text が1 MiBを超える場合は preload 結果を破棄し、同じく弱い表示を省略する。
+worker が返した current match は、raw byte 数にかかわらず layout の byte mapping で表示する。
+弱い表示を省略した場合の status column は、grapheme 数ではなく1始まりの byte offset へ fallback する。
+zero-width match は row marker と status の `line:column` で current だけを示し、反復時は少なくとも1 Unicode scalar進める。
+検索起点は viewport 左上の最初に見える grapheme とし、一致 row を本文領域先頭へ置く。
 
 search/filter input は grapheme 単位で cursor 移動と削除を行い、Left/Right、Ctrl-B/F、Home/End、
 Ctrl-A/E、Backspace/Delete、Ctrl-W、Ctrl-U、Enter、Esc を support する。固定1行 input は cursor が
@@ -189,17 +198,20 @@ Ctrl-A/E、Backspace/Delete、Ctrl-W、Ctrl-U、Enter、Esc を support する�
 
 ## 10. Syntax highlight
 
-path の拡張子と既知 file name から syntax を選び、判定できない場合は最初に現れる追加/context 行の
-shebang を使う。hunk に先頭行がなければ推測しない。`syntect` の bundled TextMate grammar と
-pure-Rust `fancy-regex` backend を使う。
+path の拡張子と既知 file name から syntax を選ぶ。
+判定できない場合は、各 hunk の old 側で最初に現れる削除または context 行と、new 側で最初に現れる追加または context 行にある shebang を使う。
+該当する source 行がなければ推測しない。
+`syntect` の bundled TextMate grammar と pure-Rust `fancy-regex` backend を使う。
 
 削除側と追加側は別の parse state を持ち、hunk 内で継続し、hunk 境界で reset する。両 state が
 diverge した context 行は new side の style、deleted file では old side を使う。stdin-only のため
 hunk 冒頭が multiline comment/string の途中なら best-effort となる。
 
-syntax 計算は worker で行い、未計算部分を plain diff style で先に表示する。viewport と前後を優先し、
-hunk 内 checkpoint から遠方 jump を再開する。1 logical line が1 MiBを超えたら syntax を省略し、
-viewport に必要な範囲だけ lazy decode/wrap する。
+syntax 計算は decoration worker で行い、未計算部分を plain diff style で先に表示する。
+現在の hunk を8 MiBの priority result として先に返し、その後 document 先頭から64 MiBの full result を計算する。
+ANSI 除去と escape を終えた source text が1 MiBを超える line、または workspace へ収まらない line は syntax を省略する。
+Result pool の残量がなくなった場合は、1 line だけを省略して続行せず、後続の decoration span を打ち切る。
+巨大 line の viewport は必要な範囲だけ lazy decode と wrap を行う。
 
 ## 11. Intraline と whitespace
 
@@ -224,6 +236,11 @@ default の `ignore` mode では leading/trailing ASCII space/tab を無視し�
 - grapheme 合計1,000万
 
 combined、word、binary、submodule、malformed fallback では intraline を無効にする。
+上の semantic cap 内でも、96 MiBの workspace へ収まらない block は省略する。
+8/64 MiBの result pool へ transfer できない場合は、その block 以降の decoration span を打ち切る。
+Line または block 単位で省略した場合、status warning は size cap と workspace 不足を区別しない。
+syntax は `syntax omitted for some lines`、intraline は省略した block 数を表示する。
+Result pool の残量がなく後続 span を打ち切った場合は、件数ではなく `decoration budget exceeded; later spans were omitted` と表示する。
 
 ## 12. Theme と表示 style
 
@@ -240,9 +257,28 @@ raw input は最初の64 MiBまで memory に置き、超過時は permission `0
 temporary file へ spill する。終了時は descriptor を閉じる。tempfile 作成または書き込みに失敗した
 場合は unbounded memory へ切り替えず、terminal を復元して OS error を stderr へ出し status 1とする。
 
-structural index は別枠256 MiBを上限とし、超過 record を temporary file へ spill して sparse index
-だけを RAM に残す。syntax span、wrap map、intraline result の derived cache は別枠256 MiBの LRU
-とし、evict 後は background で再計算する。raw data と structural identity は eviction しない。
+structural index は別枠256 MiBを上限とし、超過 record を temporary file へ spill して sparse index だけを RAM に残す。
+Raw data と structural identity は eviction しない。
+
+Viewport layout と decoration の owned data には、別枠256 MiBの固定 partition を割り当てる。
+pool 間で未使用分は融通しない。
+
+- viewport layout 24 MiB：eager layout LRU 12 MiB、巨大行 navigator と current/prepared streaming frame 8 MiB、layout transaction と row/index bookkeeping 用4 MiB
+- renderer へ適用中の decoration result 64 MiB
+- background で作る次の full decoration result 64 MiB
+- current hunk を先に返す priority decoration result 8 MiB
+- decode、syntax、intraline が計算中だけ使う workspace 96 MiB
+
+Applied result は旧 payload を解放してから、同じ ledger transition 内で置き換える。
+Next/Priority result は bounded latest-wins channel が所有し、stale、cancel、panic では lease を返す。
+Viewport の eager layout だけを LRU eviction し、decoration result は whole-result 単位で破棄して再計算する。
+Bundled syntax grammar と theme の immutable program asset は入力由来ではないため、この256 MiBには含めない。
+
+この256 MiBは process 全体の resident-memory 上限ではない。
+Viewport、Search worker、`FrameLines` の line reader buffer は raw/display 上限と chunk decode によって別に制限する。
+Search worker が保持する searchable text は1 logical lineあたり最大16 MiBとする。
+描画前の `FrameLines` は metadata と range を4 MiBまで保持し、raw line と escape 後の display text がともに1 MiB以下の場合だけ preload 中に weak match 用 text を一時 decode する。
+これらの reader buffer、thread stack、dependency の program asset は256 MiB ledger には計上しない。
 
 1 GiBまたは500万 logical line の先に達する方を performance acceptance workload とし、それ以上は
 best effort とする。cached viewport の操作は16 ms付近、spill 後の未cache領域を含む通常操作は key
@@ -255,14 +291,15 @@ single Cargo package とし、薄い `src/main.rs` と testable な `src/lib.rs`
 の外部互換性は約束しない。project code は `#![forbid(unsafe_code)]` とし、production code の
 `unwrap()`/`expect()` を lint で禁止する。dependency 内部の unsafe は対象外とする。
 
-interactive core は `Event → update(AppState) → Effect` の一方向 state machine とする。renderer は
-AppState を読むだけで I/O や worker を直接呼ばない。
+interactive core は `Event → update(AppState) → Effect` の一方向 state machine とする。
+Renderer は AppState、theme、適用中 decoration、draw 前に preload した bounded `FrameLines` だけを読み、I/O や worker を直接呼ばない。
 
-- main thread: controlling TTY の event、state update、Ratatui 描画
-- reader thread: stdin read、sanitization、spool、incremental parse
-- bounded worker pool: regex search、syntax、intraline
-- channel: parse event と worker result
-- generation ID: 古い非同期結果の破棄
+- main thread：controlling TTY の event、state update、Ratatui 描画
+- reader thread：stdin read、sanitization、spool、incremental parse
+- search worker：latest request を scan し、capacity 1の request/response channel で stale result を捨てる
+- decoration worker：syntax と intraline を直列計算し、capacity 1の request と priority/full 用 capacity 2の response channel を使う
+- channel：parse event、search result、decoration result
+- generation ID：古い非同期 result の破棄
 
 terminal UI は `ratatui` と `crossterm`、CLI は `clap` derive を使う。Tokio runtime は導入しない。
 optional Cargo feature は作らず、同じ binary に全機能を含める。`Cargo.lock` は repository に含める。
@@ -282,9 +319,8 @@ compatibility は持たない。
 --whitespace ignore|show
 ```
 
-入力なしの direct invocation は stdin を待たず、Git 設定例と
-`cat patch.diff | git-ultrapager` を示して終了する。Git pager invocation と空 pipe を区別できない
-環境では、empty-input の silent exit を優先する。
+stdin が TTY の direct invocation は入力を待たず、Git 設定例と `cat patch.diff | git-ultrapager` を示して status 2で終了する。
+Git pager invocation と空 pipe を区別できない環境では、empty-input の silent exit を優先する。
 
 ## 16. Test と completion criteria
 

@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
-use crate::ansi::{AnsiStripper, EscapeError, escape_interactive_bytes_into_counted};
+use crate::ansi::{
+    AnsiStripper, EscapeError, MAX_DEFERRED_OUTPUT_BYTES, StreamingInteractiveEscaper,
+    escape_interactive_bytes_into_counted,
+};
 use crate::input::{AppendStore, StoreError};
 use crate::model::LineKind;
 use crate::storage::{FixedRecord, RecordCodecError, SpillTable, StorageError, StructuralStorage};
@@ -51,15 +54,20 @@ const RESERVED_OFFSET: usize = 62;
 /// `raw_end`はsealed input high-water markとなる。Storeはtoken作成後にraw byteを再読せず、5百万行でも
 /// 1行1preadを発生させない。
 #[derive(Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "indexed parser移行後にcrate内のboundary proofとして構築する"
-)]
 pub(crate) struct RawLineSpan {
     store_id: u64,
     raw_start: u64,
     raw_end: u64,
     terminated: bool,
+}
+
+impl RawLineSpan {
+    /// このproof tokenが表示対象のraw LFで閉じたlineを表すかを返す。
+    ///
+    /// Callerは末尾改行状態をsnapshot metadataへ複写できるが、raw offsetやstore identityを変更できない。
+    pub(crate) const fn terminated(&self) -> bool {
+        self.terminated
+    }
 }
 
 /// Indexed ANSI outputをlogical-line境界へ変換するsingle-writer tracker。
@@ -68,10 +76,6 @@ pub(crate) struct RawLineSpan {
 /// [`Self::observe`]へ直結する。OSC/DCS内のraw LFはcallbackに現れないためspanを閉じず、chunkをまたいでも
 /// `raw_start`と可視byteの有無を維持する。EOFではraw storeをsealしてから[`Self::seal_eof`]を呼ぶ。
 #[derive(Debug, PartialEq, Eq)]
-#[allow(
-    dead_code,
-    reason = "indexed parser移行後にcrate内のwriter stateとして所有する"
-)]
 pub(crate) struct RawLineTracker {
     store_id: u64,
     raw_start: u64,
@@ -80,7 +84,6 @@ pub(crate) struct RawLineTracker {
     sealed: bool,
 }
 
-#[allow(dead_code, reason = "indexed parser移行後にANSI callbackから呼び出す")]
 impl RawLineTracker {
     /// 次にemitされるlogical lineが始まるraw absolute offsetからtrackerを作る。
     fn new(store_id: u64, raw_start: u64) -> Self {
@@ -184,7 +187,6 @@ impl RawLineTracker {
 
 /// Indexed emissionまたはsealed EOFのoffsetがtrackerの単調増加契約を満たさない時のfailure。
 #[derive(Clone, Copy, Debug, Error, PartialEq, Eq)]
-#[allow(dead_code, reason = "indexed parser移行後にtrackerから返す")]
 pub(crate) enum RawLineSpanError {
     #[error("indexed raw offset {offset} precedes open logical line start {raw_start}")]
     OffsetBeforeOpenLine { offset: u64, raw_start: u64 },
@@ -208,7 +210,6 @@ pub(crate) enum RawLineSpanError {
 /// Raw offsetとterminationを含めないため、decoded recordや独立したbooleanからboundary proofを
 /// 再構成できない。Optional `u64`の`u64::MAX`はdisk上で`None`に予約しており、append時に拒否する。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code, reason = "indexed parser移行後にwriterへmetadataを渡す")]
 pub(crate) struct LogicalLineMetadata {
     /// Plain preamble では`None`。Commit配下のlineでは所有groupのstable ID。
     pub commit_id: Option<u64>,
@@ -247,10 +248,6 @@ pub struct LogicalLineRecord {
 
 impl LogicalLineRecord {
     /// Boundary proofとparser metadataを検証して固定長recordを作る。
-    #[allow(
-        dead_code,
-        reason = "record構築はindexed parserへ移行するcrate内writerだけが呼ぶ"
-    )]
     fn new(span: &RawLineSpan, metadata: LogicalLineMetadata) -> Result<Self, RecordCodecError> {
         validate_optional(metadata.commit_id)?;
         validate_optional(metadata.file_id)?;
@@ -427,10 +424,6 @@ impl FixedRecord for LogicalLineRecord {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "optional metadata検証はindexed parserへ移行するwriterから呼ぶ"
-)]
 fn validate_optional(value: Option<u64>) -> Result<(), RecordCodecError> {
     if value == Some(OPTIONAL_U64_NONE) {
         return Err(RecordCodecError::new(
@@ -594,6 +587,8 @@ pub enum LineStoreError {
         overflow: bool,
         actual: usize,
     },
+    #[error("chunked logical-line decoder has not been started")]
+    ChunkDecoderNotStarted,
 }
 
 /// Raw input と append-only logical-line table の共有 handle。
@@ -634,10 +629,6 @@ impl DocumentLineStore {
     ///
     /// Cloneを含め2回目の呼び出しは拒否する。これにより別trackerが同じraw rangeを再発行し、duplicate
     /// recordをappendする経路を閉じる。
-    #[allow(
-        dead_code,
-        reason = "indexed parser移行後にreader/parser境界で1回だけ呼ぶ"
-    )]
     pub(crate) fn start_tracker(&self) -> Result<RawLineTracker, LineStoreError> {
         let mut writer = self
             .writer
@@ -655,7 +646,6 @@ impl DocumentLineStore {
     /// Terminated recordの`raw_end`はindexed callbackがemitしたraw LF offsetであり、現在のraw
     /// high-water markより小さくなければならない。Unterminated recordはsealed EOF tokenから作られ、
     /// `raw_end`がhigh-water markと一致する。検証はcached lengthだけを読み、raw storeへpreadしない。
-    #[allow(dead_code, reason = "indexed parser移行後に唯一のappend callerとなる")]
     pub(crate) fn append(
         &self,
         span: RawLineSpan,
@@ -940,6 +930,217 @@ impl LineDecoder {
             text: &self.text_buffer,
             record,
         }))
+    }
+}
+
+/// 1回のraw readに使う上限。Escapeで最大4倍へ展開されてもworkerごとのbufferを300 KiB前後に抑える。
+pub(crate) const CHUNKED_LINE_RAW_BYTES: usize = 64 * 1024;
+
+/// 巨大logical lineをraw storeからbounded chunkで復元するdecoder。
+///
+/// ANSI state、UTF-8 prefix、除去後末尾1 byteだけをchunk間に保持する。返す`&str`は次の
+/// [`Self::next_chunk`]まで有効で、全line textを同時に所有しない。最後のchunkを返す前にrecordの
+/// display lengthを検証する。途中でcallerが走査を打ち切った場合は未読raw rangeへpreadしない。
+#[derive(Debug, Default)]
+pub(crate) struct ChunkedLineDecoder {
+    record_buffer: Vec<u8>,
+    raw_buffer: Vec<u8>,
+    stripped_buffer: Vec<u8>,
+    text_buffer: String,
+    raw: Option<AppendStore>,
+    record: Option<LogicalLineRecord>,
+    line_id: u64,
+    raw_cursor: u64,
+    raw_end: u64,
+    stripper: AnsiStripper,
+    escaper: StreamingInteractiveEscaper,
+    trailing_sanitized: Option<u8>,
+    display_len: usize,
+    finished: bool,
+    raw_bytes_read: u64,
+    peak_buffered_bytes: usize,
+}
+
+/// Chunked decoderが実際に読んだraw byte数と、一時bufferの最大logical payload。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChunkedLineDecoderStats {
+    pub raw_bytes_read: u64,
+    pub peak_buffered_bytes: usize,
+}
+
+impl ChunkedLineDecoder {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Stable IDのrecordを固定し、次回`next_chunk`をraw range先頭から始める。
+    pub(crate) fn start(
+        &mut self,
+        snapshot: &LineSnapshot,
+        line_id: u64,
+    ) -> Result<Option<LogicalLineRecord>, LineStoreError> {
+        let Some(record) = snapshot.record_with_buffer(line_id, &mut self.record_buffer)? else {
+            self.reset_active();
+            return Ok(None);
+        };
+        validate_record_boundary(record, snapshot.raw_high_water, snapshot.raw_sealed)?;
+        self.raw = Some(snapshot.raw.clone());
+        self.record = Some(record);
+        self.line_id = line_id;
+        self.raw_cursor = record.raw_start();
+        self.raw_end = record.raw_end();
+        self.stripper = AnsiStripper::default();
+        self.escaper.reset();
+        self.trailing_sanitized = None;
+        self.display_len = 0;
+        self.finished = false;
+        self.raw_bytes_read = 0;
+        self.peak_buffered_bytes = 0;
+        self.raw_buffer.clear();
+        self.stripped_buffer.clear();
+        self.text_buffer.clear();
+        Ok(Some(record))
+    }
+
+    /// 次のraw chunkを1件だけ処理し、そのescaped UTF-8出力を返す。
+    ///
+    /// ANSI payloadだけなら`Some("")`になる。Callerはこのprogress境界ごとにcancelを確認でき、巨大な
+    /// OSC/DCS lineを1回の呼び出しで末尾までpreadしない。`None`は直前の呼び出しまでにline末尾を
+    /// 検証済みであることだけを表す。
+    pub(crate) fn next_chunk(&mut self) -> Result<Option<&str>, LineStoreError> {
+        let record = self.record.ok_or(LineStoreError::ChunkDecoderNotStarted)?;
+        if self.finished {
+            return Ok(None);
+        }
+
+        self.text_buffer.clear();
+        if self.raw_cursor < self.raw_end {
+            let chunk_len = u64::try_from(CHUNKED_LINE_RAW_BYTES).map_err(|_| {
+                LineStoreError::DecodeAllocation {
+                    requested: CHUNKED_LINE_RAW_BYTES,
+                }
+            })?;
+            let end = self.raw_cursor.saturating_add(chunk_len).min(self.raw_end);
+            let raw = self
+                .raw
+                .as_ref()
+                .ok_or(LineStoreError::ChunkDecoderNotStarted)?;
+            raw.read_range_into(self.raw_cursor..end, &mut self.raw_buffer)?;
+            self.raw_bytes_read = self
+                .raw_bytes_read
+                .saturating_add(end.saturating_sub(self.raw_cursor));
+            self.raw_cursor = end;
+            self.stripped_buffer.clear();
+            let stripped_bound = self
+                .raw_buffer
+                .len()
+                .checked_add(MAX_DEFERRED_OUTPUT_BYTES)
+                .ok_or(LineStoreError::DecodeAllocation {
+                    requested: usize::MAX,
+                })?;
+            self.stripped_buffer
+                .try_reserve(stripped_bound)
+                .map_err(|_| LineStoreError::DecodeAllocation {
+                    requested: stripped_bound,
+                })?;
+            self.stripper
+                .push(&self.raw_buffer, &mut self.stripped_buffer);
+        }
+
+        let final_raw_chunk = self.raw_cursor == self.raw_end;
+        if final_raw_chunk {
+            self.stripper.finish_into(&mut self.stripped_buffer);
+        }
+        self.escape_stripped(final_raw_chunk, record.terminated())?;
+        self.display_len = self.display_len.checked_add(self.text_buffer.len()).ok_or(
+            EscapeError::LengthOverflow {
+                input_len: self.text_buffer.len(),
+            },
+        )?;
+        self.observe_peak();
+
+        if final_raw_chunk {
+            validate_display_length(record, self.display_len, self.line_id)?;
+            self.finished = true;
+        }
+        Ok(Some(&self.text_buffer))
+    }
+
+    #[must_use]
+    pub(crate) const fn stats(&self) -> ChunkedLineDecoderStats {
+        ChunkedLineDecoderStats {
+            raw_bytes_read: self.raw_bytes_read,
+            peak_buffered_bytes: self.peak_buffered_bytes,
+        }
+    }
+
+    fn escape_stripped(
+        &mut self,
+        final_chunk: bool,
+        terminated: bool,
+    ) -> Result<(), LineStoreError> {
+        if !self.stripped_buffer.is_empty() {
+            if let Some(previous) = self.trailing_sanitized.take() {
+                let _ = self.escaper.push_into(&[previous], &mut self.text_buffer)?;
+            }
+            if self.stripped_buffer.len() > 1 {
+                let end = self.stripped_buffer.len() - 1;
+                let _ = self
+                    .escaper
+                    .push_into(&self.stripped_buffer[..end], &mut self.text_buffer)?;
+            }
+            self.trailing_sanitized = self.stripped_buffer.last().copied();
+        }
+        if final_chunk {
+            if let Some(last) = self.trailing_sanitized.take()
+                && !(terminated && last == b'\r')
+            {
+                let _ = self.escaper.push_into(&[last], &mut self.text_buffer)?;
+            }
+            let _ = self.escaper.finish_into(&mut self.text_buffer)?;
+        }
+        Ok(())
+    }
+
+    fn observe_peak(&mut self) {
+        let buffered = self
+            .raw_buffer
+            .len()
+            .saturating_add(self.stripped_buffer.len())
+            .saturating_add(self.text_buffer.len());
+        self.peak_buffered_bytes = self.peak_buffered_bytes.max(buffered);
+    }
+
+    fn reset_active(&mut self) {
+        self.raw = None;
+        self.record = None;
+        self.finished = true;
+        self.trailing_sanitized = None;
+        self.escaper.reset();
+    }
+}
+
+fn validate_display_length(
+    record: LogicalLineRecord,
+    actual: usize,
+    line_id: u64,
+) -> Result<(), LineStoreError> {
+    let actual_u32 = u32::try_from(actual).ok();
+    let stored_matches = if record.display_len_overflowed() {
+        actual_u32.is_none()
+    } else {
+        actual_u32 == Some(record.display_len())
+    };
+    if stored_matches {
+        Ok(())
+    } else {
+        Err(LineStoreError::DisplayLengthMismatch {
+            line_id,
+            stored: record.display_len(),
+            overflow: record.display_len_overflowed(),
+            actual,
+        })
     }
 }
 
@@ -1556,6 +1757,108 @@ mod tests {
             decoder.decode(&snapshot, 0).unwrap().unwrap().text,
             escape_interactive_bytes(&eager_ansi)
         );
+    }
+
+    #[test]
+    fn chunked_decoder_matches_eager_across_ansi_utf8_cr_and_raw_chunk_boundaries() {
+        let mut input = vec![b'a'; CHUNKED_LINE_RAW_BYTES - 2];
+        input.extend_from_slice(
+            b"\x1b[31m\xf0\x9f\x91\xa9\xe2\x80\x8d\xf0\x9f\x92\xbb\t\x00\xff\xc2\x85\x1b[0m\r\n",
+        );
+        let expected = escape_interactive_bytes(&strip_ansi(&input[..input.len() - 1]));
+        let expected = expected
+            .strip_suffix("\\x0D")
+            .unwrap_or(&expected)
+            .to_owned();
+        let raw = AppendStore::new();
+        raw.append(&input).unwrap();
+        let store = default_store(raw);
+        let span = collect_spans(&store, &[&input]).into_iter().next().unwrap();
+        let raw_span_len = span.raw_end - span.raw_start;
+        store
+            .append(
+                span,
+                metadata(u64::try_from(expected.len()).unwrap(), LineKind::Plain),
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+
+        let mut eager = LineDecoder::new();
+        assert_eq!(eager.decode(&snapshot, 0).unwrap().unwrap().text, expected);
+        let mut chunked = ChunkedLineDecoder::new();
+        chunked.start(&snapshot, 0).unwrap().unwrap();
+        let mut actual = String::new();
+        while let Some(chunk) = chunked.next_chunk().unwrap() {
+            actual.push_str(chunk);
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(chunked.stats().raw_bytes_read, raw_span_len);
+        assert!(chunked.stats().peak_buffered_bytes < 1024 * 1024);
+    }
+
+    #[test]
+    fn chunked_decoder_stops_after_one_chunk_of_a_64_mib_line() {
+        let raw = AppendStore::new();
+        let chunk = vec![b'x'; CHUNKED_LINE_RAW_BYTES];
+        let chunk_count = (64 * 1024 * 1024 / CHUNKED_LINE_RAW_BYTES) + 1;
+        for _ in 0..chunk_count {
+            raw.append(&chunk).unwrap();
+        }
+        let raw_len = raw.seal().unwrap();
+        let store = default_store(raw);
+        let span = RawLineSpan {
+            store_id: store.store_id,
+            raw_start: 0,
+            raw_end: raw_len,
+            terminated: false,
+        };
+        store
+            .append(span, metadata(raw_len, LineKind::Plain))
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let mut decoder = ChunkedLineDecoder::new();
+        decoder.start(&snapshot, 0).unwrap().unwrap();
+
+        let first = decoder.next_chunk().unwrap().unwrap();
+        assert_eq!(first.len(), CHUNKED_LINE_RAW_BYTES - 1);
+        let stats = decoder.stats();
+        assert_eq!(stats.raw_bytes_read, CHUNKED_LINE_RAW_BYTES as u64);
+        assert!(stats.peak_buffered_bytes < 1024 * 1024);
+        assert!(stats.raw_bytes_read < raw_len);
+    }
+
+    #[test]
+    fn chunked_decoder_yields_progress_after_one_chunk_of_ansi_only_payload() {
+        let raw = AppendStore::new();
+        raw.append(b"\x1b]").unwrap();
+        let chunk = vec![b'x'; CHUNKED_LINE_RAW_BYTES];
+        for _ in 0..(64 * 1024 * 1024 / CHUNKED_LINE_RAW_BYTES) {
+            raw.append(&chunk).unwrap();
+        }
+        raw.append(b"\x07\n").unwrap();
+        let raw_len = raw.seal().unwrap();
+        let store = default_store(raw);
+        store
+            .append(
+                RawLineSpan {
+                    store_id: store.store_id,
+                    raw_start: 0,
+                    raw_end: raw_len - 1,
+                    terminated: true,
+                },
+                metadata(0, LineKind::Plain),
+            )
+            .unwrap();
+        let snapshot = store.snapshot().unwrap();
+        let mut decoder = ChunkedLineDecoder::new();
+        decoder.start(&snapshot, 0).unwrap().unwrap();
+
+        assert_eq!(decoder.next_chunk().unwrap(), Some(""));
+        assert_eq!(
+            decoder.stats().raw_bytes_read,
+            CHUNKED_LINE_RAW_BYTES as u64
+        );
+        assert!(decoder.stats().raw_bytes_read < raw_len);
     }
 
     #[test]

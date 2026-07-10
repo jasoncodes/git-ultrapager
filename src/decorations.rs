@@ -2,31 +2,183 @@
 //!
 //! `DecorationSet` は`LineId`ごとにfull logical-line byte rangeを保持する。Source本文を扱う
 //! syntect/intralineのoffsetにはdiff marker 1 byteを加えてから格納し、layout後のtab展開や折り返しは
-//! rendererが`VisualRow::rendered_ranges_for_logical`で解決する。Raw input、parser identity、viewportは
-//! 所有せず、256 MiBを超えるderived spanだけを後方から省略する。
+//! rendererが`VisualRow::rendered_ranges_for_logical`で解決する。Syntaxはsnapshotをstable ID順に
+//! decodeし、1つのreader bufferを全hunkで再利用する。Intralineだけはline数・byte数・grapheme数を
+//! cap内と確認した1 change blockをowned textへcopyする。Raw input、parser identity、viewportは
+//! 所有しない。Interactive時にinstalled full result、次のfull result、priority partial、wrap cacheが
+//! 同時に存在しても合計256 MiB以内となるよう、各resultへ固定shareを割り当てる。
 
-use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::mem::size_of;
+use std::ops::Deref;
 use std::ops::Range;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 
-use crate::cli::WhitespaceChoice;
-use crate::highlight::{HighlightError, HighlightedLine, SyntaxEngine, SyntaxSession, SyntaxSpan};
-use crate::intraline::{IntralineResult, compute_refs};
-use crate::model::{
-    ChangeStatus, Document, DocumentLine, FileEntry, HunkId, HunkKind, LineId, LineKind,
+use crate::bounded_text::{
+    BoundedDocumentTextReader, BoundedTextError, BoundedTextRead, MAX_EAGER_TEXT_RAW_BYTES,
 };
+use crate::cli::WhitespaceChoice;
+use crate::derived_memory::{
+    DerivedMemoryError, DerivedMemoryLease, DerivedMemoryLedger, DerivedMemoryPool,
+    NEXT_DECORATION_MEMORY_BYTES, PRIORITY_DECORATION_MEMORY_BYTES,
+};
+use crate::document::{
+    DocumentError, DocumentIdentity, DocumentLineMetadata, DocumentLineMetadataReader,
+    DocumentSnapshot, LineDisplayLength, OwnedDocumentLine,
+};
+use crate::highlight::{
+    BudgetedHighlightedLine, HighlightError, HighlightedLine, SyntaxEngine, SyntaxSession,
+    SyntaxSpan,
+};
+use crate::intraline::{
+    BudgetedIntralineResult, IntralineResult, LinePairDiff, MAX_BLOCK_BYTES, MAX_BLOCK_GRAPHEMES,
+    MAX_CHANGED_LINES, MAX_LINE_GRAPHEMES, compute_refs_with_budget,
+};
+use crate::model::{ChangeStatus, FileEntry, Hunk, HunkId, HunkKind, LineId, LineKind};
 use crate::text::MAX_SYNTAX_LINE_BYTES;
 use crate::theme::{ColorLevel, Theme};
 
-/// Syntax span、intraline range、line indexを合わせたderived resultの概算上限。
-pub const DERIVED_RESULT_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+/// Syntax上限はsource本文に適用するため、bounded readerへはdiff marker 1 byteを加えて渡す。
+const MAX_SYNTAX_DISPLAY_BYTES: usize = MAX_SYNTAX_LINE_BYTES + 1;
+/// Intralineのblock byte上限もsource本文だけを数える。1 lineの復元上限にはmarkerを含める。
+const MAX_INTRALINE_LINE_DISPLAY_BYTES: usize = MAX_BLOCK_BYTES + 1;
+const DERIVED_RESULT_BUDGET_BYTES: usize = NEXT_DECORATION_MEMORY_BYTES;
+const DERIVED_PRIORITY_RESULT_BUDGET_BYTES: usize = PRIORITY_DECORATION_MEMORY_BYTES;
+
+/// 複数の同期range計算でsyntect grammar/theme bundleを共有するcalculator。
+///
+/// Engineは最初のrich hunkを含むcolored requestまでloadしない。`--paging never`は1 fileずつ
+/// [`Self::compute_range`]を呼ぶため、この値をstream lifetimeで保持してfileごとのbundle再読込を避ける。
+/// Syntax初期化failureも`OnceLock`へ保存し、各resultのwarningへ同じfailureを写す。
+pub struct DecorationComputer {
+    engine: OnceLock<Result<SyntaxEngine, HighlightError>>,
+}
+
+impl DecorationComputer {
+    /// Syntax bundleをまだloadしていないcalculatorを作る。
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            engine: OnceLock::new(),
+        }
+    }
+
+    /// Document全体のrich unified hunkを計算する。
+    pub fn compute(
+        &self,
+        document: &DocumentSnapshot,
+        theme: &Theme,
+        whitespace: WhitespaceChoice,
+    ) -> Result<DecorationSet, DecorationComputeError> {
+        self.compute_scoped(
+            document,
+            theme,
+            whitespace,
+            NEXT_DECORATION_MEMORY_BYTES,
+            None,
+        )
+    }
+
+    /// 指定logical-line範囲と交差するfileだけを装飾する。
+    pub fn compute_range(
+        &self,
+        document: &DocumentSnapshot,
+        theme: &Theme,
+        whitespace: WhitespaceChoice,
+        line_range: Range<usize>,
+    ) -> Result<DecorationSet, DecorationComputeError> {
+        let start = line_range.start.min(document.line_count());
+        let end = line_range.end.min(document.line_count());
+        self.compute_scoped(
+            document,
+            theme,
+            whitespace,
+            NEXT_DECORATION_MEMORY_BYTES,
+            Some(start..end.max(start)),
+        )
+    }
+
+    fn compute_scoped(
+        &self,
+        document: &DocumentSnapshot,
+        theme: &Theme,
+        whitespace: WhitespaceChoice,
+        budget: usize,
+        line_range: Option<Range<usize>>,
+    ) -> Result<DecorationSet, DecorationComputeError> {
+        let ledger = DerivedMemoryLedger::new();
+        let budget = budget.min(NEXT_DECORATION_MEMORY_BYTES);
+        let scope = DecorationScope {
+            budget,
+            pool: DerivedMemoryPool::NextDecoration,
+            priority_hunk: None,
+            only_priority: false,
+            line_range,
+        };
+        let has_rich_hunk = files_in_scope(document, scope.line_range.as_ref())
+            .iter()
+            .any(|file| file.mode.is_rich() && !file.hunk_ids.is_empty());
+        if !has_rich_hunk {
+            return Ok(DecorationBuilder::new(
+                document.identity(),
+                whitespace,
+                &ledger,
+                scope.pool,
+                budget,
+            )?
+            .finish()
+            .into_unbudgeted());
+        }
+        let syntax = if theme.color_level() == ColorLevel::None {
+            SyntaxAvailability::Disabled
+        } else {
+            match self.engine.get_or_init(SyntaxEngine::new) {
+                Ok(engine) => SyntaxAvailability::Ready(engine),
+                Err(error) => SyntaxAvailability::Failed(error),
+            }
+        };
+        let cancelled = || false;
+        let context = DecorationContext {
+            document,
+            theme,
+            whitespace,
+            syntax,
+            ledger: &ledger,
+            cancelled: &cancelled,
+        };
+        match DecorationSet::compute_internal(context, scope)? {
+            Some(result) => Ok(result.into_unbudgeted()),
+            // Predicateはfalse固定で、同期pathではcancelされない。型上のNoneだけ空setへ写す。
+            None => Ok(DecorationSet::default()),
+        }
+    }
+}
+
+impl Default for DecorationComputer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Snapshotからlogical line metadataまたはtextを読む処理のfailure。
+#[derive(Debug, Error)]
+pub enum DecorationComputeError {
+    #[error(transparent)]
+    Document(#[from] DocumentError),
+    #[error(transparent)]
+    BoundedText(#[from] BoundedTextError),
+    #[error(transparent)]
+    Memory(#[from] DerivedMemoryError),
+    #[error("document snapshot does not contain logical line {line_id}")]
+    MissingLine { line_id: LineId },
+}
 
 /// 1 logical lineへ適用するdecorations。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -49,68 +201,86 @@ impl LineDecoration {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct DecorationEntry {
+    line_id: LineId,
+    decoration: LineDecoration,
+}
+
 /// 1 immutable document snapshotに対応するderived decoration集合。
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Entryは`LineId`昇順のflat `Vec`に置く。Hash tableのbucket/control allocationを見積もる必要がなく、
+/// rendererのlookupはbinary searchで`O(log decorated_lines)`となる。このpayloadはCloneできず、
+/// interactive経路では[`BudgetedDecorationSet`]または[`AppliedDecorationSet`]だけが所有する。
+#[derive(Debug, PartialEq, Eq)]
 pub struct DecorationSet {
-    lines: HashMap<LineId, LineDecoration>,
+    identity: Option<DocumentIdentity>,
+    lines: Vec<DecorationEntry>,
     whitespace: WhitespaceChoice,
     approximate_bytes: usize,
     truncated: bool,
     warning: Option<String>,
+    warning_fallback: Option<&'static str>,
 }
 
 impl DecorationSet {
     /// Rich unified hunkをdocument順に計算する。
     ///
     /// Old/new syntax stateはhunkごとに独立して作り、context lineは両方へ進めたうえで通常はnew側、
-    /// deleted fileだけold側を採用する。Fallback file/hunkにはdecorationsを付けない。
-    #[must_use]
-    pub fn compute(document: &Document, theme: &Theme, whitespace: WhitespaceChoice) -> Self {
-        Self::compute_with_budget(document, theme, whitespace, DERIVED_RESULT_BUDGET_BYTES)
+    /// deleted fileだけold側を採用する。Fallback file/hunkにはdecorationsを付けない。Snapshotの
+    /// metadataまたはtextを読めなければ[`DecorationComputeError`]を返し、syntax/cap failureは
+    /// [`Self::warning`]へ格納する。
+    pub fn compute(
+        document: &DocumentSnapshot,
+        theme: &Theme,
+        whitespace: WhitespaceChoice,
+    ) -> Result<Self, DecorationComputeError> {
+        DecorationComputer::new().compute(document, theme, whitespace)
     }
 
+    /// 指定logical-line範囲と交差するfileだけを装飾する。
+    ///
+    /// Direct modeが閉じたfile entryを出力する時に使い、既に出力済みのprefixを再decodeしない。
+    /// Hunkと範囲が交差する場合はsyntax stateをhunk先頭から進めるため、そのhunk全体を計算する。
+    /// 返るsetには範囲外の同一hunkのspanが含まれ得るが、writerは指定rangeだけを参照する。
+    pub fn compute_range(
+        document: &DocumentSnapshot,
+        theme: &Theme,
+        whitespace: WhitespaceChoice,
+        line_range: Range<usize>,
+    ) -> Result<Self, DecorationComputeError> {
+        DecorationComputer::new().compute_range(document, theme, whitespace, line_range)
+    }
+
+    #[cfg(test)]
     fn compute_with_budget(
-        document: &Document,
+        document: &DocumentSnapshot,
         theme: &Theme,
         whitespace: WhitespaceChoice,
         budget: usize,
-    ) -> Self {
-        let engine = (theme.color_level() != ColorLevel::None).then(SyntaxEngine::new);
-        let syntax = match engine.as_ref() {
-            None => SyntaxAvailability::Disabled,
-            Some(Ok(engine)) => SyntaxAvailability::Ready(engine),
-            Some(Err(error)) => SyntaxAvailability::Failed(error),
-        };
-        let cancelled = || false;
-        let context = DecorationContext {
-            document,
-            theme,
-            whitespace,
-            syntax,
-            cancelled: &cancelled,
-        };
-        let scope = DecorationScope {
-            budget,
-            priority_hunk: None,
-            only_priority: false,
-        };
-        match Self::compute_internal(context, scope) {
-            Some(result) => result,
-            // Synchronous pathのcancel predicateはfalse固定なので到達しない。型上のNoneは空setへ
-            // 写し、public APIからpanic経路を作らない。
-            None => DecorationBuilder::new(whitespace, budget).finish(),
-        }
+        line_range: Option<Range<usize>>,
+    ) -> Result<Self, DecorationComputeError> {
+        DecorationComputer::new().compute_scoped(document, theme, whitespace, budget, line_range)
     }
 
-    fn compute_internal(context: DecorationContext<'_>, scope: DecorationScope) -> Option<Self> {
-        let mut builder = DecorationBuilder::new(context.whitespace, scope.budget);
-        if !context
-            .document
-            .files()
+    fn compute_internal(
+        context: DecorationContext<'_>,
+        scope: DecorationScope,
+    ) -> Result<Option<BudgetedDecorationSet>, DecorationComputeError> {
+        let mut builder = DecorationBuilder::new(
+            context.document.identity(),
+            context.whitespace,
+            context.ledger,
+            scope.pool,
+            scope.budget,
+        )?;
+        let mut readers = DecorationReaders::new(context.ledger)?;
+        let files = files_in_scope(context.document, scope.line_range.as_ref());
+        if !files
             .iter()
             .any(|file| file.mode.is_rich() && !file.hunk_ids.is_empty())
         {
-            return Some(builder.finish());
+            return Ok(Some(builder.finish()));
         }
         if let SyntaxAvailability::Failed(error) = context.syntax {
             builder.record_syntax_error(error);
@@ -120,31 +290,29 @@ impl DecorationSet {
                 && let Some(file) = context.document.file(hunk.file_id)
                 && file.mode.is_rich()
                 && hunk.kind == HunkKind::Unified
-                && !decorate_one_hunk(&mut builder, &context, file, hunk)?
             {
-                return Some(builder.finish());
+                match decorate_one_hunk(&mut builder, &context, file, hunk, &mut readers)? {
+                    DecorationStep::Continue => {}
+                    DecorationStep::Stop => return Ok(Some(builder.finish())),
+                    DecorationStep::Cancelled => return Ok(None),
+                }
             }
             if scope.only_priority {
-                return Some(builder.finish());
+                return Ok(Some(builder.finish()));
             }
         } else if scope.only_priority {
-            return Some(builder.finish());
+            return Ok(Some(builder.finish()));
         }
-        'files: for file in context
-            .document
-            .files()
-            .iter()
-            .filter(|file| file.mode.is_rich())
-        {
+        'files: for file in files.iter().filter(|file| file.mode.is_rich()) {
             if (context.cancelled)() {
-                return None;
+                return Ok(None);
             }
             for hunk_id in &file.hunk_ids {
                 if Some(*hunk_id) == scope.priority_hunk {
                     continue;
                 }
                 if (context.cancelled)() {
-                    return None;
+                    return Ok(None);
                 }
                 let Some(hunk) = context.document.hunk(*hunk_id) else {
                     continue;
@@ -152,18 +320,33 @@ impl DecorationSet {
                 if hunk.kind != HunkKind::Unified {
                     continue;
                 }
-                if !decorate_one_hunk(&mut builder, &context, file, hunk)? {
-                    break 'files;
+                match decorate_one_hunk(&mut builder, &context, file, hunk, &mut readers)? {
+                    DecorationStep::Continue => {}
+                    DecorationStep::Stop => break 'files,
+                    DecorationStep::Cancelled => return Ok(None),
                 }
             }
         }
-        Some(builder.finish())
+        Ok(Some(builder.finish()))
     }
 
     /// Lineにdecorationsがあれば返す。
     #[must_use]
     pub fn line(&self, id: LineId) -> Option<&LineDecoration> {
-        self.lines.get(&id)
+        self.lines
+            .binary_search_by_key(&id, |entry| entry.line_id)
+            .ok()
+            .and_then(|index| self.lines.get(index))
+            .map(|entry| &entry.decoration)
+    }
+
+    /// Derived spanを計算したdocument lineageと一致するかを返す。
+    ///
+    /// [`Self::default`]はUI初期化用の未結合setなのでfalseになる。数値上同じ`LineId`を持つ別builderの
+    /// spanをrendererへ流用してはならない。
+    #[must_use]
+    pub fn belongs_to(&self, document: &DocumentSnapshot) -> bool {
+        self.identity.as_ref() == Some(&document.identity())
     }
 
     /// Decoration spanを1つも保持していないかを返す。
@@ -178,7 +361,7 @@ impl DecorationSet {
         self.whitespace
     }
 
-    /// Hash tableとspan payloadの概算byte数を返す。
+    /// Flat entry Vec、syntax span、intraline range、warningがresult poolで占めるbyte数を返す。
     #[must_use]
     pub const fn approximate_bytes(&self) -> usize {
         self.approximate_bytes
@@ -193,7 +376,116 @@ impl DecorationSet {
     /// Syntax failure、intraline cap、budget省略のsummaryを返す。
     #[must_use]
     pub fn warning(&self) -> Option<&str> {
-        self.warning.as_deref()
+        self.warning.as_deref().or(self.warning_fallback)
+    }
+}
+
+/// Worker builderまたはresponse queueが所有するNext/Priority result。
+///
+/// Payloadをleaseより先に宣言するため、channel eviction、stale response、panic unwindのいずれでも
+/// span Vecを解放してからpool byteを返す。Cloneを実装せず、response送信はownershipを移す。
+#[derive(Debug)]
+pub struct BudgetedDecorationSet {
+    set: DecorationSet,
+    lease: DerivedMemoryLease,
+}
+
+impl BudgetedDecorationSet {
+    /// Resultが占有するpoolを返す。
+    #[must_use]
+    pub fn pool(&self) -> DerivedMemoryPool {
+        self.lease.pool()
+    }
+
+    /// Ledgerへ計上したresult capacityを返す。
+    #[must_use]
+    pub fn leased_bytes(&self) -> usize {
+        self.lease.bytes()
+    }
+
+    /// Direct/snapshot testのようにsession共有台帳を使わないcallerへpayloadだけを返す。
+    fn into_unbudgeted(self) -> DecorationSet {
+        let Self { set, lease } = self;
+        drop(lease);
+        set
+    }
+}
+
+impl Deref for BudgetedDecorationSet {
+    type Target = DecorationSet;
+
+    fn deref(&self) -> &Self::Target {
+        &self.set
+    }
+}
+
+/// Main rendererへ公開中のApplied result。
+///
+/// `replace`だけがNext/Priority payloadをAppliedへ移せる。旧payloadはledger lockを保持したままdropし、
+/// workerが解放直後のpoolへ新しいbuilderを入れる前に物理allocationも解放する。
+#[derive(Debug)]
+pub struct AppliedDecorationSet {
+    set: DecorationSet,
+    lease: DerivedMemoryLease,
+}
+
+impl AppliedDecorationSet {
+    /// 空payloadと0-byte Applied leaseを作る。
+    pub fn empty(ledger: &DerivedMemoryLedger) -> Result<Self, DerivedMemoryError> {
+        Ok(Self {
+            set: DecorationSet::default(),
+            lease: ledger.reserve(DerivedMemoryPool::AppliedDecoration, 0)?,
+        })
+    }
+
+    /// 現在のpayloadを空へ戻し、payload drop後にApplied byteを返す。
+    pub fn clear(&mut self) -> Result<(), DerivedMemoryError> {
+        let old = std::mem::take(&mut self.set);
+        drop(old);
+        let bytes = self.lease.bytes();
+        self.lease.release(bytes)
+    }
+
+    /// Next/Priority resultをrendererへ適用する。
+    ///
+    /// Result wrapperを分解する処理はこのmethod内だけに閉じ、旧payload dropとledger transitionの間に
+    /// worker reserveが割り込めないよう[`DerivedMemoryLedger::replace_applied_while_charged`]を使う。
+    pub fn replace(
+        &mut self,
+        replacement: BudgetedDecorationSet,
+        ledger: &DerivedMemoryLedger,
+    ) -> Result<(), DerivedMemoryError> {
+        let BudgetedDecorationSet {
+            set: replacement_set,
+            lease: mut replacement_lease,
+        } = replacement;
+        let mut current_set = Some(std::mem::take(&mut self.set));
+        let transition =
+            ledger.replace_applied_while_charged(&mut self.lease, &mut replacement_lease, || {
+                if let Some(current) = current_set.take() {
+                    drop(current);
+                }
+            });
+        if let Err(error) = transition {
+            if let Some(current) = current_set.take() {
+                self.set = current;
+            }
+            drop(replacement_set);
+            drop(replacement_lease);
+            return Err(error);
+        }
+        self.set = replacement_set;
+        let released = std::mem::replace(&mut self.lease, replacement_lease);
+        drop(released);
+        Ok(())
+    }
+}
+
+impl Deref for AppliedDecorationSet {
+    type Target = DecorationSet;
+
+    fn deref(&self) -> &Self::Target {
+        &self.set
     }
 }
 
@@ -201,44 +493,171 @@ fn decorate_one_hunk(
     builder: &mut DecorationBuilder,
     context: &DecorationContext<'_>,
     file: &FileEntry,
-    hunk: &crate::model::Hunk,
-) -> Option<bool> {
-    let lines = source_lines_for_hunk(context.document, hunk, context.cancelled)?;
+    hunk: &Hunk,
+    readers: &mut DecorationReaders,
+) -> Result<DecorationStep, DecorationComputeError> {
     if let SyntaxAvailability::Ready(engine) = context.syntax
-        && !decorate_syntax_hunk(
-            builder,
-            engine,
-            file,
-            &lines,
-            context.theme,
-            context.cancelled,
-        )
+        && !decorate_syntax_hunk(builder, engine, file, hunk, context, readers)?
     {
-        return (!(context.cancelled)()).then_some(false);
+        return Ok(if (context.cancelled)() {
+            DecorationStep::Cancelled
+        } else {
+            DecorationStep::Stop
+        });
     }
-    if !decorate_intraline_hunk(builder, &lines, context.whitespace, context.cancelled) {
-        return (!(context.cancelled)()).then_some(false);
+    if !decorate_intraline_hunk(
+        builder,
+        hunk,
+        context.document,
+        context.whitespace,
+        context.cancelled,
+        readers,
+    )? {
+        return Ok(if (context.cancelled)() {
+            DecorationStep::Cancelled
+        } else {
+            DecorationStep::Stop
+        });
     }
-    Some(true)
+    Ok(DecorationStep::Continue)
+}
+
+#[derive(Clone, Copy)]
+enum DecorationStep {
+    Continue,
+    Stop,
+    Cancelled,
+}
+
+struct DecorationReaders {
+    text: BoundedDocumentTextReader,
+    metadata: DocumentLineMetadataReader,
+    text_lease: DerivedMemoryLease,
+    eager_accounted: usize,
+    streaming_accounted: usize,
+}
+
+impl DecorationReaders {
+    fn new(ledger: &DerivedMemoryLedger) -> Result<Self, DerivedMemoryError> {
+        Ok(Self {
+            text: BoundedDocumentTextReader::new(),
+            metadata: DocumentLineMetadataReader::new(),
+            text_lease: ledger.reserve(DerivedMemoryPool::DecorationWorkspace, 0)?,
+            eager_accounted: 0,
+            streaming_accounted: 0,
+        })
+    }
+
+    /// Bounded readerがworker lifetimeで保持する再利用bufferを、raw/display metadataだけで先に計上する。
+    ///
+    /// Eager pathはraw・ANSI除去・escaped textの3 payload、streaming pathは完成textと64 KiB decoder/
+    /// grapheme buffer群を持つ。両readerは別fieldなので各pathの最大値を加算し、次のlineで小さくなっても
+    /// leaseを縮めない。`false`ではtext readを開始していない。
+    fn reserve_text_read(&mut self, metadata: DocumentLineMetadata) -> bool {
+        const STREAMING_FIXED_BYTES: usize = 2 * 1024 * 1024;
+        const EAGER_FIXED_BYTES: usize = 64 * 1024;
+
+        let Some(display_bytes) = metadata.display_len.exact() else {
+            return false;
+        };
+        let mut next_eager = self.eager_accounted;
+        let mut next_streaming = self.streaming_accounted;
+        let raw_exceeds =
+            u64::try_from(MAX_EAGER_TEXT_RAW_BYTES).map_or(true, |limit| metadata.raw_len > limit);
+        if raw_exceeds {
+            let Some(required) = display_bytes
+                .checked_mul(2)
+                .and_then(|bytes| bytes.checked_add(STREAMING_FIXED_BYTES))
+            else {
+                return false;
+            };
+            next_streaming = next_streaming.max(required);
+        } else {
+            let Ok(raw_bytes) = usize::try_from(metadata.raw_len) else {
+                return false;
+            };
+            let Some(required) = raw_bytes
+                .checked_mul(4)
+                .and_then(|bytes| {
+                    display_bytes
+                        .checked_mul(2)
+                        .and_then(|display| bytes.checked_add(display))
+                })
+                .and_then(|bytes| bytes.checked_add(EAGER_FIXED_BYTES))
+            else {
+                return false;
+            };
+            next_eager = next_eager.max(required);
+        }
+        let Some(required) = next_eager.checked_add(next_streaming) else {
+            return false;
+        };
+        if required > self.text_lease.bytes() {
+            let additional = required - self.text_lease.bytes();
+            if self.text_lease.reserve(additional).is_err() {
+                // High-water markはlease成功後だけcommitする。失敗した巨大lineの候補値を残すと、
+                // 後続の小さいlineまで存在しないbuffer capacityとの合算で省略され続ける。
+                return false;
+            }
+        }
+        self.eager_accounted = next_eager;
+        self.streaming_accounted = next_streaming;
+        true
+    }
 }
 
 /// 1回のdecorations計算で共有するimmutable input。Hunk helperへ個別に渡さず、cancel判定と
 /// syntax engineの組を同じsnapshotへ固定する。
 struct DecorationContext<'input> {
-    document: &'input Document,
+    document: &'input DocumentSnapshot,
     theme: &'input Theme,
     whitespace: WhitespaceChoice,
     syntax: SyntaxAvailability<'input>,
+    ledger: &'input DerivedMemoryLedger,
     cancelled: &'input dyn Fn() -> bool,
 }
 
 /// Derived budgetと走査範囲。`only_priority`はpartial response専用で、指定hunkを処理した後に
 /// document全体へ進まない。
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DecorationScope {
     budget: usize,
+    pool: DerivedMemoryPool,
     priority_hunk: Option<HunkId>,
     only_priority: bool,
+    /// `None`はbackground full scan。`Some`はdirect writerが閉じたfile範囲だけを要求する。
+    line_range: Option<Range<usize>>,
+}
+
+/// File spanはGit出力順で重ならないため、2回のpartition_pointで対象sliceへ絞れる。
+/// Pathologicalにfile数が多いdirect streamでも、今回閉じたfileを探すために既出prefixを走査しない。
+fn files_in_scope<'document>(
+    document: &'document DocumentSnapshot,
+    line_range: Option<&Range<usize>>,
+) -> &'document [FileEntry] {
+    let files = document.files();
+    let Some(range) = line_range else {
+        return files;
+    };
+    let first =
+        files.partition_point(|file| file_span_end(file, document.line_count()) <= range.start);
+    let end =
+        files.partition_point(|file| file_span_start(file, document.line_count()) < range.end);
+    files.get(first..end.max(first)).unwrap_or_default()
+}
+
+fn file_span_start(file: &FileEntry, document_len: usize) -> usize {
+    usize::try_from(file.span.start.get())
+        .unwrap_or(document_len)
+        .min(document_len)
+}
+
+fn file_span_end(file: &FileEntry, document_len: usize) -> usize {
+    file.span
+        .end_exclusive
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(document_len)
+        .min(document_len)
 }
 
 #[derive(Clone, Copy)]
@@ -248,38 +667,16 @@ enum SyntaxAvailability<'engine> {
     Failed(&'engine HighlightError),
 }
 
-fn source_lines_for_hunk<'document>(
-    document: &'document Document,
-    hunk: &crate::model::Hunk,
-    cancelled: &dyn Fn() -> bool,
-) -> Option<Vec<&'document DocumentLine>> {
-    let start = usize::try_from(hunk.span.start.get()).unwrap_or(usize::MAX);
-    let end = hunk
-        .span
-        .end_exclusive
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(document.lines().len())
-        .min(document.lines().len());
-    let mut lines = Vec::new();
-    for line in document.lines().get(start..end).unwrap_or_default() {
-        if cancelled() {
-            return None;
-        }
-        if is_source(line.kind) && line.hunk_id == Some(hunk.id) {
-            lines.push(line);
-        }
-    }
-    Some(lines)
-}
-
 impl Default for DecorationSet {
     fn default() -> Self {
         Self {
-            lines: HashMap::new(),
+            identity: None,
+            lines: Vec::new(),
             whitespace: WhitespaceChoice::Ignore,
             approximate_bytes: 0,
             truncated: false,
             warning: None,
+            warning_fallback: None,
         }
     }
 }
@@ -288,46 +685,200 @@ fn decorate_syntax_hunk(
     builder: &mut DecorationBuilder,
     engine: &SyntaxEngine,
     file: &FileEntry,
-    lines: &[&DocumentLine],
-    theme: &Theme,
-    cancelled: &dyn Fn() -> bool,
-) -> bool {
+    hunk: &Hunk,
+    context: &DecorationContext<'_>,
+    readers: &mut DecorationReaders,
+) -> Result<bool, DecorationComputeError> {
     let old_path = file.old_path.as_deref().or(file.new_path.as_deref());
     let new_path = file.new_path.as_deref().or(file.old_path.as_deref());
-    let old_first = lines
-        .iter()
-        .find(|line| matches!(line.kind, LineKind::Deletion | LineKind::Context))
-        .map(|line| line.content());
-    let new_first = lines
-        .iter()
-        .find(|line| matches!(line.kind, LineKind::Addition | LineKind::Context))
-        .map(|line| line.content());
-    let mut old = open_session(builder, engine, old_path, old_first, theme);
-    let mut new = open_session(builder, engine, new_path, new_first, theme);
+    // Syntax検出用first lineを先読みして保持せず、各sideで最初に現れたsource lineからsessionを開く。
+    // 以後は同じsessionへ順番どおり渡すため、複数行のtextを同時に所有する必要がない。
+    let mut old = None;
+    let mut new = None;
+    let mut old_opened = false;
+    let mut new_opened = false;
     let use_old_context = file.status == ChangeStatus::Deleted;
 
-    for line in lines {
-        if cancelled() {
-            return false;
+    for raw_id in hunk_line_range(context.document, hunk) {
+        if (context.cancelled)() {
+            return Ok(false);
         }
-        if line.content().len() > MAX_SYNTAX_LINE_BYTES {
-            builder.syntax_skipped_lines = builder.syntax_skipped_lines.saturating_add(1);
+        let line_id = LineId::new(raw_id);
+        let metadata = readers
+            .metadata
+            .read(context.document, line_id)?
+            .ok_or(DecorationComputeError::MissingLine { line_id })?;
+        if !is_source(metadata.kind) || metadata.hunk_id != Some(hunk.id) {
+            continue;
         }
-        let selected = match line.kind {
-            LineKind::Deletion => advance_session(builder, &mut old, line.content()),
-            LineKind::Addition => advance_session(builder, &mut new, line.content()),
+
+        if metadata.display_len.exceeds(MAX_SYNTAX_DISPLAY_BYTES) {
+            builder.syntax_omitted = true;
+            reset_skipped_syntax_line(
+                builder,
+                engine,
+                metadata.kind,
+                old_path,
+                new_path,
+                context.theme,
+                &mut old_opened,
+                &mut old,
+                &mut new_opened,
+                &mut new,
+            );
+            continue;
+        }
+        if !readers.reserve_text_read(metadata) {
+            builder.syntax_omitted = true;
+            reset_skipped_syntax_line(
+                builder,
+                engine,
+                metadata.kind,
+                old_path,
+                new_path,
+                context.theme,
+                &mut old_opened,
+                &mut old,
+                &mut new_opened,
+                &mut new,
+            );
+            continue;
+        }
+
+        let (metadata, text) = match readers.text.read(
+            context.document,
+            line_id,
+            MAX_SYNTAX_DISPLAY_BYTES,
+            context.cancelled,
+        )? {
+            BoundedTextRead::Available { metadata, text } => (metadata, text),
+            BoundedTextRead::Oversized { metadata } => {
+                builder.syntax_omitted = true;
+                reset_skipped_syntax_line(
+                    builder,
+                    engine,
+                    metadata.kind,
+                    old_path,
+                    new_path,
+                    context.theme,
+                    &mut old_opened,
+                    &mut old,
+                    &mut new_opened,
+                    &mut new,
+                );
+                continue;
+            }
+            BoundedTextRead::Cancelled => return Ok(false),
+        };
+        let content = text.get(1..).unwrap_or_default();
+        let selected = match metadata.kind {
+            LineKind::Deletion => open_and_advance_session(
+                builder,
+                engine,
+                old_path,
+                content,
+                context.theme,
+                &mut old_opened,
+                &mut old,
+            ),
+            LineKind::Addition => open_and_advance_session(
+                builder,
+                engine,
+                new_path,
+                content,
+                context.theme,
+                &mut new_opened,
+                &mut new,
+            ),
             LineKind::Context => {
-                let old_line = advance_session(builder, &mut old, line.content());
-                let new_line = advance_session(builder, &mut new, line.content());
+                let old_line = open_and_advance_session(
+                    builder,
+                    engine,
+                    old_path,
+                    content,
+                    context.theme,
+                    &mut old_opened,
+                    &mut old,
+                );
+                let new_line = open_and_advance_session(
+                    builder,
+                    engine,
+                    new_path,
+                    content,
+                    context.theme,
+                    &mut new_opened,
+                    &mut new,
+                );
                 if use_old_context { old_line } else { new_line }
             }
             _ => continue,
         };
-        if !builder.add_syntax(line, selected) {
-            return false;
+        if !builder.add_syntax(metadata.id, text.len(), selected) {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reset_skipped_syntax_line<'engine>(
+    builder: &mut DecorationBuilder,
+    engine: &'engine SyntaxEngine,
+    kind: LineKind,
+    old_path: Option<&str>,
+    new_path: Option<&str>,
+    theme: &Theme,
+    old_opened: &mut bool,
+    old: &mut Option<SyntaxSession<'engine>>,
+    new_opened: &mut bool,
+    new: &mut Option<SyntaxSession<'engine>>,
+) {
+    match kind {
+        LineKind::Deletion => {
+            reset_skipped_session(builder, engine, old_path, theme, old_opened, old);
+        }
+        LineKind::Addition => {
+            reset_skipped_session(builder, engine, new_path, theme, new_opened, new);
+        }
+        LineKind::Context => {
+            reset_skipped_session(builder, engine, old_path, theme, old_opened, old);
+            reset_skipped_session(builder, engine, new_path, theme, new_opened, new);
+        }
+        _ => {}
+    }
+}
+
+fn reset_skipped_session<'engine>(
+    builder: &mut DecorationBuilder,
+    engine: &'engine SyntaxEngine,
+    path: Option<&str>,
+    theme: &Theme,
+    opened: &mut bool,
+    session: &mut Option<SyntaxSession<'engine>>,
+) {
+    if !*opened {
+        *session = open_session(builder, engine, path, None, theme);
+        *opened = true;
+    }
+    if let Some(active) = session.as_mut() {
+        active.reset_after_skipped_line();
+    }
+}
+
+fn open_and_advance_session<'engine>(
+    builder: &mut DecorationBuilder,
+    engine: &'engine SyntaxEngine,
+    path: Option<&str>,
+    line: &str,
+    theme: &Theme,
+    opened: &mut bool,
+    session: &mut Option<SyntaxSession<'engine>>,
+) -> BudgetedHighlightedLine {
+    if !*opened {
+        *session = open_session(builder, engine, path, Some(line), theme);
+        *opened = true;
+    }
+    advance_session(builder, session, line)
 }
 
 fn open_session<'engine>(
@@ -337,8 +888,12 @@ fn open_session<'engine>(
     first_line: Option<&str>,
     theme: &Theme,
 ) -> Option<SyntaxSession<'engine>> {
-    match engine.session(path, first_line, theme.choice()) {
+    match engine.session_with_budget(path, first_line, theme.choice(), builder.ledger) {
         Ok(session) => session,
+        Err(HighlightError::WorkspaceBudgetExceeded) => {
+            builder.syntax_omitted = true;
+            None
+        }
         Err(error) => {
             builder.record_syntax_error(&error);
             None
@@ -350,83 +905,426 @@ fn advance_session(
     builder: &mut DecorationBuilder,
     session: &mut Option<SyntaxSession<'_>>,
     line: &str,
-) -> HighlightedLine {
+) -> BudgetedHighlightedLine {
     let Some(active) = session.as_mut() else {
-        return HighlightedLine::Plain;
+        return BudgetedHighlightedLine::plain();
     };
-    match active.highlight_line(line) {
-        Ok(highlighted) => highlighted,
+    match active.highlight_line_with_budget(line, builder.ledger) {
+        Ok(Some(highlighted)) => highlighted,
+        Ok(None) => {
+            builder.syntax_omitted = true;
+            BudgetedHighlightedLine::plain()
+        }
         Err(error) => {
             builder.record_syntax_error(&error);
             *session = None;
-            HighlightedLine::Plain
+            BudgetedHighlightedLine::plain()
         }
     }
 }
 
 fn decorate_intraline_hunk(
     builder: &mut DecorationBuilder,
-    lines: &[&DocumentLine],
+    hunk: &Hunk,
+    document: &DocumentSnapshot,
     whitespace: WhitespaceChoice,
     cancelled: &dyn Fn() -> bool,
-) -> bool {
-    let mut index = 0_usize;
-    while index < lines.len() {
+    readers: &mut DecorationReaders,
+) -> Result<bool, DecorationComputeError> {
+    let mut block: Option<IntralineBlockIds> = None;
+    let mut adding = false;
+    for raw_id in hunk_line_range(document, hunk) {
         if cancelled() {
-            return false;
+            return Ok(false);
         }
-        if lines[index].kind != LineKind::Deletion {
-            index += 1;
+        let line_id = LineId::new(raw_id);
+        let metadata = readers
+            .metadata
+            .read(document, line_id)?
+            .ok_or(DecorationComputeError::MissingLine { line_id })?;
+        if !is_source(metadata.kind) || metadata.hunk_id != Some(hunk.id) {
             continue;
         }
-        let removed_start = index;
-        while index < lines.len() && lines[index].kind == LineKind::Deletion {
-            index += 1;
-        }
-        let removed_end = index;
-        let added_start = index;
-        while index < lines.len() && lines[index].kind == LineKind::Addition {
-            index += 1;
-        }
-        let added_end = index;
-        if added_start == added_end {
-            continue;
-        }
-
-        let removed = lines[removed_start..removed_end]
-            .iter()
-            .map(|line| line.content())
-            .collect::<Vec<_>>();
-        let added = lines[added_start..added_end]
-            .iter()
-            .map(|line| line.content())
-            .collect::<Vec<_>>();
-        match compute_refs(&removed, &added, whitespace) {
-            IntralineResult::Computed(pairs) => {
-                let mut updates = Vec::with_capacity(pairs.len().saturating_mul(2));
-                for pair in pairs {
-                    if cancelled() {
-                        return false;
+        match metadata.kind {
+            LineKind::Deletion => {
+                if adding {
+                    let Some(finished) = block.take() else {
+                        return Ok(false);
+                    };
+                    if !decorate_intraline_block(
+                        builder, finished, document, whitespace, cancelled, readers,
+                    )? {
+                        return Ok(false);
                     }
-                    let old_line = lines[removed_start + pair.old_index];
-                    updates.push((old_line, pair.old_changed));
-                    let new_line = lines[added_start + pair.new_index];
-                    updates.push((new_line, pair.new_changed));
                 }
-                if cancelled() {
-                    return false;
-                }
-                if !builder.add_intraline_block(updates) {
-                    return false;
+                adding = false;
+                block
+                    .get_or_insert_with(|| IntralineBlockIds::new(builder.ledger))
+                    .push_removed(metadata);
+            }
+            LineKind::Addition => {
+                if let Some(active) = block.as_mut() {
+                    adding = true;
+                    active.push_added(metadata);
                 }
             }
-            IntralineResult::Skipped(_) => {
-                builder.intraline_skipped_blocks =
-                    builder.intraline_skipped_blocks.saturating_add(1);
+            LineKind::Context => {
+                if adding {
+                    let Some(finished) = block.take() else {
+                        return Ok(false);
+                    };
+                    if !decorate_intraline_block(
+                        builder, finished, document, whitespace, cancelled, readers,
+                    )? {
+                        return Ok(false);
+                    }
+                } else {
+                    block = None;
+                }
+                adding = false;
             }
+            _ => {}
         }
     }
-    true
+    if adding
+        && let Some(finished) = block
+        && !decorate_intraline_block(builder, finished, document, whitespace, cancelled, readers)?
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Metadata scan中の1 deletion/addition block。
+///
+/// Textをdecodeする前に5,000行と64 MiBの上限を適用する。上限を越えたblockはIDも破棄し、後続の
+/// source metadataをblock終端まで読み飛ばす。Grapheme上限はtext decode後、owned copy前に別passで
+/// 検証する。
+struct IntralineBlockIds {
+    removed: Vec<LineId>,
+    added: Vec<LineId>,
+    _lease: Option<DerivedMemoryLease>,
+    content_bytes: usize,
+    rejected: bool,
+}
+
+impl IntralineBlockIds {
+    fn new(ledger: &DerivedMemoryLedger) -> Self {
+        let bytes = MAX_CHANGED_LINES
+            .checked_mul(size_of::<LineId>())
+            // removed/addedの2 Vecとallocator growthの2倍を同時に覆う。
+            .and_then(|bytes| bytes.checked_mul(4));
+        let Some(bytes) = bytes else {
+            return Self::rejected();
+        };
+        let Ok(lease) = ledger.reserve(DerivedMemoryPool::DecorationWorkspace, bytes) else {
+            return Self::rejected();
+        };
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        if removed.try_reserve_exact(MAX_CHANGED_LINES).is_err()
+            || added.try_reserve_exact(MAX_CHANGED_LINES).is_err()
+        {
+            return Self::rejected();
+        }
+        Self {
+            removed,
+            added,
+            _lease: Some(lease),
+            content_bytes: 0,
+            rejected: false,
+        }
+    }
+
+    fn rejected() -> Self {
+        Self {
+            removed: Vec::new(),
+            added: Vec::new(),
+            _lease: None,
+            content_bytes: 0,
+            rejected: true,
+        }
+    }
+
+    fn push_removed(&mut self, metadata: DocumentLineMetadata) {
+        self.push(metadata, false);
+    }
+
+    fn push_added(&mut self, metadata: DocumentLineMetadata) {
+        self.push(metadata, true);
+    }
+
+    fn push(&mut self, metadata: DocumentLineMetadata, added: bool) {
+        if self.rejected {
+            return;
+        }
+        if self.removed.len().saturating_add(self.added.len()) >= MAX_CHANGED_LINES {
+            self.reject();
+            return;
+        }
+        let LineDisplayLength::Exact(display_len) = metadata.display_len else {
+            self.reject();
+            return;
+        };
+        let Ok(display_len) = usize::try_from(display_len) else {
+            self.reject();
+            return;
+        };
+        // display_lenはsource marker込みなので、compute_refsへ渡すcontentと同じbyte数へ1を引く。
+        let Some(content_bytes) = self
+            .content_bytes
+            .checked_add(display_len.saturating_sub(1))
+        else {
+            self.reject();
+            return;
+        };
+        if content_bytes > MAX_BLOCK_BYTES {
+            self.reject();
+            return;
+        }
+        self.content_bytes = content_bytes;
+        if added {
+            self.added.push(metadata.id);
+        } else {
+            self.removed.push(metadata.id);
+        }
+    }
+
+    fn reject(&mut self) {
+        self.rejected = true;
+        self.removed.clear();
+        self.added.clear();
+    }
+}
+
+fn decorate_intraline_block(
+    builder: &mut DecorationBuilder,
+    block: IntralineBlockIds,
+    document: &DocumentSnapshot,
+    whitespace: WhitespaceChoice,
+    cancelled: &dyn Fn() -> bool,
+    readers: &mut DecorationReaders,
+) -> Result<bool, DecorationComputeError> {
+    if block.rejected {
+        builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+        return Ok(true);
+    }
+
+    // このpassではbounded readerのborrowed viewだけを使う。Block全体のgrapheme capが確定する
+    // 前に`OwnedDocumentLine`を作らず、raw payloadが巨大でも64 KiB stepごとにcancelへ戻る。
+    let mut grapheme_total = 0_usize;
+    for line_id in block.removed.iter().chain(&block.added).copied() {
+        if cancelled() {
+            return Ok(false);
+        }
+        let metadata = readers
+            .metadata
+            .read(document, line_id)?
+            .ok_or(DecorationComputeError::MissingLine { line_id })?;
+        if !readers.reserve_text_read(metadata) {
+            builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+            return Ok(true);
+        }
+        let text = match readers.text.read(
+            document,
+            line_id,
+            MAX_INTRALINE_LINE_DISPLAY_BYTES,
+            cancelled,
+        )? {
+            BoundedTextRead::Available { text, .. } => text,
+            BoundedTextRead::Oversized { .. } => {
+                builder.intraline_skipped_blocks =
+                    builder.intraline_skipped_blocks.saturating_add(1);
+                return Ok(true);
+            }
+            BoundedTextRead::Cancelled => return Ok(false),
+        };
+        let graphemes = text
+            .get(1..)
+            .unwrap_or_default()
+            .graphemes(true)
+            .take(MAX_LINE_GRAPHEMES + 1)
+            .count();
+        if graphemes > MAX_LINE_GRAPHEMES {
+            builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+            return Ok(true);
+        }
+        grapheme_total = grapheme_total.saturating_add(graphemes);
+        if grapheme_total > MAX_BLOCK_GRAPHEMES {
+            builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+            return Ok(true);
+        }
+    }
+
+    let line_count = block.removed.len().saturating_add(block.added.len());
+    let owned_workspace_bytes = block
+        .content_bytes
+        .checked_add(line_count)
+        .and_then(|bytes| {
+            line_count
+                .checked_mul(size_of::<OwnedDocumentLine>() + size_of::<&str>())
+                .and_then(|metadata| bytes.checked_add(metadata))
+        })
+        .and_then(|bytes| bytes.checked_mul(2));
+    let Some(owned_workspace_bytes) = owned_workspace_bytes else {
+        builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+        return Ok(true);
+    };
+    // このleaseをremoved/added/borrowed refsより先に宣言する。Localは逆順dropなので、owned payload
+    // と参照Vecが解放された後にworkspace byteを返す。
+    let _owned_workspace = match builder.ledger.reserve(
+        DerivedMemoryPool::DecorationWorkspace,
+        owned_workspace_bytes,
+    ) {
+        Ok(lease) => lease,
+        Err(_) => {
+            builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+            return Ok(true);
+        }
+    };
+
+    let removed = match own_lines(readers, document, &block.removed, cancelled)? {
+        OwnedLinesRead::Available(lines) => lines,
+        OwnedLinesRead::Oversized => {
+            builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+            return Ok(true);
+        }
+        OwnedLinesRead::Cancelled => return Ok(false),
+    };
+    let added = match own_lines(readers, document, &block.added, cancelled)? {
+        OwnedLinesRead::Available(lines) => lines,
+        OwnedLinesRead::Oversized => {
+            builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+            return Ok(true);
+        }
+        OwnedLinesRead::Cancelled => return Ok(false),
+    };
+    let removed_refs = removed
+        .iter()
+        .map(OwnedDocumentLine::content)
+        .collect::<Vec<_>>();
+    let added_refs = added
+        .iter()
+        .map(OwnedDocumentLine::content)
+        .collect::<Vec<_>>();
+    let result = compute_refs_with_budget(&removed_refs, &added_refs, whitespace, builder.ledger);
+    match result.result() {
+        IntralineResult::Computed(_) => {
+            if cancelled() {
+                return Ok(false);
+            }
+            Ok(builder.add_intraline_result(result, &removed, &added))
+        }
+        IntralineResult::Skipped(_) => {
+            builder.intraline_skipped_blocks = builder.intraline_skipped_blocks.saturating_add(1);
+            Ok(true)
+        }
+    }
+}
+
+enum OwnedLinesRead {
+    Available(Vec<OwnedDocumentLine>),
+    Oversized,
+    Cancelled,
+}
+
+fn own_lines(
+    readers: &mut DecorationReaders,
+    document: &DocumentSnapshot,
+    line_ids: &[LineId],
+    cancelled: &dyn Fn() -> bool,
+) -> Result<OwnedLinesRead, DecorationComputeError> {
+    let mut lines = Vec::new();
+    lines
+        .try_reserve_exact(line_ids.len())
+        .map_err(|_| DocumentError::OwnedLineAllocation {
+            requested: line_ids
+                .len()
+                .saturating_mul(size_of::<OwnedDocumentLine>()),
+        })?;
+    for line_id in line_ids {
+        if cancelled() {
+            return Ok(OwnedLinesRead::Cancelled);
+        }
+        let metadata = readers
+            .metadata
+            .read(document, *line_id)?
+            .ok_or(DecorationComputeError::MissingLine { line_id: *line_id })?;
+        if !readers.reserve_text_read(metadata) {
+            return Ok(OwnedLinesRead::Oversized);
+        }
+        match readers.text.read(
+            document,
+            *line_id,
+            MAX_INTRALINE_LINE_DISPLAY_BYTES,
+            cancelled,
+        )? {
+            BoundedTextRead::Available { metadata, text } => {
+                let Some(line) = own_bounded_line(metadata, text, cancelled)? else {
+                    return Ok(OwnedLinesRead::Cancelled);
+                };
+                lines.push(line);
+            }
+            BoundedTextRead::Oversized { .. } => return Ok(OwnedLinesRead::Oversized),
+            BoundedTextRead::Cancelled => return Ok(OwnedLinesRead::Cancelled),
+        }
+    }
+    Ok(OwnedLinesRead::Available(lines))
+}
+
+fn own_bounded_line(
+    metadata: DocumentLineMetadata,
+    text: &str,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<OwnedDocumentLine>, DocumentError> {
+    const COPY_STEP_BYTES: usize = 64 * 1024;
+
+    let mut owned_text = String::new();
+    owned_text
+        .try_reserve_exact(text.len())
+        .map_err(|_| DocumentError::OwnedLineAllocation {
+            requested: text.len(),
+        })?;
+    let mut start = 0_usize;
+    while start < text.len() {
+        if cancelled() {
+            return Ok(None);
+        }
+        let candidate = start.saturating_add(COPY_STEP_BYTES).min(text.len());
+        let end = if candidate == text.len() {
+            candidate
+        } else {
+            text.floor_char_boundary(candidate)
+        };
+        owned_text.push_str(&text[start..end]);
+        start = end;
+    }
+    if cancelled() {
+        return Ok(None);
+    }
+    Ok(Some(OwnedDocumentLine {
+        id: metadata.id,
+        text: owned_text,
+        kind: metadata.kind,
+        commit_id: metadata.commit_id,
+        file_id: metadata.file_id,
+        hunk_id: metadata.hunk_id,
+        old_line_number: metadata.old_line_number,
+        new_line_number: metadata.new_line_number,
+        terminated: metadata.terminated,
+    }))
+}
+
+fn hunk_line_range(document: &DocumentSnapshot, hunk: &Hunk) -> Range<u64> {
+    let document_end = u64::try_from(document.line_count()).unwrap_or(u64::MAX);
+    let start = hunk.span.start.get().min(document_end);
+    let end = hunk
+        .span
+        .end_exclusive
+        .unwrap_or(document_end)
+        .min(document_end)
+        .max(start);
+    start..end
 }
 
 fn is_source(kind: LineKind) -> bool {
@@ -436,130 +1334,334 @@ fn is_source(kind: LineKind) -> bool {
     )
 }
 
-struct DecorationBuilder {
+struct DecorationBuilder<'ledger> {
     set: DecorationSet,
+    lease: DerivedMemoryLease,
+    ledger: &'ledger DerivedMemoryLedger,
     budget: usize,
-    syntax_error: Option<String>,
-    syntax_skipped_lines: usize,
+    syntax_failed: bool,
+    syntax_omitted: bool,
     intraline_skipped_blocks: usize,
 }
 
-impl DecorationBuilder {
-    fn new(whitespace: WhitespaceChoice, budget: usize) -> Self {
-        Self {
+/// Intraline outputをresult poolへ移す直前の所有単位。
+///
+/// Payload fieldをleaseより先に宣言し、capacity不足・index不整合・cancellationのearly returnでも
+/// pair/range Vecを先にdropする。
+struct PendingIntralineTransfer {
+    pairs: Vec<LinePairDiff>,
+    workspace: DerivedMemoryLease,
+}
+
+impl<'ledger> DecorationBuilder<'ledger> {
+    fn new(
+        identity: DocumentIdentity,
+        whitespace: WhitespaceChoice,
+        ledger: &'ledger DerivedMemoryLedger,
+        pool: DerivedMemoryPool,
+        budget: usize,
+    ) -> Result<Self, DerivedMemoryError> {
+        debug_assert!(matches!(
+            pool,
+            DerivedMemoryPool::NextDecoration | DerivedMemoryPool::PriorityDecoration
+        ));
+        debug_assert!(budget <= pool.limit_bytes());
+        Ok(Self {
             set: DecorationSet {
+                identity: Some(identity),
                 whitespace,
                 ..DecorationSet::default()
             },
+            lease: ledger.reserve(pool, 0)?,
+            ledger,
             budget,
-            syntax_error: None,
-            syntax_skipped_lines: 0,
+            syntax_failed: false,
+            syntax_omitted: false,
             intraline_skipped_blocks: 0,
-        }
+        })
     }
 
-    fn add_syntax(&mut self, line: &DocumentLine, highlighted: HighlightedLine) -> bool {
+    fn add_syntax(
+        &mut self,
+        line_id: LineId,
+        line_len: usize,
+        highlighted: BudgetedHighlightedLine,
+    ) -> bool {
+        let (highlighted, workspace) = highlighted.into_parts();
         let HighlightedLine::Styled(spans) = highlighted else {
             return true;
         };
-        let spans = spans
-            .into_iter()
-            .filter_map(|span| shift_syntax_span(span, line.text.len()))
-            .collect::<Vec<_>>();
-        if spans.is_empty() {
-            return true;
-        }
-        let cost = self
-            .entry_cost(line.id)
-            .saturating_add(spans.capacity().saturating_mul(size_of::<SyntaxSpan>()));
-        if !self.reserve(cost) {
-            return false;
-        }
-        self.set.lines.entry(line.id).or_default().syntax = spans;
-        true
-    }
-
-    fn add_intraline_block(&mut self, updates: Vec<(&DocumentLine, Vec<Range<usize>>)>) -> bool {
-        let mut pending = HashMap::<LineId, Vec<Range<usize>>>::new();
-        for (line, ranges) in updates {
-            pending.entry(line.id).or_default().extend(
-                ranges
-                    .into_iter()
-                    .filter_map(|range| shift_range(range, line.text.len())),
-            );
-        }
-        pending.retain(|_, ranges| !ranges.is_empty());
-        let cost = pending.iter().fold(0_usize, |total, (line_id, ranges)| {
-            total
-                .saturating_add(self.entry_cost(*line_id))
-                .saturating_add(ranges.capacity().saturating_mul(size_of::<Range<usize>>()))
-        });
-        // Pair/blockの片側だけをpublishすると、同じ変更でold/newの強調有無が分かれる。Budgetは
-        // block全体へ先に予約し、成功した場合だけLineId mapを更新する。
-        if !self.reserve(cost) {
-            return false;
-        }
-        for (line_id, ranges) in pending {
-            self.set
-                .lines
-                .entry(line_id)
-                .or_default()
-                .intraline
-                .extend(ranges);
-        }
-        true
-    }
-
-    fn entry_cost(&self, id: LineId) -> usize {
-        if self.set.lines.contains_key(&id) {
-            0
-        } else {
-            // Hash bucketのcontrol byteとload-factor余白を含め、payload型の2倍を概算する。
-            2 * (size_of::<LineId>() + size_of::<LineDecoration>())
-        }
-    }
-
-    fn reserve(&mut self, additional: usize) -> bool {
-        let Some(next) = self.set.approximate_bytes.checked_add(additional) else {
+        let Some(mut workspace) = workspace else {
             self.set.truncated = true;
             return false;
         };
-        if next > self.budget {
+        let mut spans = spans;
+        spans.retain_mut(|span| match shift_syntax_span(span.clone(), line_len) {
+            Some(shifted) => {
+                *span = shifted;
+                true
+            }
+            None => false,
+        });
+        spans.sort_unstable_by_key(|span| (span.byte_range.start, span.byte_range.end));
+        if spans.is_empty() {
+            return true;
+        }
+        if !self.ensure_line_capacity(line_id) {
+            return false;
+        }
+        let output_bytes = workspace.bytes();
+        if self
+            .lease
+            .bytes()
+            .checked_add(output_bytes)
+            .is_none_or(|next| next > self.budget)
+            || self
+                .ledger
+                .transfer(&mut workspace, &mut self.lease, output_bytes)
+                .is_err()
+        {
             self.set.truncated = true;
             return false;
         }
-        self.set.approximate_bytes = next;
+        self.line_mut(line_id).syntax = spans;
         true
     }
 
-    fn record_syntax_error(&mut self, error: &HighlightError) {
-        if self.syntax_error.is_none() {
-            self.syntax_error = Some(error.to_string());
+    fn add_intraline_result(
+        &mut self,
+        result: BudgetedIntralineResult,
+        removed: &[OwnedDocumentLine],
+        added: &[OwnedDocumentLine],
+    ) -> bool {
+        let (result, workspace) = result.into_parts();
+        let IntralineResult::Computed(pairs) = result else {
+            return true;
+        };
+        let Some(workspace) = workspace else {
+            self.set.truncated = true;
+            return false;
+        };
+        let mut pending = PendingIntralineTransfer { pairs, workspace };
+
+        let mut additional_entries = 0_usize;
+        for pair in &mut pending.pairs {
+            let (Some(old_line), Some(new_line)) =
+                (removed.get(pair.old_index), added.get(pair.new_index))
+            else {
+                self.set.truncated = true;
+                return false;
+            };
+            shift_ranges_in_place(&mut pair.old_changed, old_line.text.len());
+            shift_ranges_in_place(&mut pair.new_changed, new_line.text.len());
+            if !pair.old_changed.is_empty() && self.set.line(old_line.id).is_none() {
+                additional_entries = additional_entries.saturating_add(1);
+            }
+            if !pair.new_changed.is_empty() && self.set.line(new_line.id).is_none() {
+                additional_entries = additional_entries.saturating_add(1);
+            }
         }
+        if !self.ensure_additional_line_capacity(additional_entries) {
+            return false;
+        }
+        let output_bytes = pending.workspace.bytes();
+        if self
+            .lease
+            .bytes()
+            .checked_add(output_bytes)
+            .is_none_or(|next| next > self.budget)
+            || self
+                .ledger
+                .transfer(&mut pending.workspace, &mut self.lease, output_bytes)
+                .is_err()
+        {
+            self.set.truncated = true;
+            return false;
+        }
+        let PendingIntralineTransfer { pairs, workspace } = pending;
+        drop(workspace);
+        for pair in pairs {
+            // Indexはtransfer前のvalidation loopで両sideとも検証済みで、その後sliceを変更しない。
+            let old_line = &removed[pair.old_index];
+            let new_line = &added[pair.new_index];
+            if !pair.old_changed.is_empty() {
+                self.line_mut(old_line.id).intraline = pair.old_changed;
+            }
+            if !pair.new_changed.is_empty() {
+                self.line_mut(new_line.id).intraline = pair.new_changed;
+            }
+        }
+        true
     }
 
-    fn finish(mut self) -> DecorationSet {
-        let mut warnings = Vec::new();
-        if self.set.truncated {
-            warnings.push("decoration budget exceeded; later spans were omitted".to_owned());
+    fn ensure_line_capacity(&mut self, line_id: LineId) -> bool {
+        if self
+            .set
+            .lines
+            .binary_search_by_key(&line_id, |entry| entry.line_id)
+            .is_ok()
+        {
+            return true;
         }
-        if let Some(error) = self.syntax_error {
-            warnings.push(format!("syntax: {error}"));
+        self.ensure_additional_line_capacity(1)
+    }
+
+    fn ensure_additional_line_capacity(&mut self, additional: usize) -> bool {
+        if additional == 0 {
+            return true;
         }
-        if self.syntax_skipped_lines > 0 {
-            warnings.push(format!(
-                "syntax skipped for {} oversized lines",
-                self.syntax_skipped_lines
-            ));
+        let before = self.set.lines.capacity();
+        let Some(requested) = additional.checked_mul(size_of::<DecorationEntry>()) else {
+            self.set.truncated = true;
+            return false;
+        };
+        let Some(conservative) = requested.checked_mul(2) else {
+            self.set.truncated = true;
+            return false;
+        };
+        let Some(allowance) = self.precharge_growth(conservative) else {
+            return false;
+        };
+        if self.set.lines.try_reserve_exact(additional).is_err() {
+            self.release_growth_allowance(allowance, 0);
+            self.set.truncated = true;
+            return false;
         }
-        if self.intraline_skipped_blocks > 0 {
-            warnings.push(format!(
-                "intraline skipped for {} oversized blocks",
-                self.intraline_skipped_blocks
-            ));
+        let actual = self
+            .set
+            .lines
+            .capacity()
+            .saturating_sub(before)
+            .saturating_mul(size_of::<DecorationEntry>());
+        if actual > allowance {
+            // 2倍boundを越えるallocator growthはpublishしない。まだentryをinsertしていないため、以前の
+            // capacityまで縮小を要求し、残ったcapacityだけをfull allowance内で計上する。
+            self.set.lines.shrink_to(before);
+            let retained = self
+                .set
+                .lines
+                .capacity()
+                .saturating_sub(before)
+                .saturating_mul(size_of::<DecorationEntry>());
+            if retained > allowance {
+                // Allocatorがshrink要求も満たさない場合はentryとそのspan payloadを全体ごと捨てる。
+                // 空Vecへ戻した後はresult所有byteが残らないため、それまでのleaseも全て返す。
+                let entries = std::mem::take(&mut self.set.lines);
+                drop(entries);
+                let held = self.lease.bytes();
+                let _ = self.lease.release(held);
+            } else {
+                self.release_growth_allowance(allowance, retained);
+            }
+            self.set.truncated = true;
+            return false;
         }
-        self.set.warning = (!warnings.is_empty()).then(|| warnings.join("; "));
-        self.set
+        self.release_growth_allowance(allowance, actual);
+        true
+    }
+
+    /// Allocation前にresult poolの残量を一時leaseし、Vec/String allocatorのcapacity丸めも覆う。
+    ///
+    /// `minimum`の2倍などcallerが定めたconservative boundが残量へ収まらない場合はallocationを開始
+    /// しない。Allocation後は実capacity deltaだけを残し、未使用allowanceを返す。
+    fn precharge_growth(&mut self, minimum: usize) -> Option<usize> {
+        let remaining = self.budget.checked_sub(self.lease.bytes())?;
+        if minimum > remaining || self.lease.reserve(remaining).is_err() {
+            self.set.truncated = true;
+            return None;
+        }
+        Some(remaining)
+    }
+
+    fn release_growth_allowance(&mut self, allowance: usize, used: usize) {
+        if used > allowance {
+            self.set.truncated = true;
+            return;
+        }
+        let _ = self.lease.release(allowance - used);
+    }
+
+    fn line_mut(&mut self, line_id: LineId) -> &mut LineDecoration {
+        let index = match self
+            .set
+            .lines
+            .binary_search_by_key(&line_id, |entry| entry.line_id)
+        {
+            Ok(index) => index,
+            Err(index) => {
+                self.set.lines.insert(
+                    index,
+                    DecorationEntry {
+                        line_id,
+                        decoration: LineDecoration::default(),
+                    },
+                );
+                index
+            }
+        };
+        &mut self.set.lines[index].decoration
+    }
+
+    fn record_syntax_error(&mut self, error: &HighlightError) {
+        let _ = error;
+        self.syntax_failed = true;
+    }
+
+    fn finish(mut self) -> BudgetedDecorationSet {
+        let has_warning = self.set.truncated
+            || self.syntax_failed
+            || self.syntax_omitted
+            || self.intraline_skipped_blocks > 0;
+        if has_warning && let Some(allowance) = self.precharge_growth(2 * 1024) {
+            let mut warning = String::new();
+            if warning.try_reserve_exact(1024).is_ok() {
+                let mut separator = "";
+                if self.set.truncated {
+                    warning.push_str("decoration budget exceeded; later spans were omitted");
+                    separator = "; ";
+                }
+                if self.syntax_failed {
+                    warning.push_str(separator);
+                    warning.push_str("syntax highlighting failed");
+                    separator = "; ";
+                }
+                if self.syntax_omitted {
+                    warning.push_str(separator);
+                    warning.push_str("syntax omitted for some lines");
+                    separator = "; ";
+                }
+                if self.intraline_skipped_blocks > 0 {
+                    warning.push_str(separator);
+                    let noun = if self.intraline_skipped_blocks == 1 {
+                        "block"
+                    } else {
+                        "blocks"
+                    };
+                    let _ = write!(
+                        warning,
+                        "intraline omitted for {} {noun}",
+                        self.intraline_skipped_blocks,
+                    );
+                }
+                let used = warning.capacity();
+                self.release_growth_allowance(allowance, used);
+                self.set.warning = Some(warning);
+            } else {
+                self.release_growth_allowance(allowance, 0);
+            }
+        }
+        if has_warning && self.set.warning.is_none() {
+            self.set.warning_fallback = Some(if self.set.truncated {
+                "decoration budget exceeded; later spans were omitted"
+            } else {
+                "syntax or intraline decoration was skipped"
+            });
+        }
+        self.set.approximate_bytes = self.lease.bytes();
+        BudgetedDecorationSet {
+            set: self.set,
+            lease: self.lease,
+        }
     }
 }
 
@@ -574,13 +1676,23 @@ fn shift_range(range: Range<usize>, line_len: usize) -> Option<Range<usize>> {
     (start <= end && end <= line_len).then_some(start..end)
 }
 
+fn shift_ranges_in_place(ranges: &mut Vec<Range<usize>>, line_len: usize) {
+    ranges.retain_mut(|range| match shift_range(range.clone(), line_len) {
+        Some(shifted) => {
+            *range = shifted;
+            true
+        }
+        None => false,
+    });
+}
+
 /// Background request。`generation`はcallerのdocument/whitespace世代をそのままresponseへ返す。
 #[derive(Clone, Debug)]
 pub struct DecorationRequest {
     /// Callerがdocument/whitespace世代として割り当て、response照合に使うID。
     pub generation: u64,
     /// Worker taskの間だけ保持するimmutable document snapshot。
-    pub document: Arc<Document>,
+    pub document: Arc<DocumentSnapshot>,
     /// Built-in palette選択と出力時のcolor capability。
     pub theme: Theme,
     /// このsnapshotのintraline比較mode。
@@ -590,23 +1702,25 @@ pub struct DecorationRequest {
 }
 
 /// Latest requestに対応するbackground result。
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DecorationResponse {
     /// 対応requestから複写したcaller generation。
     pub generation: u64,
     /// `false`はpriority hunkだけのpartial set、`true`はfull-document計算の完了を表す。
     pub complete: bool,
-    /// Task panicだけが`Err`。個別syntax/cap failureはsetのwarningへ格納する。
-    pub result: Result<DecorationSet, DecorationWorkerError>,
+    /// Task panicまたはsnapshot read failureが`Err`。個別syntax/cap failureはsetのwarningへ格納する。
+    pub result: Result<BudgetedDecorationSet, DecorationWorkerError>,
 }
 
-/// Decoration workerの起動またはtask panic。
+/// Decoration workerの起動、snapshot read、task panicのfailure。
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum DecorationWorkerError {
     #[error("decoration worker could not start: {0}")]
     WorkerSpawn(String),
     #[error("decoration worker panicked")]
     WorkerPanicked,
+    #[error("decoration worker could not read its document snapshot: {0}")]
+    Document(String),
 }
 
 #[derive(Clone, Debug)]
@@ -628,7 +1742,7 @@ pub struct DecorationWorker {
 
 impl DecorationWorker {
     /// Capacity 1のrequestとcapacity 2のresponse channelを持つworker threadを開始する。
-    pub fn spawn() -> Result<Self, DecorationWorkerError> {
+    pub fn spawn(ledger: Arc<DerivedMemoryLedger>) -> Result<Self, DecorationWorkerError> {
         let (requests, worker_requests) = bounded::<QueuedRequest>(1);
         let pending = worker_requests.clone();
         let (response_sender, responses) = bounded::<DecorationResponse>(2);
@@ -646,6 +1760,7 @@ impl DecorationWorker {
                     response_eviction,
                     &worker_latest,
                     &worker_gate,
+                    &ledger,
                 );
             })
             .map_err(|error| DecorationWorkerError::WorkerSpawn(error.to_string()))?;
@@ -706,6 +1821,7 @@ fn decoration_worker_loop(
     response_eviction: Receiver<DecorationResponse>,
     latest_sequence: &AtomicU64,
     submission_gate: &Mutex<()>,
+    ledger: &DerivedMemoryLedger,
 ) {
     // SyntaxSet/ThemeSetのloadはworker lifetimeで1回にする。Streaming snapshotやW toggleごとに
     // grammar bundleを再構築すると、latest requestが古いsetup待ちになる。
@@ -745,17 +1861,20 @@ fn decoration_worker_loop(
                     theme: &queued.request.theme,
                     whitespace: queued.request.whitespace,
                     syntax,
+                    ledger,
                     cancelled: &cancelled,
                 };
                 let scope = DecorationScope {
-                    budget: DERIVED_RESULT_BUDGET_BYTES,
+                    budget: DERIVED_PRIORITY_RESULT_BUDGET_BYTES,
+                    pool: DerivedMemoryPool::PriorityDecoration,
                     priority_hunk: Some(priority_hunk),
                     only_priority: true,
+                    line_range: None,
                 };
                 DecorationSet::compute_internal(context, scope)
             }));
             match partial {
-                Ok(Some(result)) if !result.is_empty() => {
+                Ok(Ok(Some(result))) if !result.is_empty() => {
                     let _gate = lock_unpoisoned(submission_gate);
                     if latest_sequence.load(Ordering::Acquire) != queued.sequence {
                         continue;
@@ -770,8 +1889,23 @@ fn decoration_worker_loop(
                         },
                     );
                 }
-                Ok(Some(_)) => {}
-                Ok(None) => continue,
+                Ok(Ok(Some(_))) => {}
+                Ok(Ok(None)) => continue,
+                Ok(Err(error)) => {
+                    let _gate = lock_unpoisoned(submission_gate);
+                    if latest_sequence.load(Ordering::Acquire) == queued.sequence {
+                        send_latest_response(
+                            &responses,
+                            &response_eviction,
+                            DecorationResponse {
+                                generation,
+                                complete: true,
+                                result: Err(DecorationWorkerError::Document(error.to_string())),
+                            },
+                        );
+                    }
+                    continue;
+                }
                 Err(_) => {
                     let _gate = lock_unpoisoned(submission_gate);
                     if latest_sequence.load(Ordering::Acquire) == queued.sequence {
@@ -795,19 +1929,25 @@ fn decoration_worker_loop(
                 theme: &queued.request.theme,
                 whitespace: queued.request.whitespace,
                 syntax,
+                ledger,
                 cancelled: &cancelled,
             };
             let scope = DecorationScope {
                 budget: DERIVED_RESULT_BUDGET_BYTES,
-                priority_hunk: queued.request.priority_hunk,
+                pool: DerivedMemoryPool::NextDecoration,
+                // Priority hunkは8 MiB partialで既に返している。Full builderはdocument順へ戻し、flat
+                // entry Vecをappend中心に構築して先頭側への反復insertを避ける。
+                priority_hunk: None,
                 only_priority: false,
+                line_range: None,
             };
             DecorationSet::compute_internal(context, scope)
         }))
         .map_err(|_| DecorationWorkerError::WorkerPanicked);
         let result = match outcome {
-            Ok(Some(result)) => Ok(result),
-            Ok(None) => continue,
+            Ok(Ok(Some(result))) => Ok(result),
+            Ok(Ok(None)) => continue,
+            Ok(Err(error)) => Err(DecorationWorkerError::Document(error.to_string())),
             Err(error) => Err(error),
         };
         let _gate = lock_unpoisoned(submission_gate);
@@ -854,15 +1994,96 @@ fn send_latest_response(
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
     use std::time::{Duration, Instant};
 
     use super::*;
     use crate::cli::ThemeChoice;
-    use crate::parser::parse_bytes;
+    use crate::document::DocumentLineReader;
+    use crate::document_store::CHUNKED_LINE_RAW_BYTES;
+    use crate::parser::parse_bytes as parse_snapshot;
     use crate::theme::ColorLevel;
+
+    fn parse_bytes(input: &[u8]) -> DocumentSnapshot {
+        parse_snapshot(input).unwrap()
+    }
+
+    fn read_lines(document: &DocumentSnapshot) -> Vec<OwnedDocumentLine> {
+        let mut reader = DocumentLineReader::new();
+        (0..document.line_count())
+            .map(|index| {
+                let line_id = document.line_id_at(index).unwrap();
+                reader.read_owned(document, line_id).unwrap().unwrap()
+            })
+            .collect()
+    }
+
+    fn line_with_kind(document: &DocumentSnapshot, kind: LineKind) -> OwnedDocumentLine {
+        read_lines(document)
+            .into_iter()
+            .find(|line| line.kind == kind)
+            .unwrap()
+    }
+
+    fn metadata_with_kind(document: &DocumentSnapshot, kind: LineKind) -> DocumentLineMetadata {
+        let mut reader = DocumentLineMetadataReader::new();
+        (0..document.line_count())
+            .filter_map(|index| {
+                let line_id = document.line_id_at(index)?;
+                reader.read(document, line_id).ok().flatten()
+            })
+            .find(|metadata| metadata.kind == kind)
+            .unwrap()
+    }
+
+    fn push_hidden_osc_source_line(
+        input: &mut Vec<u8>,
+        marker: u8,
+        payload_len: usize,
+        content: &[u8],
+    ) {
+        input.push(marker);
+        input.extend_from_slice(b"\x1b]title;");
+        input.extend(std::iter::repeat_n(b'x', payload_len));
+        input.push(b'\x07');
+        input.extend_from_slice(content);
+        input.push(b'\n');
+    }
+
+    fn block_metadata(id: usize, kind: LineKind, display_len: u32) -> DocumentLineMetadata {
+        DocumentLineMetadata {
+            id: LineId::new(id as u64),
+            kind,
+            commit_id: None,
+            file_id: None,
+            hunk_id: None,
+            old_line_number: None,
+            new_line_number: None,
+            terminated: true,
+            raw_len: u64::from(display_len),
+            display_len: LineDisplayLength::Exact(display_len),
+        }
+    }
 
     fn theme() -> Theme {
         Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor)
+    }
+
+    fn budgeted_set(
+        ledger: &DerivedMemoryLedger,
+        pool: DerivedMemoryPool,
+        bytes: usize,
+        line_id: u64,
+    ) -> BudgetedDecorationSet {
+        // Test fixtureもpayload allocation前にleaseし、wrapperと同じdrop順を通す。
+        let lease = ledger.reserve(pool, bytes).unwrap();
+        let mut set = DecorationSet::default();
+        set.lines.push(DecorationEntry {
+            line_id: LineId::new(line_id),
+            decoration: LineDecoration::default(),
+        });
+        set.approximate_bytes = bytes;
+        BudgetedDecorationSet { set, lease }
     }
 
     #[test]
@@ -870,17 +2091,10 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/src/lib.rs b/src/lib.py\nsimilarity index 80%\nrename from src/lib.rs\nrename to src/lib.py\n--- a/src/lib.rs\n+++ b/src/lib.py\n@@ -1 +1 @@\n-fn old() {}\n+def new():\n",
         );
-        let decorations = DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore);
-        let deletion = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Deletion)
-            .unwrap();
-        let addition = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Addition)
-            .unwrap();
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+        let deletion = line_with_kind(&document, LineKind::Deletion);
+        let addition = line_with_kind(&document, LineKind::Addition);
         assert!(!decorations.line(deletion.id).unwrap().syntax.is_empty());
         assert!(!decorations.line(addition.id).unwrap().syntax.is_empty());
 
@@ -924,12 +2138,9 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/src/notes.rs b/src/notes.md\nsimilarity index 100%\nrename from src/notes.rs\nrename to src/notes.md\n--- a/src/notes.rs\n+++ b/src/notes.md\n@@ -1 +1 @@\n # heading\n",
         );
-        let context = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Context)
-            .unwrap();
-        let decorations = DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore);
+        let context = line_with_kind(&document, LineKind::Context);
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
 
         let engine = SyntaxEngine::new().unwrap();
         let expected = engine
@@ -955,13 +2166,10 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/src/old.rs b/src/old.rs\ndeleted file mode 100644\n--- a/src/old.rs\n+++ /dev/null\n@@ -1,2 +1 @@\n-/*\n let value = 1;\n",
         );
-        let context = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Context)
-            .unwrap();
+        let context = line_with_kind(&document, LineKind::Context);
         assert_eq!(document.files()[0].status, ChangeStatus::Deleted);
-        let decorations = DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore);
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
 
         let engine = SyntaxEngine::new().unwrap();
         let mut old = engine
@@ -987,12 +2195,9 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+/*\n@@ -10 +10 @@\n let value = 1;\n",
         );
-        let context = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Context)
-            .unwrap();
-        let decorations = DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore);
+        let context = line_with_kind(&document, LineKind::Context);
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
 
         let engine = SyntaxEngine::new().unwrap();
         let expected = engine
@@ -1018,23 +2223,131 @@ mod tests {
     }
 
     #[test]
+    fn raw_huge_display_short_source_lines_keep_syntax_and_intraline() {
+        let mut input = b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n".to_vec();
+        let payload_len = MAX_SYNTAX_LINE_BYTES + CHUNKED_LINE_RAW_BYTES;
+        push_hidden_osc_source_line(&mut input, b'-', payload_len, b"let old = 1;");
+        push_hidden_osc_source_line(&mut input, b'+', payload_len, b"let new = 2;");
+        let document = parse_bytes(&input);
+        let deletion = metadata_with_kind(&document, LineKind::Deletion);
+        let addition = metadata_with_kind(&document, LineKind::Addition);
+        assert!(deletion.raw_len > MAX_SYNTAX_DISPLAY_BYTES as u64);
+        assert_eq!(deletion.display_len.exact(), Some("-let old = 1;".len()));
+
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Show).unwrap();
+        for metadata in [deletion, addition] {
+            let line = decorations.line(metadata.id).unwrap();
+            assert!(!line.syntax.is_empty());
+            assert!(!line.intraline.is_empty());
+        }
+        assert!(decorations.warning().is_none());
+    }
+
+    #[test]
+    fn syntax_streaming_decode_observes_cancellation_between_raw_chunks() {
+        let mut input = b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n".to_vec();
+        let payload_len = MAX_SYNTAX_LINE_BYTES + 8 * CHUNKED_LINE_RAW_BYTES;
+        push_hidden_osc_source_line(&mut input, b'-', payload_len, b"let old = 1;");
+        input.extend_from_slice(b"+let new = 2;\n");
+        let document = parse_bytes(&input);
+        let deletion = metadata_with_kind(&document, LineKind::Deletion);
+        let engine = SyntaxEngine::new().unwrap();
+        let theme = theme();
+        let checks = Cell::new(0_usize);
+        let cancelled = || {
+            let current = checks.get();
+            checks.set(current + 1);
+            current >= 5
+        };
+        let ledger = DerivedMemoryLedger::new();
+        let context = DecorationContext {
+            document: &document,
+            theme: &theme,
+            whitespace: WhitespaceChoice::Ignore,
+            syntax: SyntaxAvailability::Ready(&engine),
+            ledger: &ledger,
+            cancelled: &cancelled,
+        };
+        let mut builder = DecorationBuilder::new(
+            document.identity(),
+            WhitespaceChoice::Ignore,
+            &ledger,
+            DerivedMemoryPool::NextDecoration,
+            DERIVED_RESULT_BUDGET_BYTES,
+        )
+        .unwrap();
+        let mut readers = DecorationReaders::new(&ledger).unwrap();
+
+        assert!(
+            !decorate_syntax_hunk(
+                &mut builder,
+                &engine,
+                &document.files()[0],
+                &document.hunks()[0],
+                &context,
+                &mut readers,
+            )
+            .unwrap()
+        );
+        let raw_bytes_read = readers.text.large_line_stats().raw_bytes_read;
+        assert!(raw_bytes_read > 0);
+        assert!(raw_bytes_read <= (3 * CHUNKED_LINE_RAW_BYTES) as u64);
+        assert!(raw_bytes_read < deletion.raw_len);
+    }
+
+    #[test]
+    fn oversized_deletion_resets_only_the_old_syntax_side() {
+        let mut input =
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1,2 +1,2 @@\n+/*\n-".to_vec();
+        input.extend(std::iter::repeat_n(b'x', MAX_SYNTAX_LINE_BYTES + 1));
+        input.extend_from_slice(b"\n let value = 1;\n");
+        let document = parse_bytes(&input);
+        let context_line = metadata_with_kind(&document, LineKind::Context);
+
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+        assert!(
+            decorations
+                .warning()
+                .unwrap()
+                .contains("syntax omitted for some lines")
+        );
+
+        let engine = SyntaxEngine::new().unwrap();
+        let mut new = engine
+            .session(Some("a.rs"), Some("/*"), ThemeChoice::Dark)
+            .unwrap()
+            .unwrap();
+        let _ = new.highlight_line("/*").unwrap();
+        let HighlightedLine::Styled(expected) = new.highlight_line("let value = 1;").unwrap()
+        else {
+            panic!("expected new-side syntax");
+        };
+        assert_eq!(
+            decorations.line(context_line.id).unwrap().syntax,
+            expected
+                .into_iter()
+                .filter_map(|span| shift_syntax_span(span, " let value = 1;".len()))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn intraline_ignore_and_show_keep_full_line_offsets() {
         let document = parse_bytes(
             b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-foo\tbar\n+foo   bar\n",
         );
-        let deletion = document
-            .lines()
-            .iter()
-            .find(|line| line.kind == LineKind::Deletion)
-            .unwrap();
-        let ignored = DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore);
+        let deletion = line_with_kind(&document, LineKind::Deletion);
+        let ignored =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
         assert!(
             ignored
                 .line(deletion.id)
                 .is_none_or(|line| line.intraline.is_empty())
         );
 
-        let shown = DecorationSet::compute(&document, &theme(), WhitespaceChoice::Show);
+        let shown = DecorationSet::compute(&document, &theme(), WhitespaceChoice::Show).unwrap();
         let ranges = &shown.line(deletion.id).unwrap().intraline;
         assert!(
             ranges
@@ -1049,10 +2362,76 @@ mod tests {
         let document = parse_bytes(
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let old = 1;\n+let new = 2;\n",
         );
-        let result =
-            DecorationSet::compute_with_budget(&document, &theme(), WhitespaceChoice::Show, 1);
+        let result = DecorationSet::compute_with_budget(
+            &document,
+            &theme(),
+            WhitespaceChoice::Show,
+            1,
+            None,
+        )
+        .unwrap();
         assert!(result.is_truncated());
         assert!(result.warning().unwrap().contains("budget"));
+    }
+
+    #[test]
+    fn range_compute_does_not_decorate_previously_emitted_files() {
+        let document = parse_bytes(
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;\ndiff --git a/b.rs b/b.rs\n--- a/b.rs\n+++ b/b.rs\n@@ -1 +1 @@\n-let b = 1;\n+let b = 2;\n",
+        );
+        let first = &document.files()[0];
+        let first_range = usize::try_from(first.span.start.get()).unwrap()
+            ..usize::try_from(first.span.end_exclusive.unwrap()).unwrap();
+        let result = DecorationSet::compute_range(
+            &document,
+            &theme(),
+            WhitespaceChoice::Ignore,
+            first_range,
+        )
+        .unwrap();
+        let lines = read_lines(&document);
+        let first_source = lines
+            .iter()
+            .find(|line| line.file_id == Some(first.id) && line.kind == LineKind::Addition)
+            .unwrap();
+        let second = &document.files()[1];
+        let second_source = lines
+            .iter()
+            .find(|line| line.file_id == Some(second.id) && line.kind == LineKind::Addition)
+            .unwrap();
+
+        assert!(result.line(first_source.id).is_some());
+        assert!(result.line(second_source.id).is_none());
+    }
+
+    #[test]
+    fn range_computer_loads_syntax_bundle_once_and_skips_plain_segments() {
+        let computer = DecorationComputer::new();
+        let plain = parse_bytes(b"metadata only\n");
+        computer
+            .compute_range(
+                &plain,
+                &theme(),
+                WhitespaceChoice::Ignore,
+                0..plain.line_count(),
+            )
+            .unwrap();
+        assert!(computer.engine.get().is_none());
+
+        let rich = parse_bytes(
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let a = 1;\n+let a = 2;\n",
+        );
+        for _ in 0..2 {
+            computer
+                .compute_range(
+                    &rich,
+                    &theme(),
+                    WhitespaceChoice::Ignore,
+                    0..rich.line_count(),
+                )
+                .unwrap();
+        }
+        assert!(computer.engine.get().is_some());
     }
 
     #[test]
@@ -1066,17 +2445,20 @@ mod tests {
             &colorless,
             WhitespaceChoice::Show,
             usize::MAX,
-        );
+            None,
+        )
+        .unwrap();
         let constrained = DecorationSet::compute_with_budget(
             &document,
             &colorless,
             WhitespaceChoice::Show,
             complete.approximate_bytes().saturating_sub(1),
-        );
+            None,
+        )
+        .unwrap();
         assert!(constrained.is_truncated());
-        for line in document
-            .lines()
-            .iter()
+        for line in read_lines(&document)
+            .into_iter()
             .filter(|line| matches!(line.kind, LineKind::Deletion | LineKind::Addition))
         {
             assert!(
@@ -1093,8 +2475,11 @@ mod tests {
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let old = 1;\n+let new = 2;\n",
         );
         let colorless = Theme::new(ThemeChoice::Dark, ColorLevel::None);
-        let result = DecorationSet::compute(&document, &colorless, WhitespaceChoice::Show);
-        for line in document.lines().iter().filter(|line| is_source(line.kind)) {
+        let result = DecorationSet::compute(&document, &colorless, WhitespaceChoice::Show).unwrap();
+        for line in read_lines(&document)
+            .into_iter()
+            .filter(|line| is_source(line.kind))
+        {
             let decoration = result.line(line.id).unwrap();
             assert!(decoration.syntax.is_empty());
             assert!(!decoration.intraline.is_empty());
@@ -1102,8 +2487,33 @@ mod tests {
     }
 
     #[test]
+    fn intraline_block_releases_ids_when_line_cap_is_exceeded() {
+        let ledger = DerivedMemoryLedger::new();
+        let mut block = IntralineBlockIds::new(&ledger);
+        for id in 0..=MAX_CHANGED_LINES {
+            block.push_removed(block_metadata(id, LineKind::Deletion, 2));
+        }
+
+        assert!(block.rejected);
+        assert!(block.removed.is_empty());
+        assert!(block.added.is_empty());
+    }
+
+    #[test]
+    fn intraline_block_rejects_byte_cap_before_owning_text() {
+        let ledger = DerivedMemoryLedger::new();
+        let mut block = IntralineBlockIds::new(&ledger);
+        let display_len = u32::try_from(MAX_BLOCK_BYTES + 2).unwrap();
+        block.push_added(block_metadata(0, LineKind::Addition, display_len));
+
+        assert!(block.rejected);
+        assert!(block.removed.is_empty());
+        assert!(block.added.is_empty());
+    }
+
+    #[test]
     fn worker_replaces_queued_stale_response() {
-        let worker = DecorationWorker::spawn().unwrap();
+        let worker = DecorationWorker::spawn(Arc::new(DerivedMemoryLedger::new())).unwrap();
         let document = Arc::new(parse_bytes(b"plain\n"));
         worker
             .submit_latest(DecorationRequest {
@@ -1143,7 +2553,7 @@ mod tests {
 
     #[test]
     fn worker_publishes_only_the_latest_back_to_back_request() {
-        let worker = DecorationWorker::spawn().unwrap();
+        let worker = DecorationWorker::spawn(Arc::new(DerivedMemoryLedger::new())).unwrap();
         let document = Arc::new(parse_bytes(b"plain\n"));
         worker
             .submit_latest(DecorationRequest {
@@ -1188,21 +2598,26 @@ mod tests {
             current >= 8
         };
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let ledger = DerivedMemoryLedger::new();
         let context = DecorationContext {
             document: &document,
             theme: &theme,
             whitespace: WhitespaceChoice::Ignore,
             syntax: SyntaxAvailability::Disabled,
+            ledger: &ledger,
             cancelled: &cancelled,
         };
         let scope = DecorationScope {
             budget: DERIVED_RESULT_BUDGET_BYTES,
+            pool: DerivedMemoryPool::NextDecoration,
             priority_hunk: None,
             only_priority: false,
+            line_range: None,
         };
         let result = DecorationSet::compute_internal(context, scope);
-        assert!(result.is_none());
+        assert!(result.unwrap().is_none());
         assert!(checks.get() < 50);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
     }
 
     #[test]
@@ -1211,19 +2626,19 @@ mod tests {
             b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let first = 1;\n+let first = 2;\n@@ -10 +10 @@\n-let second = 1;\n+let second = 2;\n",
         ));
         let priority = document.hunks()[1].id;
-        let first_line = document
-            .lines()
+        let lines = read_lines(&document);
+        let first_line = lines
             .iter()
             .find(|line| line.hunk_id == Some(document.hunks()[0].id) && is_source(line.kind))
             .unwrap()
             .id;
-        let priority_line = document
-            .lines()
+        let priority_line = lines
             .iter()
             .find(|line| line.hunk_id == Some(priority) && is_source(line.kind))
             .unwrap()
             .id;
-        let worker = DecorationWorker::spawn().unwrap();
+        let ledger = Arc::new(DerivedMemoryLedger::new());
+        let worker = DecorationWorker::spawn(Arc::clone(&ledger)).unwrap();
         worker
             .submit_latest(DecorationRequest {
                 generation: 20,
@@ -1234,6 +2649,21 @@ mod tests {
             })
             .unwrap();
 
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while worker.responses.len() < 2 && Instant::now() < deadline {
+            thread::yield_now();
+        }
+        assert_eq!(worker.responses.len(), 2);
+        let coexistence = ledger.snapshot();
+        assert!(
+            coexistence.reserved_bytes(DerivedMemoryPool::PriorityDecoration) > 0,
+            "priority response must own its dedicated pool while queued"
+        );
+        assert!(
+            coexistence.reserved_bytes(DerivedMemoryPool::NextDecoration) > 0,
+            "full response must own Next while the priority response is still queued"
+        );
+
         let partial = worker
             .responses
             .recv_timeout(Duration::from_secs(5))
@@ -1242,6 +2672,19 @@ mod tests {
         let partial = partial.result.unwrap();
         assert!(partial.line(priority_line).is_some());
         assert!(partial.line(first_line).is_none());
+        drop(partial);
+        assert_eq!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::PriorityDecoration),
+            0
+        );
+        assert!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::NextDecoration)
+                > 0
+        );
 
         let complete = worker
             .responses
@@ -1251,5 +2694,311 @@ mod tests {
         let complete = complete.result.unwrap();
         assert!(complete.line(priority_line).is_some());
         assert!(complete.line(first_line).is_some());
+        drop(complete);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn applied_replacement_reclassifies_priority_and_next_without_overlap() {
+        let ledger = DerivedMemoryLedger::new();
+        let mut applied = AppliedDecorationSet::empty(&ledger).unwrap();
+
+        applied
+            .replace(
+                budgeted_set(&ledger, DerivedMemoryPool::PriorityDecoration, 4096, 10),
+                &ledger,
+            )
+            .unwrap();
+        let priority_applied = ledger.snapshot();
+        assert_eq!(
+            priority_applied.reserved_bytes(DerivedMemoryPool::AppliedDecoration),
+            4096
+        );
+        assert_eq!(
+            priority_applied.reserved_bytes(DerivedMemoryPool::PriorityDecoration),
+            0
+        );
+        assert!(applied.line(LineId::new(10)).is_some());
+
+        applied
+            .replace(
+                budgeted_set(&ledger, DerivedMemoryPool::NextDecoration, 6144, 20),
+                &ledger,
+            )
+            .unwrap();
+        let next_applied = ledger.snapshot();
+        assert_eq!(
+            next_applied.reserved_bytes(DerivedMemoryPool::AppliedDecoration),
+            6144
+        );
+        assert_eq!(
+            next_applied.reserved_bytes(DerivedMemoryPool::NextDecoration),
+            0
+        );
+        assert!(applied.line(LineId::new(10)).is_none());
+        assert!(applied.line(LineId::new(20)).is_some());
+
+        drop(applied);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn applied_replacement_restores_payload_after_foreign_or_invalid_lease() {
+        let ledger = DerivedMemoryLedger::new();
+        let foreign = DerivedMemoryLedger::new();
+        let mut applied = AppliedDecorationSet::empty(&ledger).unwrap();
+        applied
+            .replace(
+                budgeted_set(&ledger, DerivedMemoryPool::NextDecoration, 4096, 10),
+                &ledger,
+            )
+            .unwrap();
+
+        assert_eq!(
+            applied.replace(
+                budgeted_set(&foreign, DerivedMemoryPool::NextDecoration, 2048, 20,),
+                &ledger,
+            ),
+            Err(DerivedMemoryError::ForeignLease)
+        );
+        assert!(applied.line(LineId::new(10)).is_some());
+        assert!(applied.line(LineId::new(20)).is_none());
+        assert_eq!(foreign.snapshot().total_reserved_bytes(), Some(0));
+
+        assert_eq!(
+            applied.replace(
+                budgeted_set(&ledger, DerivedMemoryPool::AppliedDecoration, 2048, 30,),
+                &ledger,
+            ),
+            Err(DerivedMemoryError::InvalidAppliedReplacement {
+                current: DerivedMemoryPool::AppliedDecoration,
+                replacement: DerivedMemoryPool::AppliedDecoration,
+            })
+        );
+        assert!(applied.line(LineId::new(10)).is_some());
+        assert!(applied.line(LineId::new(30)).is_none());
+        assert_eq!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::AppliedDecoration),
+            4096
+        );
+
+        drop(applied);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn stale_response_eviction_releases_the_replaced_result_lease() {
+        let ledger = DerivedMemoryLedger::new();
+        let (sender, responses) = bounded::<DecorationResponse>(1);
+        let eviction = responses.clone();
+        send_latest_response(
+            &sender,
+            &eviction,
+            DecorationResponse {
+                generation: 1,
+                complete: true,
+                result: Ok(budgeted_set(
+                    &ledger,
+                    DerivedMemoryPool::NextDecoration,
+                    4096,
+                    10,
+                )),
+            },
+        );
+        assert_eq!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::NextDecoration),
+            4096
+        );
+
+        send_latest_response(
+            &sender,
+            &eviction,
+            DecorationResponse {
+                generation: 2,
+                complete: true,
+                result: Ok(budgeted_set(
+                    &ledger,
+                    DerivedMemoryPool::NextDecoration,
+                    6144,
+                    20,
+                )),
+            },
+        );
+        assert_eq!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::NextDecoration),
+            6144
+        );
+        assert_eq!(responses.recv().unwrap().generation, 2);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn budgeted_result_unwind_releases_its_pool() {
+        let ledger = DerivedMemoryLedger::new();
+        let outcome = catch_unwind(AssertUnwindSafe(|| {
+            let _result = budgeted_set(&ledger, DerivedMemoryPool::NextDecoration, 4096, 10);
+            panic!("synthetic decoration task panic");
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn tiny_result_budget_allocates_no_entry_and_keeps_static_warning() {
+        let document = parse_bytes(b"plain\n");
+        let ledger = DerivedMemoryLedger::new();
+        let budget = 2 * size_of::<DecorationEntry>() - 1;
+        let mut builder = DecorationBuilder::new(
+            document.identity(),
+            WhitespaceChoice::Ignore,
+            &ledger,
+            DerivedMemoryPool::NextDecoration,
+            budget,
+        )
+        .unwrap();
+
+        assert!(!builder.ensure_line_capacity(LineId::new(1)));
+        assert_eq!(builder.set.lines.capacity(), 0);
+        let result = builder.finish();
+        assert_eq!(result.leased_bytes(), 0);
+        assert!(result.is_truncated());
+        assert!(result.warning().unwrap().contains("budget exceeded"));
+        drop(result);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn reader_workspace_keeps_separate_eager_and_streaming_high_water_marks() {
+        let ledger = DerivedMemoryLedger::new();
+        let mut readers = DecorationReaders::new(&ledger).unwrap();
+        let eager = block_metadata(1, LineKind::Context, 32);
+        assert!(readers.reserve_text_read(eager));
+        let eager_bytes = readers.eager_accounted;
+
+        let mut rejected = block_metadata(
+            99,
+            LineKind::Deletion,
+            u32::try_from(48 * 1024 * 1024).unwrap(),
+        );
+        rejected.raw_len = u64::try_from(MAX_EAGER_TEXT_RAW_BYTES).unwrap() + 1;
+        assert!(!readers.reserve_text_read(rejected));
+        assert_eq!(readers.eager_accounted, eager_bytes);
+        assert_eq!(readers.streaming_accounted, 0);
+        assert_eq!(readers.text_lease.bytes(), eager_bytes);
+
+        let mut streaming = block_metadata(2, LineKind::Context, 64);
+        streaming.raw_len = u64::try_from(MAX_EAGER_TEXT_RAW_BYTES).unwrap() + 1;
+        assert!(readers.reserve_text_read(streaming));
+        let streaming_bytes = readers.streaming_accounted;
+        assert_eq!(readers.text_lease.bytes(), eager_bytes + streaming_bytes);
+
+        assert!(readers.reserve_text_read(block_metadata(3, LineKind::Context, 1)));
+        assert_eq!(readers.eager_accounted, eager_bytes);
+        assert_eq!(readers.streaming_accounted, streaming_bytes);
+        assert_eq!(readers.text_lease.bytes(), eager_bytes + streaming_bytes);
+        drop(readers);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn failed_huge_hunk_reservation_does_not_poison_a_later_rust_hunk() {
+        let document = parse_bytes(
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let old = 1;\n+let new = 2;\n",
+        );
+        let theme = theme();
+        let engine = SyntaxEngine::new().unwrap();
+        let ledger = DerivedMemoryLedger::new();
+        let mut readers = DecorationReaders::new(&ledger).unwrap();
+
+        // 先行hunkのstreaming lineが48 MiBなら、完成textとdecoderの上限はWorkspace 96 MiBを
+        // 超える。このmetadataだけでallocation前の失敗を再現し、48 MiB payloadをtest内に作らない。
+        let mut huge = block_metadata(
+            100,
+            LineKind::Deletion,
+            u32::try_from(48 * 1024 * 1024).unwrap(),
+        );
+        huge.raw_len = u64::try_from(MAX_EAGER_TEXT_RAW_BYTES).unwrap() + 1;
+        assert!(!readers.reserve_text_read(huge));
+        assert_eq!(readers.eager_accounted, 0);
+        assert_eq!(readers.streaming_accounted, 0);
+        assert_eq!(readers.text_lease.bytes(), 0);
+
+        let cancelled = || false;
+        let context = DecorationContext {
+            document: &document,
+            theme: &theme,
+            whitespace: WhitespaceChoice::Ignore,
+            syntax: SyntaxAvailability::Ready(&engine),
+            ledger: &ledger,
+            cancelled: &cancelled,
+        };
+        let mut builder = DecorationBuilder::new(
+            document.identity(),
+            WhitespaceChoice::Ignore,
+            &ledger,
+            DerivedMemoryPool::NextDecoration,
+            DERIVED_RESULT_BUDGET_BYTES,
+        )
+        .unwrap();
+        assert!(
+            decorate_syntax_hunk(
+                &mut builder,
+                &engine,
+                &document.files()[0],
+                &document.hunks()[0],
+                &context,
+                &mut readers,
+            )
+            .unwrap()
+        );
+
+        let addition = metadata_with_kind(&document, LineKind::Addition);
+        let result = builder.finish();
+        assert!(!result.line(addition.id).unwrap().syntax.is_empty());
+        drop(result);
+        drop(readers);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn flat_result_entries_stay_sorted_and_within_the_result_lease() {
+        let document = parse_bytes(b"plain\n");
+        let ledger = DerivedMemoryLedger::new();
+        let budget = 16 * 1024;
+        let mut builder = DecorationBuilder::new(
+            document.identity(),
+            WhitespaceChoice::Ignore,
+            &ledger,
+            DerivedMemoryPool::NextDecoration,
+            budget,
+        )
+        .unwrap();
+        for raw_id in [9, 1, 5] {
+            let line_id = LineId::new(raw_id);
+            assert!(builder.ensure_line_capacity(line_id));
+            let _ = builder.line_mut(line_id);
+        }
+
+        let result = builder.finish();
+        assert!(
+            result
+                .set
+                .lines
+                .windows(2)
+                .all(|entries| entries[0].line_id < entries[1].line_id)
+        );
+        for raw_id in [1, 5, 9] {
+            assert!(result.line(LineId::new(raw_id)).is_some());
+        }
+        assert_eq!(result.approximate_bytes(), result.leased_bytes());
+        assert!(result.leased_bytes() <= budget);
+        drop(result);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
     }
 }

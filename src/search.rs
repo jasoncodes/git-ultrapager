@@ -2,7 +2,7 @@
 //!
 //! scanner は document model に依存せず、呼び出し側が stable line ID と text の snapshot を渡す。
 //! 結果の span は UTF-8 byte offset であり、renderer は同じ sanitized text に対してだけ適用する。
-//! 16 MiB を超える line は表示対象のまま検索から除外し、除外数を結果へ積算する。Scannerは
+//! 16 MiB を超える表示textは表示対象のまま検索から除外し、除外数を結果へ積算する。Scannerは
 //! `SearchSource`から1行ずつ読み、background workerの世代変更をline/match境界で検出した場合は
 //! 部分resultを破棄する。Source I/O failureはcancelと別のoutcomeとしてcallerへ返す。
 
@@ -81,6 +81,17 @@ pub struct SearchLine<'text, Id> {
     pub text: &'text str,
 }
 
+/// Search sourceが1 logical lineを読んだ結果。
+///
+/// `Oversized`はmetadataだけで判定したlineを表し、scannerはregexを実行せずskip数へ1回だけ加える。
+/// `Cancelled`はI/O failureではなく、世代変更によって途中のdecode結果を破棄した状態である。
+#[derive(Clone, Copy, Debug)]
+pub enum SearchLineRead<'text, Id> {
+    Searchable(SearchLine<'text, Id>),
+    Oversized { line_id: Id },
+    Cancelled,
+}
+
 impl<'text, Id> SearchLine<'text, Id> {
     #[must_use]
     pub const fn new(id: Id, text: &'text str) -> Self {
@@ -90,9 +101,9 @@ impl<'text, Id> SearchLine<'text, Id> {
 
 /// Search対象をlogical-line indexで読むためのaccessor。
 ///
-/// Scannerは全lineの参照配列を先に作らず、走査位置だけをこのtraitへ問い合わせる。`line`はmutable
-/// accessなので、disk-backed実装は1つのdecode bufferを次の呼び出しまで再利用できる。I/Oやdecode
-/// failureはassociated errorで返し、世代変更によるcooperative cancellationとは区別する。
+/// Scannerは全lineの参照配列を先に作らず、走査位置だけをこのtraitへ問い合わせる。`read_line`は
+/// mutable accessなので、disk-backed実装は1つのdecode bufferを次の呼び出しまで再利用できる。
+/// I/Oやdecode failureはassociated errorで返し、oversized/cancellationとは区別する。
 pub trait SearchSource<Id> {
     /// Lineの読み出しに失敗した理由。
     type Error;
@@ -100,8 +111,15 @@ pub trait SearchSource<Id> {
     /// 現在のimmutable snapshotに含まれるlogical-line数。
     fn line_count(&self) -> usize;
 
-    /// `index`のstable IDと本文を返す。本文のborrowは次のmutable accessより前に解放する。
-    fn line(&mut self, index: usize) -> Result<SearchLine<'_, Id>, Self::Error>;
+    /// `index`を検索可能text、oversized skip、cancellationのいずれかへ分類する。
+    ///
+    /// 本文のborrowは次のmutable accessより前に解放する。Disk-backed sourceはtext decodeより先に
+    /// metadata capを判定し、長いraw rangeのdecode中もpredicateへ定期的に制御を戻す。
+    fn read_line(
+        &mut self,
+        index: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SearchLineRead<'_, Id>, Self::Error>;
 
     /// Snapshotが空かを返す。
     fn is_empty(&self) -> bool {
@@ -123,11 +141,24 @@ impl<Id: Clone> SearchSource<Id> for SliceSearchSource<'_, '_, Id> {
         self.lines.len()
     }
 
-    fn line(&mut self, index: usize) -> Result<SearchLine<'_, Id>, Self::Error> {
-        self.lines
+    fn read_line(
+        &mut self,
+        index: usize,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<SearchLineRead<'_, Id>, Self::Error> {
+        if cancelled() {
+            return Ok(SearchLineRead::Cancelled);
+        }
+        let line = self
+            .lines
             .get(index)
             .map(|line| SearchLine::new(line.id.clone(), line.text))
-            .ok_or(SliceSearchSourceError)
+            .ok_or(SliceSearchSourceError)?;
+        if line.text.len() > MAX_SEARCH_LINE_BYTES {
+            Ok(SearchLineRead::Oversized { line_id: line.id })
+        } else {
+            Ok(SearchLineRead::Searchable(line))
+        }
     }
 }
 
@@ -323,13 +354,7 @@ fn scan_forward<Id: Clone, Source: SearchSource<Id> + ?Sized, Cancel: Fn() -> bo
         SearchAnchor::At {
             line_index,
             byte_offset,
-        } if line_index < line_count => {
-            let line = match source.line(line_index) {
-                Ok(line) => line,
-                Err(error) => return ScanOutcome::Failed(error),
-            };
-            (line_index, ceil_char_boundary(line.text, byte_offset))
-        }
+        } if line_index < line_count => (line_index, byte_offset),
         SearchAnchor::At { .. } | SearchAnchor::AfterDocument => {
             return ScanOutcome::Completed(exhausted_forward(line_count, count.get(), 0));
         }
@@ -341,17 +366,21 @@ fn scan_forward<Id: Clone, Source: SearchSource<Id> + ?Sized, Cancel: Fn() -> bo
         if cancelled() {
             return ScanOutcome::Cancelled;
         }
-        let line = match source.line(line_index) {
-            Ok(line) => line,
+        let read = match source.read_line(line_index, &cancelled) {
+            Ok(read) => read,
             Err(error) => return ScanOutcome::Failed(error),
         };
-        if line.text.len() > MAX_SEARCH_LINE_BYTES {
-            skipped = skipped.saturating_add(1);
-            continue;
-        }
+        let line = match read {
+            SearchLineRead::Searchable(line) if line.text.len() <= MAX_SEARCH_LINE_BYTES => line,
+            SearchLineRead::Searchable(_) | SearchLineRead::Oversized { .. } => {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            SearchLineRead::Cancelled => return ScanOutcome::Cancelled,
+        };
 
         let lower_bound = if line_index == start_line {
-            first_offset
+            ceil_char_boundary(line.text, first_offset)
         } else {
             0
         };
@@ -413,24 +442,11 @@ fn scan_backward<Id: Clone, Source: SearchSource<Id> + ?Sized, Cancel: Fn() -> b
     }
 
     let (start_line, first_offset) = match anchor {
-        SearchAnchor::AfterDocument => {
-            let index = line_count - 1;
-            let line = match source.line(index) {
-                Ok(line) => line,
-                Err(error) => return ScanOutcome::Failed(error),
-            };
-            (index, line.text.len())
-        }
+        SearchAnchor::AfterDocument => (line_count - 1, None),
         SearchAnchor::At {
             line_index,
             byte_offset,
-        } if line_index < line_count => {
-            let line = match source.line(line_index) {
-                Ok(line) => line,
-                Err(error) => return ScanOutcome::Failed(error),
-            };
-            (line_index, floor_char_boundary(line.text, byte_offset))
-        }
+        } if line_index < line_count => (line_index, Some(byte_offset)),
         SearchAnchor::At { .. } | SearchAnchor::BeforeDocument => {
             return ScanOutcome::Completed(exhausted_backward(count.get(), 0));
         }
@@ -442,17 +458,23 @@ fn scan_backward<Id: Clone, Source: SearchSource<Id> + ?Sized, Cancel: Fn() -> b
         if cancelled() {
             return ScanOutcome::Cancelled;
         }
-        let line = match source.line(line_index) {
-            Ok(line) => line,
+        let read = match source.read_line(line_index, &cancelled) {
+            Ok(read) => read,
             Err(error) => return ScanOutcome::Failed(error),
         };
-        if line.text.len() > MAX_SEARCH_LINE_BYTES {
-            skipped = skipped.saturating_add(1);
-            continue;
-        }
+        let line = match read {
+            SearchLineRead::Searchable(line) if line.text.len() <= MAX_SEARCH_LINE_BYTES => line,
+            SearchLineRead::Searchable(_) | SearchLineRead::Oversized { .. } => {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            SearchLineRead::Cancelled => return ScanOutcome::Cancelled,
+        };
 
         let upper_bound = if line_index == start_line {
-            first_offset
+            first_offset.map_or(line.text.len(), |offset| {
+                floor_char_boundary(line.text, offset)
+            })
         } else {
             line.text.len()
         };

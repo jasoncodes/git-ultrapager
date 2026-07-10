@@ -19,7 +19,7 @@ sticky file context, and fast file navigation.
 - Highlights intraline changes while ignoring whitespace differences by default.
 - Keeps the current file in a sticky header while scrolling.
 - Opens a filterable, commit-grouped changed-file list with `Tab`.
-- Searches the full Git output with smart-case regular expressions.
+- Searches Git logical lines up to 16 MiB with smart-case regular expressions.
 - Falls back to a safe plain pager for unsupported or malformed input.
 - Supports macOS and Linux terminals with UTF-8 output.
 
@@ -109,8 +109,10 @@ or `2}`.
 
 Search uses Rust regular-expression syntax. A lowercase-only pattern is
 case-insensitive; a pattern containing an uppercase character is case-sensitive.
-Search previews matches while typing and highlights all visible matches, with the
-current match shown distinctly.
+Search previews matches while typing and shows the current match distinctly.
+Weak highlights for other visible matches are bounded and may be omitted on dense
+lines or when raw or escaped display text exceeds the preload limit; navigation to
+the current match is unaffected.
 
 The file list preserves Git's output order. Press `/` inside the list to fuzzy
 filter displayed paths, use the navigation keys to select an entry, and press
@@ -121,7 +123,9 @@ filter displayed paths, use the navigation keys to select an entry, and press
 Interactive mode reserves one row for a sticky context header and one row for a
 status bar. Diff source lines have separate old/new line-number columns. Long
 lines hard-wrap at grapheme boundaries; continuation rows leave both number
-columns blank and align with the source text.
+columns blank and align with the source text. A single grapheme larger than 64 KiB
+is split at Unicode scalar boundaries so one crafted cluster cannot require an
+unbounded row buffer.
 
 Incoming ANSI, OSC, and DCS sequences are stripped before display. Invalid UTF-8
 and unsafe control bytes are shown as `\xNN` in interactive mode instead of being

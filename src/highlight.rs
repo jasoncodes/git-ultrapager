@@ -3,8 +3,11 @@
 //! `syntect::ParseState` / `HighlightState` は worker 間を移動させず、専用 actor thread が所有する。
 //! AppState へ返すのは thread-independent な byte span と RGB/style bit だけである。diff background、
 //! search、intraline の precedence は renderer が合成し、この module は source foreground だけを
-//! 提供する。
+//! 提供する。Built-in `SyntaxSet`/`ThemeSet`はworker lifetimeのimmutable program assetであり、256 MiB
+//! derived-data partitionには含めない。Requestごとのparse state、synthetic line、region/span Vecだけを
+//! `DecorationWorkspace`へ計上する。
 
+use std::mem::size_of;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
@@ -12,12 +15,15 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, ThemeSet};
+use syntect::highlighting::{FontStyle, Style, ThemeSet};
 use syntect::parsing::SyntaxSet;
 use thiserror::Error;
 
 use crate::cli::ThemeChoice;
+use crate::derived_memory::{DerivedMemoryLease, DerivedMemoryLedger, DerivedMemoryPool};
 use crate::text::MAX_SYNTAX_LINE_BYTES;
+
+const SYNTAX_STATE_BASE_BYTES: usize = 64 * 1024;
 
 /// Syntax style を renderer へ渡す immutable span。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,6 +41,29 @@ pub struct SyntaxSpan {
 pub enum HighlightedLine {
     Styled(Vec<SyntaxSpan>),
     Plain,
+}
+
+/// Decoration workerへ返すsyntax spanとDecorationWorkspace lease。
+///
+/// Styled payloadをleaseより先にdropし、builderは[`Self::into_parts`]でspan ownershipと同時にresult
+/// poolへbyteをtransferする。`None` leaseはPlain resultを表す。
+#[derive(Debug)]
+pub(crate) struct BudgetedHighlightedLine {
+    line: HighlightedLine,
+    lease: Option<DerivedMemoryLease>,
+}
+
+impl BudgetedHighlightedLine {
+    pub(crate) fn plain() -> Self {
+        Self {
+            line: HighlightedLine::Plain,
+            lease: None,
+        }
+    }
+
+    pub(crate) fn into_parts(self) -> (HighlightedLine, Option<DerivedMemoryLease>) {
+        (self.line, self.lease)
+    }
 }
 
 /// Syntax actor へ渡す hunk 単位の request。
@@ -77,6 +106,8 @@ pub enum HighlightError {
     WorkerSpawn(String),
     #[error("syntax worker panicked")]
     WorkerPanicked,
+    #[error("syntax decoration workspace is exhausted")]
+    WorkspaceBudgetExceeded,
 }
 
 /// 専用 syntax thread の request handle。
@@ -164,6 +195,32 @@ impl SyntaxEngine {
         first_line: Option<&str>,
         theme_choice: ThemeChoice,
     ) -> Result<Option<SyntaxSession<'engine>>, HighlightError> {
+        self.session_with_state_lease(path, first_line, theme_choice, None)
+    }
+
+    pub(crate) fn session_with_budget<'engine>(
+        &'engine self,
+        path: Option<&str>,
+        first_line: Option<&str>,
+        theme_choice: ThemeChoice,
+        ledger: &DerivedMemoryLedger,
+    ) -> Result<Option<SyntaxSession<'engine>>, HighlightError> {
+        let lease = ledger
+            .reserve(
+                DerivedMemoryPool::DecorationWorkspace,
+                SYNTAX_STATE_BASE_BYTES,
+            )
+            .map_err(|_| HighlightError::WorkspaceBudgetExceeded)?;
+        self.session_with_state_lease(path, first_line, theme_choice, Some(lease))
+    }
+
+    fn session_with_state_lease<'engine>(
+        &'engine self,
+        path: Option<&str>,
+        first_line: Option<&str>,
+        theme_choice: ThemeChoice,
+        state_lease: Option<DerivedMemoryLease>,
+    ) -> Result<Option<SyntaxSession<'engine>>, HighlightError> {
         let Some(syntax) = detect_syntax(&self.syntaxes, path, first_line) else {
             return Ok(None);
         };
@@ -181,6 +238,7 @@ impl SyntaxEngine {
             syntax,
             theme,
             highlighter: HighlightLines::new(syntax, theme),
+            state_lease,
         }))
     }
 
@@ -211,18 +269,73 @@ pub(crate) struct SyntaxSession<'engine> {
     syntax: &'engine syntect::parsing::SyntaxReference,
     theme: &'engine syntect::highlighting::Theme,
     highlighter: HighlightLines<'engine>,
+    state_lease: Option<DerivedMemoryLease>,
 }
 
 impl SyntaxSession<'_> {
+    const STATE_BYTES_PER_INPUT_BYTE: usize = 8;
+
+    /// Logical lineのtransient working setを事前leaseし、output capacity leaseを返す。
+    ///
+    /// `Ok(None)`はworkspace不足。Lineをparseせずstateをresetするため、callerはそのlineだけPlainとして
+    /// 扱い、後続lineを未知stateから継続しない。
+    pub(crate) fn highlight_line_with_budget(
+        &mut self,
+        line: &str,
+        ledger: &DerivedMemoryLedger,
+    ) -> Result<Option<BudgetedHighlightedLine>, HighlightError> {
+        if line.len() > MAX_SYNTAX_LINE_BYTES || !self.ensure_state_budget(line.len()) {
+            self.reset_after_skipped_line();
+            return Ok(None);
+        }
+        let Some(workspace_bytes) = syntax_workspace_upper_bound(line.len()) else {
+            self.reset_after_skipped_line();
+            return Ok(None);
+        };
+        let mut workspace =
+            match ledger.reserve(DerivedMemoryPool::DecorationWorkspace, workspace_bytes) {
+                Ok(lease) => lease,
+                Err(_) => {
+                    self.reset_after_skipped_line();
+                    return Ok(None);
+                }
+            };
+        let highlighted = self.highlight_line_inner(line)?;
+        let output_bytes = match &highlighted {
+            HighlightedLine::Styled(spans) => spans
+                .capacity()
+                .checked_mul(size_of::<SyntaxSpan>())
+                .unwrap_or(workspace_bytes),
+            HighlightedLine::Plain => 0,
+        };
+        if output_bytes > workspace.bytes() {
+            // Upper-bound違反を事後chargeすると、allocation済みの未計上期間が生じる。Payloadをlease
+            // より先にdropし、このlineをpublishしない。
+            drop(highlighted);
+            return Ok(None);
+        } else {
+            let released = workspace.bytes() - output_bytes;
+            if workspace.release(released).is_err() {
+                return Ok(None);
+            }
+        }
+        Ok(Some(BudgetedHighlightedLine {
+            line: highlighted,
+            lease: (output_bytes > 0).then_some(workspace),
+        }))
+    }
+
     /// Logical source lineを1行進め、original content byteへのspanを返す。
     pub(crate) fn highlight_line(&mut self, line: &str) -> Result<HighlightedLine, HighlightError> {
         if line.len() > MAX_SYNTAX_LINE_BYTES {
-            // Parseしなかったlineがmultiline string/commentを開閉したかは分からない。直前stateを
-            // 継続すると既知でないstateを既知として扱うため、次のlineはhunk先頭と同じstateへ戻す。
-            self.highlighter = HighlightLines::new(self.syntax, self.theme);
+            self.reset_after_skipped_line();
             return Ok(HighlightedLine::Plain);
         }
 
+        self.highlight_line_inner(line)
+    }
+
+    fn highlight_line_inner(&mut self, line: &str) -> Result<HighlightedLine, HighlightError> {
         // `load_defaults_newlines` のgrammarはline末尾の`\n`でsingle-line contextをpopする。
         // Modelは改行をlogical lineから分離するため、worker内だけsynthetic newlineを補い、返す
         // spanはoriginal byte lengthでclipする。
@@ -251,6 +364,43 @@ impl SyntaxSession<'_> {
             .collect();
         Ok(HighlightedLine::Styled(spans))
     }
+
+    fn ensure_state_budget(&mut self, line_len: usize) -> bool {
+        let Some(lease) = self.state_lease.as_mut() else {
+            return false;
+        };
+        let Some(required) = line_len
+            .checked_mul(Self::STATE_BYTES_PER_INPUT_BYTE)
+            .and_then(|bytes| bytes.checked_add(SYNTAX_STATE_BASE_BYTES))
+        else {
+            return false;
+        };
+        if required <= lease.bytes() {
+            return true;
+        }
+        let additional = required - lease.bytes();
+        lease.reserve(additional).is_ok()
+    }
+
+    /// Decodeまたはparseを省略したsource lineの後で、grammar stateをhunk先頭へ戻す。
+    ///
+    /// 省略したlineがmultiline string/commentを開閉したかは判定できない。直前stateを継続すると
+    /// 未確認の遷移を既知として扱うため、callerは省略したlineが属するold/new sideだけをresetする。
+    pub(crate) fn reset_after_skipped_line(&mut self) {
+        self.highlighter = HighlightLines::new(self.syntax, self.theme);
+    }
+}
+
+fn syntax_workspace_upper_bound(line_len: usize) -> Option<usize> {
+    const PARSER_BYTES_PER_INPUT_BYTE: usize = 32;
+    let per_input = size_of::<SyntaxSpan>()
+        .checked_add(size_of::<(Style, &str)>())?
+        .checked_add(PARSER_BYTES_PER_INPUT_BYTE)?;
+    line_len
+        .max(1)
+        .checked_mul(per_input)?
+        .checked_add(line_len.checked_add(1)?.checked_mul(2)?)
+        .and_then(|bytes| bytes.checked_add(64 * 1024))
 }
 
 fn detect_syntax<'a>(
@@ -388,5 +538,92 @@ mod tests {
                 .iter()
                 .all(|span| span.byte_range.end <= "let value = 1;".len())
         );
+    }
+
+    #[test]
+    fn budgeted_session_keeps_state_and_output_charged_until_each_owner_drops() {
+        let engine = SyntaxEngine::new().unwrap();
+        let ledger = DerivedMemoryLedger::new();
+        let line = "let value = 1;";
+        let mut session = engine
+            .session_with_budget(Some("src/main.rs"), Some(line), ThemeChoice::Dark, &ledger)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::DecorationWorkspace),
+            SYNTAX_STATE_BASE_BYTES
+        );
+
+        let output = session
+            .highlight_line_with_budget(line, &ledger)
+            .unwrap()
+            .unwrap();
+        let state_bytes =
+            SYNTAX_STATE_BASE_BYTES + line.len() * SyntaxSession::STATE_BYTES_PER_INPUT_BYTE;
+        assert!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::DecorationWorkspace)
+                > state_bytes
+        );
+
+        drop(output);
+        assert_eq!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::DecorationWorkspace),
+            state_bytes
+        );
+        drop(session);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn syntax_session_fails_before_construction_when_workspace_is_full() {
+        let engine = SyntaxEngine::new().unwrap();
+        let ledger = DerivedMemoryLedger::new();
+        let held_bytes =
+            DerivedMemoryPool::DecorationWorkspace.limit_bytes() - SYNTAX_STATE_BASE_BYTES + 1;
+        let held = ledger
+            .reserve(DerivedMemoryPool::DecorationWorkspace, held_bytes)
+            .unwrap();
+
+        assert!(matches!(
+            engine.session_with_budget(
+                Some("src/main.rs"),
+                Some("fn main() {}"),
+                ThemeChoice::Dark,
+                &ledger,
+            ),
+            Err(HighlightError::WorkspaceBudgetExceeded)
+        ));
+        assert_eq!(
+            ledger
+                .snapshot()
+                .reserved_bytes(DerivedMemoryPool::DecorationWorkspace),
+            held_bytes
+        );
+        drop(held);
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
+    }
+
+    #[test]
+    fn unknown_syntax_drops_the_precharged_state_lease() {
+        let engine = SyntaxEngine::new().unwrap();
+        let ledger = DerivedMemoryLedger::new();
+        assert!(
+            engine
+                .session_with_budget(
+                    Some("unknown.no-such-syntax"),
+                    None,
+                    ThemeChoice::Dark,
+                    &ledger,
+                )
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(ledger.snapshot().total_reserved_bytes(), Some(0));
     }
 }
