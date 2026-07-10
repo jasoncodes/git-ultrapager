@@ -8,7 +8,7 @@ styles:
   s1: fg=Rgb(130, 210, 255) bg=Reset mod=BOLD
   s2: fg=Rgb(132, 220, 198) bg=Rgb(23, 50, 55) mod=BOLD
   s3: fg=Rgb(115, 125, 145) bg=Reset mod=DIM
-  s4: fg=Reset bg=Reset mod=NONE
+  s4: fg=Rgb(255, 255, 255) bg=Reset mod=NONE
   s5: fg=Rgb(180, 142, 173) bg=Reset mod=NONE
   s6: fg=Rgb(192, 197, 206) bg=Reset mod=NONE
   s7: fg=Rgb(163, 190, 140) bg=Reset mod=NONE

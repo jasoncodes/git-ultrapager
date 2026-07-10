@@ -1598,7 +1598,7 @@ mod tests {
             .collect(&malformed, Some(VisualAnchor::new(deletion, 0)), 1, WIDE)
             .unwrap();
         assert_eq!(viewport.stats().layout_misses, 4);
-        assert_eq!(frame.rows[0].role, crate::theme::SemanticRole::Dim);
+        assert_eq!(frame.rows[0].role, crate::theme::SemanticRole::Plain);
 
         let (raw, mut parser) = streaming_parser();
         push(

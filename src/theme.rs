@@ -172,7 +172,14 @@ struct Rgb(u8, u8, u8);
 fn palette(choice: ThemeChoice, role: SemanticRole) -> (Option<Rgb>, Option<Rgb>) {
     let dark = choice == ThemeChoice::Dark;
     match role {
-        SemanticRole::Plain | SemanticRole::Context => (None, None),
+        SemanticRole::Plain | SemanticRole::Context => (
+            Some(if dark {
+                Rgb(255, 255, 255)
+            } else {
+                Rgb(34, 39, 48)
+            }),
+            None,
+        ),
         SemanticRole::Dim | SemanticRole::LineNumber => (
             Some(if dark {
                 Rgb(115, 125, 145)
@@ -394,6 +401,28 @@ mod tests {
             theme.style(SemanticRole::Added).fg,
             Some(Color::Rgb(..))
         ));
+    }
+
+    #[test]
+    fn default_text_uses_an_explicit_contrasting_foreground() {
+        let dark = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor);
+        assert_eq!(
+            dark.style(SemanticRole::Plain).fg,
+            Some(Color::Rgb(255, 255, 255))
+        );
+        assert_eq!(
+            dark.style(SemanticRole::Context).fg,
+            Some(Color::Rgb(255, 255, 255))
+        );
+
+        let light = Theme::new(ThemeChoice::Light, ColorLevel::TrueColor);
+        assert_eq!(
+            light.style(SemanticRole::Plain).fg,
+            Some(Color::Rgb(34, 39, 48))
+        );
+
+        let colorless = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        assert_eq!(colorless.style(SemanticRole::Plain).fg, None);
     }
 
     #[test]

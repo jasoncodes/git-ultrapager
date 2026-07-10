@@ -1755,7 +1755,8 @@ fn role_for_line(kind: LineKind) -> SemanticRole {
         LineKind::Addition => SemanticRole::Added,
         LineKind::Deletion => SemanticRole::Removed,
         LineKind::Context => SemanticRole::Context,
-        LineKind::Fallback | LineKind::Binary | LineKind::Submodule => SemanticRole::Dim,
+        LineKind::Fallback => SemanticRole::Plain,
+        LineKind::Binary | LineKind::Submodule => SemanticRole::Dim,
         _ => SemanticRole::Plain,
     }
 }
@@ -2357,6 +2358,13 @@ mod tests {
         assert_eq!(GutterSpec::new(0, 2), GutterSpec::MINIMUM);
         assert_eq!(GutterSpec::new(4, 7).old_width(), 4);
         assert_eq!(GutterSpec::new(4, 7).new_width(), 7);
+    }
+
+    #[test]
+    fn fallback_rows_use_plain_text_without_brightening_opaque_payloads() {
+        assert_eq!(role_for_line(LineKind::Fallback), SemanticRole::Plain);
+        assert_eq!(role_for_line(LineKind::Binary), SemanticRole::Dim);
+        assert_eq!(role_for_line(LineKind::Submodule), SemanticRole::Dim);
     }
 
     #[test]

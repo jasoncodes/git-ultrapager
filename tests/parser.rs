@@ -6,7 +6,8 @@ use git_ultrapager::document::{
 };
 use git_ultrapager::input::AppendStore;
 use git_ultrapager::model::{
-    ChangeStatus, Commit, CommitKind, FileEntry, FileId, FileMode, Hunk, HunkId, HunkKind, LineKind,
+    ChangeStatus, Commit, CommitKind, FileEntry, FileId, FileMode, Hunk, HunkId, HunkKind,
+    LineKind, SourceRange,
 };
 use git_ultrapager::parser::{
     GitParser, ParseDelta, ParseError, decode_git_path, parse_bytes as parse_bytes_result,
@@ -135,6 +136,101 @@ fn decoded_lines(document: &DocumentSnapshot) -> Vec<OwnedDocumentLine> {
             reader.read_owned(document, id).unwrap().unwrap()
         })
         .collect()
+}
+
+const NEW_MARKDOWN_FILE_DIFF: &str = r#"commit 38c61f63fe28e507afecf620360034d10de013fe
+Author: Naoto KAWAMURA <kawamura@xenodrive.co.jp>
+Date:   Fri Jul 10 14:58:15 2026 +0900
+
+    issues: add DEC-0089 position rate gate hot-item contention
+
+    position rate gate が write-pipeline と device_state のホット行を共有する
+    構造を、リトライで覆い続けるか分離するかの判断待ちとして起票する。
+
+diff --git a/issues/DEC-0089-position-rate-gate-hot-item.md b/issues/DEC-0089-position-rate-gate-hot-item.md
+new file mode 100644
+index 00000000..4cb0e9b7
+--- /dev/null
++++ b/issues/DEC-0089-position-rate-gate-hot-item.md
+@@ -0,0 +1,49 @@
++---
++id: DEC-0089
++title: position rate gate を device_state のホット行から分離するか
++status: open
++category: tech
++severity: med
++phase: alpha
++---
++
++## 背景
++
++device_state は 1 device 1 行のホット行で、毎秒のテレメトリ受信のたびに
++write-pipeline の TransactWriteItems (位置・イベントの採用更新、last_data_at
++更新) が書き込む。positions 系ハンドラの position rate gate (短期 lease 属性)
++も同じ行に同居しているため、トランザクション実行中の数十 ms に gate の
++UpdateItem が重なると DynamoDB が TransactionConflictException を返す。
++
++PoC 検証 (2 端末 × 1 秒間隔送信) では、この衝突が 5xx の約 1% から始まり、
++release 失敗による lease 残留 (30 秒) とクライアントの重ね撃ちが連鎖して
++約 6% まで増幅した。対症療法として gate の acquire / release の衝突リトライ
++(00d1c51) とシミュレーターの送信直列化 (b00e179) は導入済みで、観測上の
++エラーは止まる見込み。
++
++ただし「毎秒読み書きされる行に排他制御を相乗りさせる」構造自体は残っており、
++送信頻度・device 数・トランザクション要素が増えるほど衝突確率とリトライ
++コストが上がる。gate の置き場所はまだ意図的に判断しておらず、リトライで
++覆い続けるかを alpha のうちに決めたい。
++
++## 選択肢
++
++- A: gate を device_state と別 item (同テーブル別 SK または専用テーブル) に
++  分離する。write-pipeline のトランザクションと物理的に衝突しなくなる。
++  lease による直列化の意味論は変えず、変更は device-state ストアと
++  position-rate 境界に閉じる。
++- B: gate を廃止し、レート判定を position_history の条件付き書き込みや
++  materializer 側の判定に寄せて、直列化そのものを不要にする。
++- C: 現状構造のままリトライと監視で運用する。実 SDK の送信間隔では
++  シミュレーターほど衝突しない可能性に賭ける。
++
++## 推奨
++
++A。衝突の物理的な原因 (同一 item の共有) を消しつつ、10点移動窓の検証順序が
++前提にしている直列化はそのまま残るため、影響範囲が読みやすい。B は
++レート検証の設計ごと作り直しになり alpha の期間に収まらないリスクがある。
++C は device 数と送信頻度に比例して悪化する構造を放置することになる。
++
++## 決定
++
++## 反映先
+"#;
+
+fn assert_new_markdown_file_is_rich(document: &TestDocument) {
+    let file = &document.files()[0];
+    assert_eq!(file.mode, FileMode::Rich);
+    assert_eq!(file.status, ChangeStatus::Added);
+    assert_eq!(file.additions, Some(49));
+    assert_eq!(file.deletions, Some(0));
+
+    let hunk = &document.hunks()[0];
+    assert_eq!(hunk.kind, HunkKind::Unified);
+    assert_eq!(hunk.old_range, Some(SourceRange { start: 0, count: 0 }));
+    assert_eq!(
+        hunk.new_range,
+        Some(SourceRange {
+            start: 1,
+            count: 49,
+        })
+    );
+
+    let additions = decoded_lines(document)
+        .into_iter()
+        .filter(|line| line.kind == LineKind::Addition)
+        .collect::<Vec<_>>();
+    assert_eq!(additions.len(), 49);
+    for (index, line) in additions.iter().enumerate() {
+        assert_eq!(line.old_line_number, None);
+        assert_eq!(line.new_line_number, Some(index as u64 + 1));
+    }
 }
 
 fn streaming_parser() -> (AppendStore, GitParser) {
@@ -551,6 +647,18 @@ fn non_empty_hunk_ranges_reject_zero_source_line_numbers() {
     let empty_side = parse_bytes(b"diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -0,0 +1,1 @@\n+new\n");
     assert_eq!(empty_side.files()[0].mode, FileMode::Rich);
     assert_eq!(empty_side.files()[0].additions, Some(1));
+}
+
+#[test]
+fn new_markdown_file_frontmatter_and_lists_keep_source_line_numbers() {
+    assert_new_markdown_file_is_rich(&parse_bytes(NEW_MARKDOWN_FILE_DIFF.as_bytes()));
+
+    let (raw, mut parser) = streaming_parser();
+    for chunk in NEW_MARKDOWN_FILE_DIFF.as_bytes().chunks(31) {
+        push_stored(&raw, &mut parser, chunk).unwrap();
+    }
+    raw.seal().unwrap();
+    assert_new_markdown_file_is_rich(&materialize(parser.into_document().unwrap()));
 }
 
 #[test]
