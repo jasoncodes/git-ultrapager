@@ -1132,8 +1132,8 @@ mod tests {
         emit_direct_prefix(&mut output, &document, &settings, false, &mut emitted).unwrap();
         let plain = crate::ansi::strip_ansi(&output);
         let rendered = String::from_utf8_lossy(&plain);
-        assert!(rendered.contains("│-old"));
-        assert!(rendered.contains("│+new"));
+        assert!(rendered.contains("-│old"));
+        assert!(rendered.contains("+│new"));
         assert!(!rendered.contains("b/b.rs"));
 
         push_stored(
@@ -1154,8 +1154,8 @@ mod tests {
         let rendered = String::from_utf8_lossy(&plain);
         assert_eq!(rendered.matches("diff --git a/a.rs b/a.rs").count(), 1);
         assert_eq!(rendered.matches("diff --git a/b.rs b/b.rs").count(), 1);
-        assert!(rendered.contains("│-before"));
-        assert!(rendered.contains("│+after"));
+        assert!(rendered.contains("-│before"));
+        assert!(rendered.contains("+│after"));
     }
 
     #[test]

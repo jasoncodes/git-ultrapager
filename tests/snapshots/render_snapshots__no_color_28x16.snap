@@ -1,5 +1,6 @@
 ---
 source: tests/render_snapshots.rs
+assertion_line: 52
 expression: "render_snapshot(28, 16, ThemeChoice::Dark, ColorLevel::None)"
 ---
 screen 28x16
@@ -18,9 +19,9 @@ rows:
 07 <s0>+++·b/src/unicode.rs
 08 <s0>@@·-98,3·+98,4·@@·fn·render(
 09 <s0>)·{
-10 <s1>·98··98·│<s2>·let·decomposed·=·"
-11 <s1>········│<s2>·é";
-12 <s1>·99·····│<s2>-let·old·=·"東京";
-13 <s1>·····99·│<s2>+let·new·=·"東京·👩‍💻
-14 <s1>········│<s2>·";
+10 <s1>·98··98··│let·decomposed·=·"
+11 <s1>·········│é";
+12 <s1>·99·····<s2>-<s1>│let·<s2>old·=·"東京";
+13 <s1>·····99·<s2>+<s1>│let·<s2>new·=·"東京·👩‍💻
+14 <s1>·········│";
 15 <s2>line·1/10··EOF··ws:ignore

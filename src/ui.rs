@@ -1484,6 +1484,7 @@ fn render_visual_row<'line>(
     let gutter_end = source_content_start(row, metadata.kind)
         .map(|start| start.saturating_sub(1))
         .unwrap_or(0);
+    let marker_range = diff_marker_range(row, metadata.kind);
     let line_decoration = decorations.line(row.line_id);
     let mut syntax = syntax_overlays(row, line_decoration);
     syntax.sort_by_key(|overlay| (overlay.range.start, overlay.range.end));
@@ -1503,6 +1504,9 @@ fn render_visual_row<'line>(
     };
 
     let mut boundaries = vec![0, row.text.len(), gutter_end];
+    if let Some(marker) = &marker_range {
+        boundaries.extend([marker.start, marker.end]);
+    }
     extend_boundaries(&mut boundaries, &syntax);
     extend_boundaries(&mut boundaries, &intraline);
     extend_boundaries(&mut boundaries, &search.weak);
@@ -1526,7 +1530,16 @@ fn render_visual_row<'line>(
             if range.is_empty() {
                 return None;
             }
-            let base_role = if range.start < gutter_end {
+            let base_role = if marker_range
+                .as_ref()
+                .is_some_and(|marker| marker.start <= range.start && range.end <= marker.end)
+            {
+                match metadata.kind {
+                    LineKind::Deletion => SemanticRole::Removed,
+                    LineKind::Addition => SemanticRole::Added,
+                    _ => unreachable!("diff marker range exists only for changed source lines"),
+                }
+            } else if range.start < gutter_end {
                 SemanticRole::LineNumber
             } else {
                 row.role
@@ -1835,10 +1848,22 @@ fn source_content_start(row: &VisualRow, kind: LineKind) -> Option<usize> {
 
 fn current_row_marker(row: &VisualRow, kind: LineKind) -> Option<Range<usize>> {
     if let Some(content_start) = source_content_start(row, kind) {
-        let start = content_start.saturating_sub(1);
+        let start = content_start.checked_sub("│".len())?.checked_sub(1)?;
         return next_grapheme_range(&row.text, start);
     }
     next_grapheme_range(&row.text, 0)
+}
+
+/// 先頭visual rowに実在する`-` / `+`だけを返し、折り返し行の空白は行番号色のまま残す。
+fn diff_marker_range(row: &VisualRow, kind: LineKind) -> Option<Range<usize>> {
+    let marker = match kind {
+        LineKind::Deletion => "-",
+        LineKind::Addition => "+",
+        _ => return None,
+    };
+    let end = row.rendered_content_range.start.checked_sub("│".len())?;
+    let start = end.checked_sub(marker.len())?;
+    (row.text.get(start..end)? == marker).then_some(start..end)
 }
 
 fn row_contains_logical_offset(
@@ -2652,8 +2677,8 @@ mod tests {
             .unwrap();
         let screen = buffer_text(&terminal);
         assert!(screen.contains("src/main.rs"), "{screen}");
-        assert!(screen.contains("10     │-old"), "{screen}");
-        assert!(screen.contains("10 │+new"), "{screen}");
+        assert!(screen.contains("10     -│old"), "{screen}");
+        assert!(screen.contains("10 +│new"), "{screen}");
         assert!(screen.contains("line 1/6"), "{screen}");
     }
 
@@ -3393,8 +3418,8 @@ commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
             .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
             .unwrap();
         let screen = buffer_text(&terminal);
-        assert!(screen.contains("-→···foo"), "{screen}");
-        assert!(screen.contains("+····foo"), "{screen}");
+        assert!(screen.contains("-│→···foo"), "{screen}");
+        assert!(screen.contains("+│····foo"), "{screen}");
     }
 
     #[test]

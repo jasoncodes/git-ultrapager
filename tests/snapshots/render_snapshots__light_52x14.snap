@@ -1,5 +1,6 @@
 ---
 source: tests/render_snapshots.rs
+assertion_line: 44
 expression: "render_snapshot(52, 14, ThemeChoice::Light, ColorLevel::TrueColor)"
 ---
 screen 52x14
@@ -8,23 +9,22 @@ styles:
   s1: fg=Rgb(0, 92, 153) bg=Reset mod=BOLD
   s2: fg=Rgb(0, 105, 92) bg=Rgb(221, 245, 241) mod=BOLD
   s3: fg=Rgb(92, 99, 112) bg=Reset mod=DIM
-  s4: fg=Rgb(34, 39, 48) bg=Reset mod=NONE
-  s5: fg=Rgb(167, 29, 93) bg=Reset mod=BOLD
-  s6: fg=Rgb(50, 50, 50) bg=Reset mod=NONE
-  s7: fg=Rgb(24, 54, 145) bg=Reset mod=NONE
-  s8: fg=Rgb(161, 37, 63) bg=Rgb(253, 231, 236) mod=NONE
-  s9: fg=Rgb(167, 29, 93) bg=Rgb(253, 231, 236) mod=BOLD
-  s10: fg=Rgb(50, 50, 50) bg=Rgb(253, 231, 236) mod=NONE
-  s11: fg=Rgb(50, 50, 50) bg=Rgb(246, 185, 197) mod=NONE
-  s12: fg=Rgb(24, 54, 145) bg=Rgb(253, 231, 236) mod=NONE
-  s13: fg=Rgb(19, 102, 54) bg=Rgb(225, 246, 232) mod=NONE
-  s14: fg=Rgb(167, 29, 93) bg=Rgb(225, 246, 232) mod=BOLD
-  s15: fg=Rgb(50, 50, 50) bg=Rgb(225, 246, 232) mod=NONE
-  s16: fg=Rgb(50, 50, 50) bg=Rgb(181, 230, 195) mod=NONE
-  s17: fg=Rgb(24, 54, 145) bg=Rgb(225, 246, 232) mod=NONE
-  s18: fg=Rgb(24, 54, 145) bg=Rgb(181, 230, 195) mod=NONE
-  s19: fg=Rgb(98, 163, 92) bg=Rgb(225, 246, 232) mod=NONE
-  s20: fg=Rgb(51, 58, 71) bg=Rgb(235, 237, 242) mod=NONE
+  s4: fg=Rgb(167, 29, 93) bg=Reset mod=BOLD
+  s5: fg=Rgb(50, 50, 50) bg=Reset mod=NONE
+  s6: fg=Rgb(24, 54, 145) bg=Reset mod=NONE
+  s7: fg=Rgb(161, 37, 63) bg=Rgb(253, 231, 236) mod=NONE
+  s8: fg=Rgb(167, 29, 93) bg=Rgb(253, 231, 236) mod=BOLD
+  s9: fg=Rgb(50, 50, 50) bg=Rgb(253, 231, 236) mod=NONE
+  s10: fg=Rgb(50, 50, 50) bg=Rgb(246, 185, 197) mod=NONE
+  s11: fg=Rgb(24, 54, 145) bg=Rgb(253, 231, 236) mod=NONE
+  s12: fg=Rgb(19, 102, 54) bg=Rgb(225, 246, 232) mod=NONE
+  s13: fg=Rgb(167, 29, 93) bg=Rgb(225, 246, 232) mod=BOLD
+  s14: fg=Rgb(50, 50, 50) bg=Rgb(225, 246, 232) mod=NONE
+  s15: fg=Rgb(50, 50, 50) bg=Rgb(181, 230, 195) mod=NONE
+  s16: fg=Rgb(24, 54, 145) bg=Rgb(225, 246, 232) mod=NONE
+  s17: fg=Rgb(24, 54, 145) bg=Rgb(181, 230, 195) mod=NONE
+  s18: fg=Rgb(98, 163, 92) bg=Rgb(225, 246, 232) mod=NONE
+  s19: fg=Rgb(51, 58, 71) bg=Rgb(235, 237, 242) mod=NONE
 rows:
 00 <s0>working·tree
 01 <s0>M·src/unicode.rs··1/1··+2·-1
@@ -33,10 +33,10 @@ rows:
 04 <s1>---·a/src/unicode.rs
 05 <s1>+++·b/src/unicode.rs
 06 <s2>@@·-98,3·+98,4·@@·fn·render()·{
-07 <s3>·98··98·│<s4>·<s5>let<s6>·decomposed·<s5>=<s6>·<s7>"é"<s6>;
-08 <s3>·99·····│<s8>-<s9>let<s10>·<s11>old<s10>·<s9>=<s10>·<s12>"東京"<s10>;
-09 <s3>·····99·│<s13>+<s14>let<s15>·<s16>new<s15>·<s14>=<s15>·<s17>"東京<s18>·👩‍💻<s17>"<s15>;
-10 <s3>····100·│<s13>+<s15>····<s19>very_long_function<s15>(<s17>"alpha"<s15>,·<s17>"beta"<s15>,·<s17>"g
-11 <s3>········│<s13>·<s17>amma"<s15>);
-12 <s3>100·101·│<s4>·<s5>return<s6>·decomposed;
-13 <s20>line·1/10··EOF··ws:ignore
+07 <s3>·98··98··│<s4>let<s5>·decomposed·<s4>=<s5>·<s6>"é"<s5>;
+08 <s3>·99·····<s7>-<s3>│<s8>let<s9>·<s10>old<s9>·<s8>=<s9>·<s11>"東京"<s9>;
+09 <s3>·····99·<s12>+<s3>│<s13>let<s14>·<s15>new<s14>·<s13>=<s14>·<s16>"東京<s17>·👩‍💻<s16>"<s14>;
+10 <s3>····100·<s12>+<s3>│<s14>····<s18>very_long_function<s14>(<s16>"alpha"<s14>,·<s16>"beta"<s14>,·<s16>"g
+11 <s3>·········│<s16>amma"<s14>);
+12 <s3>100·101··│<s4>return<s5>·decomposed;
+13 <s19>line·1/10··EOF··ws:ignore

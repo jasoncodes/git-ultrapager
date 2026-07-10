@@ -1244,7 +1244,7 @@ impl LargeLineRows {
                 }
             };
             self.row_text = format!(
-                "{old_number:>old_width$} {new_number:>new_width$} │{marker}",
+                "{old_number:>old_width$} {new_number:>new_width$} {marker}│",
                 old_width = self.gutter.old_width(),
                 new_width = self.gutter.new_width(),
             );
@@ -1252,8 +1252,8 @@ impl LargeLineRows {
             if !continuation {
                 self.row_mappings.push(SpanMapping {
                     logical: 0..1,
-                    rendered: self.rendered_content_start.saturating_sub(1)
-                        ..self.rendered_content_start,
+                    rendered: self.rendered_content_start.saturating_sub(2)
+                        ..self.rendered_content_start.saturating_sub(1),
                     tab: false,
                 });
             }
@@ -1511,7 +1511,7 @@ fn append_source_rows(
     old_width: usize,
     new_width: usize,
 ) -> Result<(), LayoutError> {
-    // "old new │+ " の separator/markerを含む。source content自身に最低1cellを残す。
+    // "old new +│ " の separator/markerを含む。source content自身に最低1cellを残す。
     let prefix_width = old_width + 1 + new_width + 3;
     let content_width = width
         .checked_sub(prefix_width)
@@ -1547,7 +1547,7 @@ fn append_source_rows(
         let row_marker = if continuation { ' ' } else { marker };
         let source = &expanded.text[segment.byte_range.clone()];
         let text =
-            format!("{old_number:>old_width$} {new_number:>new_width$} │{row_marker}{source}");
+            format!("{old_number:>old_width$} {new_number:>new_width$} {row_marker}│{source}");
         let rendered_content_start = text.len() - source.len();
         let mut span_map = map_expanded_segment(
             &expanded,
@@ -1560,7 +1560,8 @@ fn append_source_rows(
                 0,
                 SpanMapping {
                     logical: 0..1,
-                    rendered: rendered_content_start.saturating_sub(1)..rendered_content_start,
+                    rendered: rendered_content_start.saturating_sub(2)
+                        ..rendered_content_start.saturating_sub(1),
                     tab: false,
                 },
             );
@@ -1857,9 +1858,21 @@ fn write_large_undecorated_row<W: Write>(
     } else {
         0
     };
-    if gutter_end > 0 {
+    let marker_range = source_marker_range(row, kind);
+    let line_number_end = marker_range
+        .as_ref()
+        .map_or(gutter_end, |range| range.start);
+    if line_number_end > 0 {
         write_style(writer, theme.style(SemanticRole::LineNumber))?;
-        writer.write_all(&row.text.as_bytes()[..gutter_end])?;
+        writer.write_all(&row.text.as_bytes()[..line_number_end])?;
+    }
+    if let Some(marker) = marker_range {
+        write_style(writer, theme.style(role_for_line(kind)))?;
+        writer.write_all(&row.text.as_bytes()[marker.clone()])?;
+        if marker.end < gutter_end {
+            write_style(writer, theme.style(SemanticRole::LineNumber))?;
+            writer.write_all(&row.text.as_bytes()[marker.end..gutter_end])?;
+        }
     }
     write_style(writer, theme.style(row.role))?;
     writer.write_all(&row.text.as_bytes()[gutter_end..])?;
@@ -1925,7 +1938,11 @@ fn write_composed_row<W: Write>(
     } else {
         0
     };
+    let marker_range = source_marker_range(row, kind);
     let mut boundaries = vec![0, row.text.len(), gutter_end];
+    if let Some(marker) = &marker_range {
+        boundaries.extend([marker.start, marker.end]);
+    }
     for (range, _) in syntax {
         boundaries.extend([range.start, range.end]);
     }
@@ -1941,7 +1958,12 @@ fn write_composed_row<W: Write>(
         if range.is_empty() {
             continue;
         }
-        let base_role = if range.start < gutter_end {
+        let base_role = if marker_range
+            .as_ref()
+            .is_some_and(|marker| marker.start <= range.start && range.end <= marker.end)
+        {
+            role_for_line(kind)
+        } else if range.start < gutter_end {
             SemanticRole::LineNumber
         } else {
             row.role
@@ -1974,6 +1996,19 @@ fn write_composed_row<W: Write>(
         writer.write_all(rendered.as_bytes())?;
     }
     writer.write_all(b"\x1b[0m\n")
+}
+
+/// 先頭visual rowのdiff markerだけを返す。折り返し行の同じ位置には空白が入るため、
+/// `LineKind`とglyphの両方を照合して行番号色を誤って追加・削除色へ変えない。
+fn source_marker_range(row: &VisualRow, kind: LineKind) -> Option<Range<usize>> {
+    let marker = match kind {
+        LineKind::Deletion => "-",
+        LineKind::Addition => "+",
+        _ => return None,
+    };
+    let end = row.rendered_content_range.start.checked_sub("│".len())?;
+    let start = end.checked_sub(marker.len())?;
+    (row.text.get(start..end)? == marker).then_some(start..end)
 }
 
 fn direct_syntax_ranges<'decoration>(
@@ -2440,7 +2475,7 @@ mod tests {
                 .iter()
                 .map(|row| row.text.as_str())
                 .collect::<Vec<_>>(),
-            vec![" 98       │-    ", "          │ 界abc"]
+            vec![" 98       -│    ", "           │界abc"]
         );
         assert_eq!(
             deletion_layout.rows()[0]
@@ -2471,7 +2506,7 @@ mod tests {
         .unwrap();
         let rendered = String::from_utf8(crate::ansi::strip_ansi(&per_line_output)).unwrap();
         assert!(rendered.starts_with("ab  界cd\n"));
-        assert!(rendered.contains(" 98       │-    \n          │ 界abc\n"));
+        assert!(rendered.contains(" 98       -│    \n           │界abc\n"));
     }
 
     #[test]
@@ -2518,8 +2553,8 @@ mod tests {
         )
         .unwrap();
         let deletion_rows = layout.rows();
-        assert!(deletion_rows[0].text.starts_with(" 10     │-"));
-        assert!(deletion_rows[1].text.starts_with("        │ "));
+        assert!(deletion_rows[0].text.starts_with(" 10     -│"));
+        assert!(deletion_rows[1].text.starts_with("         │"));
     }
 
     #[test]
@@ -2803,8 +2838,8 @@ mod tests {
         .unwrap();
         let plain = crate::ansi::strip_ansi(&output);
         let rendered = String::from_utf8(plain).unwrap();
-        assert!(rendered.contains("-→···foo"), "{rendered}");
-        assert!(rendered.contains("+····foo"), "{rendered}");
+        assert!(rendered.contains("-│→···foo"), "{rendered}");
+        assert!(rendered.contains("+│····foo"), "{rendered}");
     }
 
     #[test]
