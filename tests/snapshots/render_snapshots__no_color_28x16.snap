@@ -1,0 +1,26 @@
+---
+source: tests/render_snapshots.rs
+expression: "render_snapshot(28, 16, ThemeChoice::Dark, ColorLevel::None)"
+---
+screen 28x16
+styles:
+  s0: fg=Reset bg=Reset mod=BOLD
+  s1: fg=Reset bg=Reset mod=DIM
+  s2: fg=Reset bg=Reset mod=NONE
+rows:
+00 <s0>M·src/unicode.rs··1/1··+2·-1
+01 <s0>diff·--git·a/src/unicode.rs
+02 <s0>b/src/unicode.rs
+03 <s0>index·1111111..2222222·10064
+04 <s0>4
+05 <s0>---·a/src/unicode.rs
+06 <s0>+++·b/src/unicode.rs
+07 <s0>@@·-98,3·+98,4·@@·fn·render(
+08 <s0>)·{
+09 <s1>·98··98·│<s2>·let·decomposed·=·"
+10 <s1>········│<s2>·é";
+11 <s1>·99·····│<s2>-let·old·=·"東京";
+12 <s1>·····99·│<s2>+let·new·=·"東京·👩‍💻
+13 <s1>········│<s2>·";
+14 <s1>····100·│<s2>+····very_long_func
+15 <s2>row·1/17··EOF··ws:ignore

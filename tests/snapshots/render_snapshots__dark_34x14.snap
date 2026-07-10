@@ -1,0 +1,29 @@
+---
+source: tests/render_snapshots.rs
+expression: "render_snapshot(34, 14, ThemeChoice::Dark, ColorLevel::TrueColor)"
+---
+screen 34x14
+styles:
+  s0: fg=Rgb(235, 238, 245) bg=Rgb(55, 62, 78) mod=BOLD
+  s1: fg=Rgb(130, 210, 255) bg=Reset mod=BOLD
+  s2: fg=Rgb(132, 220, 198) bg=Rgb(23, 50, 55) mod=BOLD
+  s3: fg=Rgb(115, 125, 145) bg=Reset mod=DIM
+  s4: fg=Reset bg=Reset mod=NONE
+  s5: fg=Rgb(243, 139, 168) bg=Rgb(65, 31, 42) mod=NONE
+  s6: fg=Rgb(166, 227, 161) bg=Rgb(24, 55, 35) mod=NONE
+  s7: fg=Rgb(210, 215, 228) bg=Rgb(38, 43, 55) mod=NONE
+rows:
+00 <s0>M·src/unicode.rs··1/1··+2·-1
+01 <s1>diff·--git·a/src/unicode.rs·b/src/
+02 <s1>unicode.rs
+03 <s1>index·1111111..2222222·100644
+04 <s1>---·a/src/unicode.rs
+05 <s1>+++·b/src/unicode.rs
+06 <s2>@@·-98,3·+98,4·@@·fn·render()·{
+07 <s3>·98··98·│<s4>·let·decomposed·=·"é";
+08 <s3>·99·····│<s5>-let·old·=·"東京";
+09 <s3>·····99·│<s6>+let·new·=·"東京·👩‍💻";
+10 <s3>····100·│<s6>+····very_long_function("
+11 <s3>········│<s6>·alpha",·"beta",·"gamma")
+12 <s3>········│<s6>·;
+13 <s7>row·1/13··EOF··ws:ignore

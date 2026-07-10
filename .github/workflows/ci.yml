@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  readme-sync:
+    name: README synchronization
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject one-sided README changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BEFORE_SHA: ${{ github.event.before }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            base="$BASE_SHA"
+          else
+            base="$BEFORE_SHA"
+          fi
+
+          if [[ -z "$base" || "$base" =~ ^0+$ ]] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            changed_files="$(git ls-tree -r --name-only "$HEAD_SHA")"
+          else
+            changed_files="$(git diff --name-only "$base" "$HEAD_SHA")"
+          fi
+
+          english_changed=false
+          japanese_changed=false
+          while IFS= read -r path; do
+            case "$path" in
+              README.md) english_changed=true ;;
+              README-ja.md) japanese_changed=true ;;
+            esac
+          done <<< "$changed_files"
+
+          if [[ "$english_changed" != "$japanese_changed" ]]; then
+            echo "README.md and README-ja.md must be updated together." >&2
+            exit 1
+          fi
+
+  quality:
+    name: Quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Detect the Cargo package
+        id: cargo-package
+        shell: bash
+        run: |
+          if [[ -f Cargo.toml ]]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check formatting
+        if: steps.cargo-package.outputs.exists == 'true'
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        if: steps.cargo-package.outputs.exists == 'true'
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run tests
+        if: steps.cargo-package.outputs.exists == 'true'
+        run: cargo test --all-features
