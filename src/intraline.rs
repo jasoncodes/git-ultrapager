@@ -1,9 +1,11 @@
-//! Adjacent deletion/addition block の grapheme-level diff。
+//! Adjacent deletion/addition block の word/grapheme-level diff。
 //!
 //! Git の `-`/`+` 行を隠さず、対応付けと強調 span だけを生成する。block の line alignment は
 //! whitespace policy 適用後の文字列へ Patience diff を使い、anchor 間の unmatched 行を入力順に
-//! pair する。worker が budget 超過を検出した場合は部分結果を返さず block 全体を fallback する。
+//! pair する。Ignore modeは識別子・日本語script・記号をword単位、Show modeはgrapheme単位で比較する。
+//! worker が budget 超過を検出した場合は部分結果を返さず block 全体を fallback する。
 
+use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::ops::Range;
 
@@ -505,8 +507,8 @@ fn estimate_workspace(
         checked_mul(pair_mapping_pieces, size_of::<MappingPiece>())?,
         VEC_GROWTH_FACTOR,
     )?;
-    let grapheme_references = checked_mul(
-        checked_mul(pair_graphemes, size_of::<&str>())?,
+    let diff_units = checked_mul(
+        checked_mul(pair_graphemes, size_of::<DiffUnit<'_>>())?,
         VEC_GROWTH_FACTOR,
     )?;
     let retained_ranges = checked_mul(
@@ -524,7 +526,7 @@ fn estimate_workspace(
         pair_records,
         pair_bytes,
         scalar_mapping,
-        grapheme_references,
+        diff_units,
         retained_ranges,
         current_pair_ranges,
         pair_algorithm,
@@ -639,13 +641,12 @@ fn pair_lines(
         };
     }
 
-    // Ignore modeではoriginal textをdiffすると、content変更と同じlineにある無視対象spaceまで
-    // changed spanへ入る。正規化後のgraphemeを比較し、対応表でoriginal byte rangeへ戻す。
-    let mut old_graphemes = Vec::with_capacity(old_comparable.original_ranges.len());
-    old_graphemes.extend(old_comparable.text.graphemes(true));
-    let mut new_graphemes = Vec::with_capacity(new_comparable.original_ranges.len());
-    new_graphemes.extend(new_comparable.text.graphemes(true));
-    let operations = capture_diff_slices(Algorithm::Myers, &old_graphemes, &new_graphemes);
+    // Ignore modeではGitのword-diffに近い粒度へまとめる。Show modeはchanged whitespaceを個別表示
+    // する契約を持つため、従来どおりgrapheme単位を保つ。どちらもoriginal byte rangeをunitへ持たせ、
+    // 正規化で除外した行頭・行末spaceや縮約したrunをchanged spanへ混ぜない。
+    let old_units = old_comparable.diff_units(whitespace);
+    let new_units = new_comparable.diff_units(whitespace);
+    let operations = capture_diff_slices(Algorithm::Myers, &old_units, &new_units);
     let mut old_changed = Vec::with_capacity(operations.len());
     let mut new_changed = Vec::with_capacity(operations.len());
 
@@ -654,38 +655,18 @@ fn pair_lines(
             DiffOp::Equal { .. } => {}
             DiffOp::Delete {
                 old_index, old_len, ..
-            } => push_span(
-                &mut old_changed,
-                &old_comparable.original_ranges,
-                old_index,
-                old_len,
-            ),
+            } => push_span(&mut old_changed, &old_units, old_index, old_len),
             DiffOp::Insert {
                 new_index, new_len, ..
-            } => push_span(
-                &mut new_changed,
-                &new_comparable.original_ranges,
-                new_index,
-                new_len,
-            ),
+            } => push_span(&mut new_changed, &new_units, new_index, new_len),
             DiffOp::Replace {
                 old_index,
                 old_len,
                 new_index,
                 new_len,
             } => {
-                push_span(
-                    &mut old_changed,
-                    &old_comparable.original_ranges,
-                    old_index,
-                    old_len,
-                );
-                push_span(
-                    &mut new_changed,
-                    &new_comparable.original_ranges,
-                    new_index,
-                    new_len,
-                );
+                push_span(&mut old_changed, &old_units, old_index, old_len);
+                push_span(&mut new_changed, &new_units, new_index, new_len);
             }
         }
     }
@@ -701,6 +682,43 @@ fn pair_lines(
 struct ComparableLine {
     text: String,
     original_ranges: Vec<Range<usize>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WordClass {
+    AsciiIdentifier,
+    Hiragana,
+    Katakana,
+    Han,
+}
+
+#[derive(Clone, Debug)]
+struct DiffUnit<'a> {
+    text: &'a str,
+    original: Range<usize>,
+}
+
+impl PartialEq for DiffUnit<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl Eq for DiffUnit<'_> {}
+
+impl Hash for DiffUnit<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.text.hash(state);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PendingWord {
+    class: WordClass,
+    normalized_start: usize,
+    normalized_end: usize,
+    original_start: usize,
+    original_end: usize,
 }
 
 impl ComparableLine {
@@ -748,6 +766,103 @@ impl ComparableLine {
             original_ranges,
         }
     }
+
+    fn diff_units(&self, whitespace: WhitespaceChoice) -> Vec<DiffUnit<'_>> {
+        if whitespace == WhitespaceChoice::Show {
+            return self
+                .text
+                .graphemes(true)
+                .zip(&self.original_ranges)
+                .map(|(text, original)| DiffUnit {
+                    text,
+                    original: original.clone(),
+                })
+                .collect();
+        }
+
+        let mut units = Vec::with_capacity(self.original_ranges.len());
+        let mut pending = None;
+        for ((normalized_start, grapheme), original) in
+            self.text.grapheme_indices(true).zip(&self.original_ranges)
+        {
+            let normalized_end = normalized_start + grapheme.len();
+            let Some(class) = word_class(grapheme) else {
+                push_pending_word(&mut units, &self.text, pending.take());
+                units.push(DiffUnit {
+                    text: grapheme,
+                    original: original.clone(),
+                });
+                continue;
+            };
+
+            match &mut pending {
+                Some(word) if word.class == class => {
+                    word.normalized_end = normalized_end;
+                    word.original_end = original.end;
+                }
+                Some(_) => {
+                    push_pending_word(&mut units, &self.text, pending.take());
+                    pending = Some(PendingWord {
+                        class,
+                        normalized_start,
+                        normalized_end,
+                        original_start: original.start,
+                        original_end: original.end,
+                    });
+                }
+                None => {
+                    pending = Some(PendingWord {
+                        class,
+                        normalized_start,
+                        normalized_end,
+                        original_start: original.start,
+                        original_end: original.end,
+                    });
+                }
+            }
+        }
+        push_pending_word(&mut units, &self.text, pending);
+        units
+    }
+}
+
+fn push_pending_word<'a>(
+    units: &mut Vec<DiffUnit<'a>>,
+    text: &'a str,
+    pending: Option<PendingWord>,
+) {
+    let Some(word) = pending else {
+        return;
+    };
+    units.push(DiffUnit {
+        text: &text[word.normalized_start..word.normalized_end],
+        original: word.original_start..word.original_end,
+    });
+}
+
+// Ignore modeの固定token契約。ASCII識別子と日本語3scriptは連続runへまとめ、その他は1 graphemeを
+// 1 tokenにする。Git設定をpager processから読むと、入力を生成したrepository/working directoryと
+// 異なる設定を参照し得るため、`diff.wordRegex`には依存しない。Gitの`.`相当もscalarではなく
+// graphemeで止め、結合文字やZWJ emojiの途中をbackground spanの境界にしない。
+fn word_class(grapheme: &str) -> Option<WordClass> {
+    if grapheme
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Some(WordClass::AsciiIdentifier);
+    }
+
+    let first = grapheme.chars().next()?;
+    if ('ぁ'..='ん').contains(&first) {
+        return Some(WordClass::Hiragana);
+    }
+    if ('ァ'..='ヶ').contains(&first) || first == 'ー' {
+        return Some(WordClass::Katakana);
+    }
+    if ('一'..='龥').contains(&first) || matches!(first, '々' | '〇' | '〆') {
+        return Some(WordClass::Han);
+    }
+    None
 }
 
 struct MappingPiece {
@@ -831,23 +946,17 @@ fn normalized_content_bounds(input: &str) -> (usize, usize) {
     (content_start, content_end)
 }
 
-fn push_span(
-    spans: &mut Vec<Range<usize>>,
-    original_ranges: &[Range<usize>],
-    index: usize,
-    len: usize,
-) {
+fn push_span(spans: &mut Vec<Range<usize>>, units: &[DiffUnit<'_>], index: usize, len: usize) {
     if len == 0 {
         return;
     }
     let Some(last_index) = index.checked_add(len - 1) else {
         return;
     };
-    let (Some(first), Some(last)) = (original_ranges.get(index), original_ranges.get(last_index))
-    else {
+    let (Some(first), Some(last)) = (units.get(index), units.get(last_index)) else {
         return;
     };
-    spans.push(first.start..last.end);
+    spans.push(first.original.start..last.original.end);
 }
 
 fn merge_adjacent(mut spans: Vec<Range<usize>>) -> Vec<Range<usize>> {
@@ -958,6 +1067,66 @@ mod tests {
     }
 
     #[test]
+    fn ignored_whitespace_compares_complete_identifiers_as_words() {
+        let old = "let inline_file_headers = value;";
+        let new = "let inline_context_headers = value;";
+        let result = compute(
+            &[old.to_owned()],
+            &[new.to_owned()],
+            WhitespaceChoice::Ignore,
+        );
+        let IntralineResult::Computed(pairs) = result else {
+            panic!("expected computed result");
+        };
+        assert_eq!(
+            pairs[0]
+                .old_changed
+                .iter()
+                .map(|range| &old[range.clone()])
+                .collect::<Vec<_>>(),
+            vec!["inline_file_headers"]
+        );
+        assert_eq!(
+            pairs[0]
+                .new_changed
+                .iter()
+                .map(|range| &new[range.clone()])
+                .collect::<Vec<_>>(),
+            vec!["inline_context_headers"]
+        );
+    }
+
+    #[test]
+    fn ignored_whitespace_groups_japanese_scripts_and_keeps_symbols_separate() {
+        let old = "変更前です(foo)";
+        let new = "変更後です[foo]";
+        let result = compute(
+            &[old.to_owned()],
+            &[new.to_owned()],
+            WhitespaceChoice::Ignore,
+        );
+        let IntralineResult::Computed(pairs) = result else {
+            panic!("expected computed result");
+        };
+        assert_eq!(
+            pairs[0]
+                .old_changed
+                .iter()
+                .map(|range| &old[range.clone()])
+                .collect::<Vec<_>>(),
+            vec!["変更前", "(", ")"]
+        );
+        assert_eq!(
+            pairs[0]
+                .new_changed
+                .iter()
+                .map(|range| &new[range.clone()])
+                .collect::<Vec<_>>(),
+            vec!["変更後", "[", "]"]
+        );
+    }
+
+    #[test]
     fn ignored_whitespace_is_not_highlighted_beside_content_changes() {
         let result = compute(
             &["  foo\t  old  ".to_owned()],
@@ -987,17 +1156,19 @@ mod tests {
     }
 
     #[test]
-    fn token_separator_remains_semantically_significant() {
+    fn inserted_token_separator_changes_both_words() {
+        let old = "foobar";
+        let new = "foo\tbar";
         let result = compute(
-            &["foobar".to_owned()],
-            &["foo\tbar".to_owned()],
+            &[old.to_owned()],
+            &[new.to_owned()],
             WhitespaceChoice::Ignore,
         );
         let IntralineResult::Computed(pairs) = result else {
             panic!("expected computed result");
         };
-        assert!(pairs[0].old_changed.is_empty());
-        assert_eq!(&"foo\tbar"[pairs[0].new_changed[0].clone()], "\t");
+        assert_eq!(&old[pairs[0].old_changed[0].clone()], old);
+        assert_eq!(&new[pairs[0].new_changed[0].clone()], new);
     }
 
     #[test]
@@ -1182,10 +1353,10 @@ mod tests {
                     for new in added {
                         let old_comparable = ComparableLine::new(old, whitespace);
                         let new_comparable = ComparableLine::new(new, whitespace);
-                        let old_graphemes = old_comparable.text.graphemes(true).collect::<Vec<_>>();
-                        let new_graphemes = new_comparable.text.graphemes(true).collect::<Vec<_>>();
+                        let old_units = old_comparable.diff_units(whitespace);
+                        let new_units = new_comparable.diff_units(whitespace);
                         let operations =
-                            capture_diff_slices(Algorithm::Myers, &old_graphemes, &new_graphemes);
+                            capture_diff_slices(Algorithm::Myers, &old_units, &new_units);
                         let mapping_capacity = if whitespace == WhitespaceChoice::Ignore {
                             (old.chars().count() + new.chars().count()) * size_of::<MappingPiece>()
                         } else {
@@ -1197,8 +1368,8 @@ mod tests {
                             + (old_comparable.original_ranges.capacity()
                                 + new_comparable.original_ranges.capacity())
                                 * size_of::<Range<usize>>()
-                            + (old_graphemes.capacity() + new_graphemes.capacity())
-                                * size_of::<&str>()
+                            + (old_units.capacity() + new_units.capacity())
+                                * size_of::<DiffUnit<'_>>()
                             + operations.capacity() * size_of::<DiffOp>()
                             + operations.capacity() * 3 * size_of::<Range<usize>>();
                         largest_pair_capacity = largest_pair_capacity.max(visible_pair);

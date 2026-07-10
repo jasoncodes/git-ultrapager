@@ -152,10 +152,12 @@ tab は設定した tab stop へ展開します。
 
 デフォルトの `--whitespace ignore` は、intraline の pairing と highlight で ASCII space / tab の差を無視します。
 行頭と行末の ASCII space / tab を除外し、行中の連続部分は1つの区切りとして比較します。
+正規化後の highlight は、ASCII の識別子、連続するひらがな・カタカナ・漢字、残りの各 grapheme を word token として比較します。
+識別子内の一致部分だけを細かく切り出さず、Git の word-diff に近い粒度で名前全体を変更として表示します。
 `foo bar` と `foobar` は別の内容として扱い、ほかの Unicode whitespace は通常の文字として比較します。
 Git が出した `-` / `+` 行自体は隠しません。
 whitespace-only の diff 行を除外する場合は、Git 側で `-w` を指定します。
-`W` または `--whitespace show` に切り替えると、変更された space を `·`、tab を `→` の後ろに残りの展開 cell 数だけ `·` を続けて表示します。
+`W` または `--whitespace show` に切り替えると grapheme 単位の厳密な比較になり、変更された space を `·`、tab を `→` の後ろに残りの展開 cell 数だけ `·` を続けて表示します。
 
 組み込みの dark / light theme は、ターミナルに応じて true color、256色、16色へ degrade します。
 追加、削除、選択、検索状態を色だけで表すことはありません。

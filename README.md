@@ -180,14 +180,18 @@ search state.
 
 In the default `ignore` whitespace mode, intraline pairing and emphasis ignore
 leading and trailing ASCII spaces and tabs, and normalize each interior run of
-ASCII spaces or tabs to one separator. `foo bar` and `foobar` remain different;
-other Unicode whitespace is compared as ordinary text. Diff lines are never
-hidden by this mode—use Git's `-w` when the lines themselves should be excluded.
+ASCII spaces or tabs to one separator. After normalization, intraline emphasis
+compares whole ASCII identifiers, contiguous Hiragana, Katakana, and Han runs,
+and individual remaining graphemes as word tokens. This keeps identifier changes
+at a Git word-diff-like granularity instead of highlighting matching fragments
+inside a name. `foo bar` and `foobar` remain different; other Unicode whitespace
+is compared as ordinary text. Diff lines are never hidden by this mode—use Git's
+`-w` when the lines themselves should be excluded.
 
 `W` toggles the comparison for the current session, and `--whitespace show`
-starts with exact whitespace comparison. In `show` mode, changed whitespace spans
-render spaces as `·` and tabs as `→` followed by `·` cells; unchanged whitespace
-and context lines retain their normal display.
+starts with exact grapheme-level comparison. In `show` mode, changed whitespace
+spans render spaces as `·` and tabs as `→` followed by `·` cells; unchanged
+whitespace and context lines retain their normal display.
 
 ## Supported Git output
 
