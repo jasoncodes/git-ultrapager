@@ -17,8 +17,9 @@ use crossterm::event::{self, Event as CrosstermEvent};
 
 use crate::ansi::AnsiStripper;
 use crate::cli::{Cli, PagingChoice};
-use crate::direct::{DocumentLayout, layout_document, write_direct};
-use crate::model::Document;
+use crate::decorations::{DecorationRequest, DecorationSet, DecorationWorker};
+use crate::direct::{layout_document, write_direct_decorated_range, write_direct_metadata_lines};
+use crate::model::{Document, HunkId};
 use crate::parser::GitParser;
 use crate::runtime::{ReaderEvent, ReaderRuntime, SearchJob, SearchWorker, SearchWorkerEvent};
 use crate::state::{AppState, Effect, Event as StateEvent};
@@ -54,6 +55,9 @@ pub fn run() -> Result<ExitCode> {
     let (width, height) = startup_terminal_size();
     let mut reader = ReaderRuntime::spawn_stdin().context("failed to spawn stdin reader")?;
     let mut parser = GitParser::new();
+    if cli.paging == PagingChoice::Never {
+        return run_streaming_direct(&cli, width, &mut parser, &mut reader);
+    }
     let startup = probe_startup(
         cli.paging,
         width,
@@ -276,9 +280,19 @@ fn run_interactive(
     );
     let search =
         SearchWorker::spawn(SEARCH_QUEUE_DEPTH).context("failed to spawn search worker")?;
+    let decorations_worker =
+        DecorationWorker::spawn().context("failed to spawn decoration worker")?;
+    let mut decoration_generation = 0_u64;
+    let mut decorations = DecorationSet::default();
     let mut redraw = true;
     let mut document_dirty = false;
     let mut last_document_publish = Instant::now();
+    submit_decorations(
+        &decorations_worker,
+        &mut decoration_generation,
+        &mut state,
+        &theme,
+    )?;
 
     loop {
         if let Some(code) = drain_signals(&guards.signals, &mut guards.terminal, &mut redraw)? {
@@ -301,9 +315,16 @@ fn run_interactive(
                 guards.terminal.restore().map_err(anyhow::Error::new)?;
                 return Ok(ExitCode::from(code));
             }
+            submit_decorations(
+                &decorations_worker,
+                &mut decoration_generation,
+                &mut state,
+                &theme,
+            )?;
         }
 
         while let Ok(worker_event) = search.responses.try_recv() {
+            let previous_hunk = viewport_hunk(&state);
             let event = match worker_event {
                 SearchWorkerEvent::Completed {
                     generation,
@@ -332,6 +353,34 @@ fn run_interactive(
                 guards.terminal.restore().map_err(anyhow::Error::new)?;
                 return Ok(ExitCode::from(code));
             }
+            if viewport_hunk(&state) != previous_hunk {
+                submit_decorations(
+                    &decorations_worker,
+                    &mut decoration_generation,
+                    &mut state,
+                    &theme,
+                )?;
+            }
+        }
+
+        while let Ok(response) = decorations_worker.responses().try_recv() {
+            if response.generation != decoration_generation {
+                continue;
+            }
+            let message = match response.result {
+                Ok(result) => {
+                    let warning = result.warning().map(str::to_owned);
+                    decorations = result;
+                    if response.complete {
+                        warning
+                    } else {
+                        Some("highlighting…".to_owned())
+                    }
+                }
+                Err(error) => Some(error.to_string()),
+            };
+            let _ = state.update(StateEvent::BackgroundStatus { message });
+            redraw = true;
         }
 
         let timeout = if redraw {
@@ -342,6 +391,8 @@ fn run_interactive(
         if event::poll(timeout).context("failed to poll terminal events")?
             && let Some(event) = read_terminal_event()?
         {
+            let previous_whitespace = state.whitespace();
+            let previous_hunk = viewport_hunk(&state);
             let effects = state.update(event);
             redraw = true;
             if let Some(code) =
@@ -350,16 +401,57 @@ fn run_interactive(
                 guards.terminal.restore().map_err(anyhow::Error::new)?;
                 return Ok(ExitCode::from(code));
             }
+            if state.whitespace() != previous_whitespace || viewport_hunk(&state) != previous_hunk {
+                submit_decorations(
+                    &decorations_worker,
+                    &mut decoration_generation,
+                    &mut state,
+                    &theme,
+                )?;
+            }
         }
 
         if redraw {
             guards
                 .terminal
-                .draw(|frame| crate::ui::render(frame, &state, &theme))
+                .draw(|frame| crate::ui::render(frame, &state, &theme, &decorations))
                 .context("failed to draw pager")?;
             redraw = false;
         }
     }
+}
+
+fn submit_decorations(
+    worker: &DecorationWorker,
+    generation: &mut u64,
+    state: &mut AppState,
+    theme: &Theme,
+) -> Result<()> {
+    *generation = generation.wrapping_add(1);
+    let request = DecorationRequest {
+        generation: *generation,
+        document: state.document_snapshot(),
+        theme: theme.clone(),
+        whitespace: state.whitespace(),
+        priority_hunk: viewport_hunk(state),
+    };
+    worker
+        .submit_latest(request)
+        .map_err(|_| anyhow!("decoration worker disconnected"))?;
+    let _ = state.update(StateEvent::BackgroundStatus {
+        message: Some("highlighting…".to_owned()),
+    });
+    Ok(())
+}
+
+/// Viewport先頭が属するhunkを返す。Worker requestはこのIDだけを先に計算してpartial resultを
+/// 返すため、長いdocumentでも移動先のsyntax/intraline装飾をfull scanより先に描画できる。
+fn viewport_hunk(state: &AppState) -> Option<HunkId> {
+    state
+        .layout()
+        .rows()
+        .get(state.viewport_top())
+        .and_then(|row| row.hunk_id)
 }
 
 fn read_terminal_event() -> Result<Option<StateEvent>> {
@@ -475,15 +567,141 @@ fn drain_to_eof(reader: &mut ReaderRuntime, parser: &mut GitParser) -> Result<()
     }
 }
 
-fn write_completed_direct(cli: &Cli, document: &Document, width: u16) -> Result<ExitCode> {
-    let layout = layout_document(document, usize::from(width), usize::from(cli.tab_width))?;
-    write_tty_direct(cli, &layout)
+/// `--paging never`はfile entryが閉じるたびに出力し、producerのEOFまでdocument全体を待たない。
+/// Plain textはgutter確定を必要としないため、受信済みlogical lineだけを逐次layoutする。
+fn run_streaming_direct(
+    cli: &Cli,
+    width: u16,
+    parser: &mut GitParser,
+    reader: &mut ReaderRuntime,
+) -> Result<ExitCode> {
+    let theme = Theme::new(cli.theme, detect_color_level(cli.no_color));
+    let stdout = io::stdout();
+    let mut writer = stdout.lock();
+    let mut emitted_lines = 0_usize;
+    let settings = DirectRenderSettings {
+        theme: &theme,
+        width: usize::from(width),
+        tab_width: usize::from(cli.tab_width),
+        whitespace: cli.whitespace,
+    };
+
+    loop {
+        let event = reader
+            .events
+            .recv()
+            .map_err(|_| anyhow!("stdin reader channel disconnected before reporting EOF"))?;
+        let eof = match event {
+            ReaderEvent::Data(bytes) => {
+                let _ = parser.push(&bytes);
+                false
+            }
+            ReaderEvent::Eof => {
+                let _ = parser.finish();
+                true
+            }
+            ReaderEvent::Failed(error) => return Err(anyhow::Error::new(error)),
+        };
+
+        if let Err(error) = emit_direct_prefix(
+            &mut writer,
+            parser.document(),
+            &settings,
+            eof,
+            &mut emitted_lines,
+        ) {
+            if matches!(&error, crate::direct::DirectWriteError::Io(source) if source.kind() == io::ErrorKind::BrokenPipe)
+            {
+                return Ok(ExitCode::SUCCESS);
+            }
+            return Err(
+                anyhow::Error::new(error).context("failed to write streaming direct output")
+            );
+        }
+        if eof {
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
 }
 
-fn write_tty_direct(cli: &Cli, layout: &DocumentLayout) -> Result<ExitCode> {
+struct DirectRenderSettings<'theme> {
+    theme: &'theme Theme,
+    width: usize,
+    tab_width: usize,
+    whitespace: crate::cli::WhitespaceChoice,
+}
+
+fn emit_direct_prefix<W: Write>(
+    writer: &mut W,
+    document: &Document,
+    settings: &DirectRenderSettings<'_>,
+    eof: bool,
+    emitted_lines: &mut usize,
+) -> Result<(), crate::direct::DirectWriteError> {
+    let safe = safe_direct_line_exclusive(document, eof);
+    if safe <= *emitted_lines {
+        return Ok(());
+    }
+
+    if document.files().is_empty() {
+        write_direct_metadata_lines(
+            writer,
+            &document.lines()[*emitted_lines..safe],
+            settings.width,
+            settings.tab_width,
+            settings.theme,
+        )?;
+    } else {
+        let layout = layout_document(document, settings.width, settings.tab_width)?;
+        let decorations = DecorationSet::compute(document, settings.theme, settings.whitespace);
+        write_direct_decorated_range(
+            writer,
+            &layout,
+            document,
+            &decorations,
+            settings.theme,
+            *emitted_lines..safe,
+        )?;
+    }
+    *emitted_lines = safe;
+    Ok(())
+}
+
+fn safe_direct_line_exclusive(document: &Document, eof: bool) -> usize {
+    if eof || document.files().is_empty() {
+        return document.lines().len();
+    }
+
+    let mut safe = line_index(document.files()[0].span.start.get(), document.lines().len());
+    for file in document.files() {
+        safe = safe.max(line_index(file.span.start.get(), document.lines().len()));
+        let Some(end) = file.span.end_exclusive else {
+            break;
+        };
+        safe = line_index(end, document.lines().len());
+    }
+    safe
+}
+
+fn line_index(value: u64, document_len: usize) -> usize {
+    usize::try_from(value)
+        .unwrap_or(document_len)
+        .min(document_len)
+}
+
+fn write_completed_direct(cli: &Cli, document: &Document, width: u16) -> Result<ExitCode> {
+    let layout = layout_document(document, usize::from(width), usize::from(cli.tab_width))?;
     let theme = Theme::new(cli.theme, detect_color_level(cli.no_color));
+    let decorations = DecorationSet::compute(document, &theme, cli.whitespace);
     let mut stdout = io::stdout().lock();
-    match write_direct(&mut stdout, layout, &theme) {
+    match write_direct_decorated_range(
+        &mut stdout,
+        &layout,
+        document,
+        &decorations,
+        &theme,
+        0..document.lines().len(),
+    ) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(ExitCode::SUCCESS),
         Err(error) => Err(error).context("failed to write terminal output"),
@@ -522,6 +740,8 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+    use crate::cli::{ThemeChoice, WhitespaceChoice};
+    use crate::theme::ColorLevel;
 
     #[test]
     fn passthrough_preserves_invalid_bytes_and_newline_state() {
@@ -590,5 +810,58 @@ mod tests {
         assert_eq!(outcome.mode, StartupMode::Direct);
         assert!(outcome.eof);
         assert_eq!(outcome.input_bytes, 6);
+    }
+
+    #[test]
+    fn streaming_direct_emits_plain_lines_but_holds_open_file() {
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let mut parser = GitParser::new();
+        let mut output = Vec::new();
+        let mut emitted = 0;
+        let settings = DirectRenderSettings {
+            theme: &theme,
+            width: 80,
+            tab_width: 4,
+            whitespace: WhitespaceChoice::Ignore,
+        };
+
+        let _ = parser.push(b"preamble\n");
+        emit_direct_prefix(
+            &mut output,
+            parser.document(),
+            &settings,
+            false,
+            &mut emitted,
+        )
+        .unwrap();
+        assert!(String::from_utf8_lossy(&output).contains("preamble"));
+
+        let before_file = output.len();
+        let _ = parser
+            .push(b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+new\n");
+        emit_direct_prefix(
+            &mut output,
+            parser.document(),
+            &settings,
+            false,
+            &mut emitted,
+        )
+        .unwrap();
+        assert_eq!(output.len(), before_file);
+
+        let _ = parser.push(b"diff --git a/b.rs b/b.rs\n");
+        emit_direct_prefix(
+            &mut output,
+            parser.document(),
+            &settings,
+            false,
+            &mut emitted,
+        )
+        .unwrap();
+        let plain = crate::ansi::strip_ansi(&output);
+        let rendered = String::from_utf8_lossy(&plain);
+        assert!(rendered.contains("│-old"));
+        assert!(rendered.contains("│+new"));
+        assert!(!rendered.contains("b/b.rs"));
     }
 }

@@ -154,6 +154,17 @@ cargo test --all-features
 詳細な design contract は [docs/design-ja.md](docs/design-ja.md) にあります。
 README の内容を変更するときは、この file と `README.md` を一緒に更新します。
 
+Release build で大容量入力の経路を動かす場合は、design で定めた acceptance
+stream を pager へ直接生成します。
+
+```sh
+cargo build --release
+scripts/generate-large-fixture.sh 5000000 | target/release/git-ultrapager --paging always
+```
+
+generator は default で1 logical lineあたり約200 byteのpayloadを出力します。
+local で反復するときは、行数とpayload幅を小さい値で指定できます。
+
 ## License
 
 `git-ultrapager` は [MIT License](LICENSE) で提供します。

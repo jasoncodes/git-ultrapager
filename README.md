@@ -160,6 +160,17 @@ cargo test --all-features
 The detailed design contract is in [docs/design-ja.md](docs/design-ja.md) (Japanese).
 When README content changes, update this file and `README-ja.md` together.
 
+To exercise the large-input path with a release build, generate the documented
+acceptance stream directly into the pager:
+
+```sh
+cargo build --release
+scripts/generate-large-fixture.sh 5000000 | target/release/git-ultrapager --paging always
+```
+
+The generator writes about 200 payload bytes per logical line by default. Pass a
+smaller line count and payload width while iterating locally.
+
 ## License
 
 `git-ultrapager` is available under the [MIT License](LICENSE).

@@ -116,14 +116,14 @@ impl SyntaxWorker {
 }
 
 fn syntax_actor(requests: Receiver<SyntaxRequest>, responses: Sender<SyntaxResponse>) {
-    let mut engine =
+    let engine =
         std::panic::catch_unwind(SyntaxEngine::new).unwrap_or(Err(HighlightError::WorkerPanicked));
     while let Ok(request) = requests.recv() {
         let generation = request.generation;
         let request_id = request.request_id;
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             engine
-                .as_mut()
+                .as_ref()
                 .map_err(|error| error.clone())
                 .and_then(|engine| engine.highlight(&request))
         }))
@@ -141,13 +141,13 @@ fn syntax_actor(requests: Receiver<SyntaxRequest>, responses: Sender<SyntaxRespo
     }
 }
 
-struct SyntaxEngine {
+pub(crate) struct SyntaxEngine {
     syntaxes: SyntaxSet,
     themes: ThemeSet,
 }
 
 impl SyntaxEngine {
-    fn new() -> Result<Self, HighlightError> {
+    pub(crate) fn new() -> Result<Self, HighlightError> {
         let syntaxes = SyntaxSet::load_defaults_newlines();
         if syntaxes.find_syntax_by_name("Plain Text").is_none() {
             return Err(HighlightError::MissingPlainText);
@@ -158,18 +158,16 @@ impl SyntaxEngine {
         })
     }
 
-    fn highlight(
-        &mut self,
-        request: &SyntaxRequest,
-    ) -> Result<Vec<HighlightedLine>, HighlightError> {
-        let Some(syntax) = detect_syntax(
-            &self.syntaxes,
-            request.path.as_deref(),
-            request.first_line.as_deref(),
-        ) else {
-            return Ok(vec![HighlightedLine::Plain; request.lines.len()]);
+    pub(crate) fn session<'engine>(
+        &'engine self,
+        path: Option<&str>,
+        first_line: Option<&str>,
+        theme_choice: ThemeChoice,
+    ) -> Result<Option<SyntaxSession<'engine>>, HighlightError> {
+        let Some(syntax) = detect_syntax(&self.syntaxes, path, first_line) else {
+            return Ok(None);
         };
-        let theme_name = match request.theme {
+        let theme_name = match theme_choice {
             ThemeChoice::Dark => "base16-ocean.dark",
             ThemeChoice::Light => "InspiredGitHub",
         };
@@ -178,45 +176,80 @@ impl SyntaxEngine {
             .themes
             .get(theme_name)
             .ok_or(HighlightError::MissingTheme(theme_name))?;
-        let mut highlighter = HighlightLines::new(syntax, theme);
+        Ok(Some(SyntaxSession {
+            syntaxes: &self.syntaxes,
+            syntax,
+            theme,
+            highlighter: HighlightLines::new(syntax, theme),
+        }))
+    }
+
+    fn highlight(&self, request: &SyntaxRequest) -> Result<Vec<HighlightedLine>, HighlightError> {
+        let mut session = self.session(
+            request.path.as_deref(),
+            request.first_line.as_deref(),
+            request.theme,
+        )?;
         let mut output = Vec::with_capacity(request.lines.len());
 
         for line in request.lines.iter() {
-            if line.len() > MAX_SYNTAX_LINE_BYTES {
-                output.push(HighlightedLine::Plain);
-                // Parseしなかったlineがmultiline string/commentを開閉したかは分からない。直前stateを
-                // 継続すると既知でないstateを既知として扱うため、次のlineはhunk先頭と同じstateへ戻す。
-                highlighter = HighlightLines::new(syntax, theme);
-                continue;
-            }
-            // `load_defaults_newlines` のgrammarはline末尾の`\n`でsingle-line contextをpopする。
-            // Modelは改行をlogical lineから分離するため、worker内だけsynthetic newlineを補い、返す
-            // spanはoriginal byte lengthでclipする。
-            let mut line_with_newline = String::with_capacity(line.len() + 1);
-            line_with_newline.push_str(line);
-            line_with_newline.push('\n');
-            let regions = highlighter
-                .highlight_line(&line_with_newline, &self.syntaxes)
-                .map_err(|error| HighlightError::Syntect(error.to_string()))?;
-            let mut offset = 0_usize;
-            let spans = regions
-                .into_iter()
-                .filter_map(|(style, text)| {
-                    let start = offset;
-                    offset += text.len();
-                    let end = offset.min(line.len());
-                    (start < end).then_some(SyntaxSpan {
-                        byte_range: start..end,
-                        foreground: (style.foreground.r, style.foreground.g, style.foreground.b),
-                        bold: style.font_style.contains(FontStyle::BOLD),
-                        italic: style.font_style.contains(FontStyle::ITALIC),
-                        underline: style.font_style.contains(FontStyle::UNDERLINE),
-                    })
-                })
-                .collect();
-            output.push(HighlightedLine::Styled(spans));
+            output.push(match session.as_mut() {
+                Some(session) => session.highlight_line(line)?,
+                None => HighlightedLine::Plain,
+            });
         }
         Ok(output)
+    }
+}
+
+/// 1 file side・1 hunk の連続したparse state。
+///
+/// Decoration計算はold/new用に2つ作り、deletionはoldだけ、additionはnewだけ、contextは両方へ
+/// 順番どおり渡す。Hunkごとに作り直すことで、別hunkの不完全なsyntax stateを持ち越さない。
+pub(crate) struct SyntaxSession<'engine> {
+    syntaxes: &'engine SyntaxSet,
+    syntax: &'engine syntect::parsing::SyntaxReference,
+    theme: &'engine syntect::highlighting::Theme,
+    highlighter: HighlightLines<'engine>,
+}
+
+impl SyntaxSession<'_> {
+    /// Logical source lineを1行進め、original content byteへのspanを返す。
+    pub(crate) fn highlight_line(&mut self, line: &str) -> Result<HighlightedLine, HighlightError> {
+        if line.len() > MAX_SYNTAX_LINE_BYTES {
+            // Parseしなかったlineがmultiline string/commentを開閉したかは分からない。直前stateを
+            // 継続すると既知でないstateを既知として扱うため、次のlineはhunk先頭と同じstateへ戻す。
+            self.highlighter = HighlightLines::new(self.syntax, self.theme);
+            return Ok(HighlightedLine::Plain);
+        }
+
+        // `load_defaults_newlines` のgrammarはline末尾の`\n`でsingle-line contextをpopする。
+        // Modelは改行をlogical lineから分離するため、worker内だけsynthetic newlineを補い、返す
+        // spanはoriginal byte lengthでclipする。
+        let mut line_with_newline = String::with_capacity(line.len() + 1);
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+        let regions = self
+            .highlighter
+            .highlight_line(&line_with_newline, self.syntaxes)
+            .map_err(|error| HighlightError::Syntect(error.to_string()))?;
+        let mut offset = 0_usize;
+        let spans = regions
+            .into_iter()
+            .filter_map(|(style, text)| {
+                let start = offset;
+                offset += text.len();
+                let end = offset.min(line.len());
+                (start < end).then_some(SyntaxSpan {
+                    byte_range: start..end,
+                    foreground: (style.foreground.r, style.foreground.g, style.foreground.b),
+                    bold: style.font_style.contains(FontStyle::BOLD),
+                    italic: style.font_style.contains(FontStyle::ITALIC),
+                    underline: style.font_style.contains(FontStyle::UNDERLINE),
+                })
+            })
+            .collect();
+        Ok(HighlightedLine::Styled(spans))
     }
 }
 
@@ -275,7 +308,7 @@ mod tests {
 
     #[test]
     fn oversized_lines_fall_back_to_plain() {
-        let mut engine = SyntaxEngine::new().unwrap();
+        let engine = SyntaxEngine::new().unwrap();
         let request = SyntaxRequest {
             generation: 1,
             request_id: 1,
@@ -292,7 +325,7 @@ mod tests {
 
     #[test]
     fn oversized_line_resets_unknown_parse_state() {
-        let mut engine = SyntaxEngine::new().unwrap();
+        let engine = SyntaxEngine::new().unwrap();
         let request = SyntaxRequest {
             generation: 1,
             request_id: 1,
@@ -320,7 +353,7 @@ mod tests {
 
     #[test]
     fn synthetic_newline_closes_single_line_context() {
-        let mut engine = SyntaxEngine::new().unwrap();
+        let engine = SyntaxEngine::new().unwrap();
         let request = SyntaxRequest {
             generation: 1,
             request_id: 1,

@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use git_ultrapager::cli::{ThemeChoice, WhitespaceChoice};
+use git_ultrapager::decorations::DecorationSet;
 use git_ultrapager::parser::parse_bytes;
 use git_ultrapager::state::AppState;
 use git_ultrapager::theme::{ColorLevel, Theme};
@@ -63,10 +64,11 @@ fn render_snapshot(
     let document = Arc::new(parse_bytes(UNICODE_DIFF.as_bytes()));
     let state = AppState::new(document, width, height, 4, WhitespaceChoice::Ignore, true);
     let theme = Theme::new(theme_choice, color_level);
+    let decorations = DecorationSet::compute(state.document(), &theme, state.whitespace());
     let backend = TestBackend::new(width, height);
     let mut terminal = Terminal::new(backend).expect("TestBackend の初期化に失敗した");
     terminal
-        .draw(|frame| render(frame, &state, &theme))
+        .draw(|frame| render(frame, &state, &theme, &decorations))
         .expect("cell grid の描画に失敗した");
 
     semantic_grid(terminal.backend().buffer())

@@ -1,9 +1,9 @@
 //! Interactive pager の画面構成と、semantic role から Ratatui widget への変換。
 //!
-//! この module は AppState の immutable snapshot だけを読み、sticky header、本文、status bar、
-//! help/file-list overlay を1 frameへ描く。入力 event、terminal lifecycle、background worker は扱わない。
-//! 検索 span は layout が保持する byte mapping を使い、tab 展開や折り返しをまたぐ一致も sanitized
-//! logical line の offset から対応する visual row へ写す。
+//! この module はAppStateとDecorationSetのimmutable snapshotだけを読み、sticky header、本文、
+//! status bar、help/file-list overlayを1 frameへ描く。入力event、terminal lifecycle、background workerは
+//! 扱わない。Syntax foreground、intraline background、searchの順にstyleを重ね、全spanをlayoutが持つ
+//! byte mappingでtab展開・折り返し後のvisual rowへ写す。
 
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
@@ -16,14 +16,18 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::cli::WhitespaceChoice;
+use crate::decorations::{DecorationSet, LineDecoration};
 use crate::direct::VisualRow;
 use crate::model::{Commit, CommitKind, DocumentLine, FileEntry, LineKind};
-use crate::search::{
-    CompiledSearch, IncrementalQueryStatus, SearchLine, SearchMatch, match_spans_in_line,
-};
+use crate::search::{CompiledSearch, IncrementalQueryStatus, SearchMatch};
 use crate::state::{AppState, FileListState, Mode, SearchInputState, TextInput};
-use crate::text::wrap_hard;
+use crate::text::{MAX_SEARCH_LINE_BYTES, wrap_hard};
 use crate::theme::{SemanticRole, Theme};
+
+/// Weak matchは補助表示であり、current matchのnavigation contractには使わない。1 frameで保持する
+/// range数を固定し、1 cellごとにmatchするpatternでもrendererのallocationを入力長へ比例させない。
+const MAX_WEAK_MATCH_SPANS_PER_FRAME: usize = 16_384;
+const MAX_WEAK_MATCH_LOOKBEHIND_BYTES: usize = 4 * 1024;
 
 const HELP_LINES: [&str; 42] = [
     "git-ultrapager help",
@@ -73,8 +77,9 @@ const HELP_LINES: [&str; 42] = [
 /// 現在の state を frame 全体へ描く。
 ///
 /// 呼び出し側は alternate screen の開始・終了と Terminal::draw を所有する。この関数は frame 外へ
-/// 書き込まず、search/filter input 中だけ Ratatui の software cursor 位置を設定する。
-pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
+/// 書き込まず、search/filter input 中だけ Ratatui の software cursor 位置を設定する。DecorationSetの
+/// whitespace modeがstateと異なる間はstale intralineだけを隠し、mode非依存のsyntaxは表示を続ける。
+pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme, decorations: &DecorationSet) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(theme.style(SemanticRole::Plain)),
@@ -95,7 +100,9 @@ pub fn render(frame: &mut Frame<'_>, state: &AppState, theme: &Theme) {
     let content_area = Rect::new(area.x, area.y, area.width, area.height.saturating_sub(1));
 
     match state.mode() {
-        Mode::Body | Mode::Search(_) => render_body(frame, content_area, state, theme),
+        Mode::Body | Mode::Search(_) => {
+            render_body(frame, content_area, state, theme, decorations);
+        }
         Mode::Help { top } => render_help(frame, content_area, *top, theme),
         Mode::FileList(list) => render_file_list(frame, content_area, state, list, theme),
     }
@@ -113,7 +120,13 @@ fn render_too_small(frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
     );
 }
 
-fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Theme) {
+fn render_body(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &AppState,
+    theme: &Theme,
+    decorations: &DecorationSet,
+) {
     let header_area = Rect::new(area.x, area.y, area.width, 1);
     let body_area = Rect::new(
         area.x,
@@ -129,31 +142,30 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Them
 
     let start = state.viewport_top();
     let rows = state.layout().rows();
+    let visible_end = start
+        .saturating_add(usize::from(body_area.height))
+        .min(rows.len());
+    let visible_rows = rows.get(start..visible_end).unwrap_or_default();
     let compiled = displayed_search(state);
+    let visible_ranges = visible_logical_ranges(visible_rows);
     let mut matches_by_line = HashMap::new();
-    for (screen_row, row) in rows
-        .iter()
-        .skip(start)
-        .take(usize::from(body_area.height))
-        .enumerate()
-    {
+    let mut remaining_weak_matches = MAX_WEAK_MATCH_SPANS_PER_FRAME;
+    for (screen_row, row) in visible_rows.iter().enumerate() {
         let y = body_area.y.saturating_add(screen_row as u16);
         let weak_matches = compiled.map_or(&[][..], |compiled| {
             matches_by_line
                 .entry(row.line_id)
                 .or_insert_with(|| {
-                    state
-                        .document()
-                        .line(row.line_id)
-                        .map(|line| {
-                            match_spans_in_line(
-                                compiled,
-                                usize::try_from(line.id.get()).unwrap_or(usize::MAX),
-                                SearchLine::new(line.id, &line.text),
-                            )
-                            .byte_ranges
-                        })
-                        .unwrap_or_default()
+                    let Some(line) = state.document().line(row.line_id) else {
+                        return Vec::new();
+                    };
+                    let visible = visible_ranges.get(&row.line_id).cloned().unwrap_or(0..0);
+                    weak_matches_in_visible_range(
+                        compiled,
+                        &line.text,
+                        visible,
+                        &mut remaining_weak_matches,
+                    )
                 })
                 .as_slice()
         });
@@ -164,10 +176,74 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Them
                 start + screen_row,
                 weak_matches,
                 theme,
+                decorations,
             )),
             Rect::new(body_area.x, y, body_area.width, 1),
         );
     }
+}
+
+fn visible_logical_ranges(rows: &[VisualRow]) -> HashMap<crate::model::LineId, Range<usize>> {
+    let mut ranges = HashMap::<_, Range<usize>>::new();
+    for row in rows {
+        ranges
+            .entry(row.line_id)
+            .and_modify(|range| {
+                range.start = range.start.min(row.content_range.start);
+                range.end = range.end.max(row.content_range.end);
+            })
+            .or_insert_with(|| row.content_range.clone());
+    }
+    ranges
+}
+
+fn weak_matches_in_visible_range(
+    compiled: &CompiledSearch,
+    text: &str,
+    visible: Range<usize>,
+    remaining: &mut usize,
+) -> Vec<Range<usize>> {
+    if text.len() > MAX_SEARCH_LINE_BYTES || visible.is_empty() || *remaining == 0 {
+        return Vec::new();
+    }
+
+    // Full logical lineの先頭から毎frame走査すると、末尾viewportの`.`でも16 MiB分のmatchを辿る。
+    // Visible直前4 KiBだけをlook-behindとして残し、haystack末尾もvisible endへ切る。Weak layerは
+    // current matchの補助表示なので、それより前から始まる巨大matchは省略してmain threadを守る。
+    let mut scan_start = visible
+        .start
+        .saturating_sub(MAX_WEAK_MATCH_LOOKBEHIND_BYTES);
+    while scan_start > 0 && !text.is_char_boundary(scan_start) {
+        scan_start -= 1;
+    }
+    let mut scan_end = visible.end.min(text.len());
+    while scan_end > 0 && !text.is_char_boundary(scan_end) {
+        scan_end -= 1;
+    }
+    let haystack = &text[..scan_end];
+    let mut cursor = scan_start.min(haystack.len());
+    let mut matches = Vec::new();
+    while cursor <= haystack.len() && matches.len() < *remaining {
+        let Some(found) = compiled.regex().find_at(haystack, cursor) else {
+            break;
+        };
+        if !found.is_empty() && found.end() > visible.start {
+            matches.push(found.range());
+        }
+        if found.is_empty() {
+            let Some(character) = haystack
+                .get(found.end()..)
+                .and_then(|tail| tail.chars().next())
+            else {
+                break;
+            };
+            cursor = found.end().saturating_add(character.len_utf8());
+        } else {
+            cursor = found.end();
+        }
+    }
+    *remaining = remaining.saturating_sub(matches.len());
+    matches
 }
 
 fn sticky_header(state: &AppState, width: usize) -> String {
@@ -249,22 +325,49 @@ fn render_visual_row<'line>(
     row_index: usize,
     weak_matches: &[Range<usize>],
     theme: &Theme,
+    decorations: &DecorationSet,
 ) -> Line<'line> {
     let Some(logical_line) = state.document().line(row.line_id) else {
         return Line::from(Span::styled(row.text.clone(), theme.style(row.role)));
     };
+    if row.text.is_empty()
+        && displayed_current_match(state).is_some_and(|current| {
+            current.line_id == row.line_id
+                && current.is_zero_width()
+                && row_contains_logical_offset(state, row_index, current.byte_range.start)
+        })
+    {
+        // Empty logical lineには既存cellがないためstyleだけでは位置を示せない。検索中だけ1 cellの
+        // markerを描き、NO_COLORでもbold glyphとしてcurrent matchを見失わないようにする。
+        return Line::from(Span::styled("▏", theme.style(SemanticRole::SearchCurrent)));
+    }
 
     let gutter_end = source_content_start(row, logical_line)
         .map(|start| start.saturating_sub(1))
         .unwrap_or(0);
-    let mut overlays = search_overlays(state, row, row_index, logical_line, weak_matches);
-    overlays.sort_by_key(|overlay| (overlay.range.start, overlay.range.end));
+    let line_decoration = decorations.line(row.line_id);
+    let mut syntax = syntax_overlays(row, line_decoration);
+    syntax.sort_by_key(|overlay| (overlay.range.start, overlay.range.end));
+    let mut intraline = if decorations.whitespace() == state.whitespace() {
+        intraline_overlays(row, logical_line, line_decoration)
+    } else {
+        Vec::new()
+    };
+    intraline.sort_by_key(|overlay| (overlay.range.start, overlay.range.end));
+    let search = search_overlays(state, row, row_index, logical_line, weak_matches);
+    let replacements = if decorations.whitespace() == WhitespaceChoice::Show
+        && decorations.whitespace() == state.whitespace()
+    {
+        whitespace_replacements(state, row, row_index, logical_line, line_decoration)
+    } else {
+        HashMap::new()
+    };
 
     let mut boundaries = vec![0, row.text.len(), gutter_end];
-    for overlay in &overlays {
-        boundaries.push(overlay.range.start);
-        boundaries.push(overlay.range.end);
-    }
+    extend_boundaries(&mut boundaries, &syntax);
+    extend_boundaries(&mut boundaries, &intraline);
+    extend_boundaries(&mut boundaries, &search.weak);
+    extend_boundaries(&mut boundaries, &search.current);
     boundaries.retain(|offset| *offset <= row.text.len() && row.text.is_char_boundary(*offset));
     boundaries.sort_unstable();
     boundaries.dedup();
@@ -273,6 +376,10 @@ fn render_visual_row<'line>(
         return Line::from(Span::styled(row.text.clone(), theme.style(row.role)));
     }
 
+    let mut syntax_cursor = 0_usize;
+    let mut intraline_cursor = 0_usize;
+    let mut weak_search_cursor = 0_usize;
+    let mut current_search_cursor = 0_usize;
     let spans = boundaries
         .windows(2)
         .filter_map(|window| {
@@ -285,27 +392,209 @@ fn render_visual_row<'line>(
             } else {
                 row.role
             };
-            let overlay = overlays
-                .iter()
-                .filter(|candidate| {
-                    candidate.range.start <= range.start && range.end <= candidate.range.end
-                })
-                .max_by_key(|candidate| candidate.priority);
-            let style = overlay.map_or_else(
-                || theme.style(base_role),
-                |candidate| theme.style(base_role).patch(theme.style(candidate.role)),
-            );
-            Some(Span::styled(row.text[range].to_owned(), style))
+            let mut style = theme.style(base_role);
+            if let Some(candidate) = covering_overlay(&syntax, &mut syntax_cursor, &range) {
+                style = style.patch(theme.syntax_style(
+                    candidate.foreground,
+                    candidate.bold,
+                    candidate.italic,
+                    candidate.underline,
+                ));
+            }
+            if let Some(candidate) = covering_overlay(&intraline, &mut intraline_cursor, &range) {
+                style = style.patch(theme.style(candidate.role));
+            }
+            if let Some(candidate) = covering_overlay(&search.weak, &mut weak_search_cursor, &range)
+            {
+                style = style.patch(theme.style(candidate.role));
+            }
+            if let Some(candidate) =
+                covering_overlay(&search.current, &mut current_search_cursor, &range)
+            {
+                style = style.patch(theme.style(candidate.role));
+            }
+            Some(Span::styled(
+                decorated_segment(&row.text, range, &replacements),
+                style,
+            ))
         })
         .collect::<Vec<_>>();
     Line::from(spans)
 }
 
 #[derive(Clone, Debug)]
+struct MappedSyntax {
+    range: Range<usize>,
+    foreground: (u8, u8, u8),
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+trait RangedOverlay {
+    fn range(&self) -> &Range<usize>;
+}
+
+impl RangedOverlay for MappedSyntax {
+    fn range(&self) -> &Range<usize> {
+        &self.range
+    }
+}
+
+fn extend_boundaries<T: RangedOverlay>(boundaries: &mut Vec<usize>, overlays: &[T]) {
+    for overlay in overlays {
+        boundaries.push(overlay.range().start);
+        boundaries.push(overlay.range().end);
+    }
+}
+
+fn covering_overlay<'overlay, T: RangedOverlay>(
+    overlays: &'overlay [T],
+    cursor: &mut usize,
+    segment: &Range<usize>,
+) -> Option<&'overlay T> {
+    while overlays
+        .get(*cursor)
+        .is_some_and(|overlay| overlay.range().end <= segment.start)
+    {
+        *cursor += 1;
+    }
+    overlays.get(*cursor).filter(|overlay| {
+        overlay.range().start <= segment.start && segment.end <= overlay.range().end
+    })
+}
+
+fn syntax_overlays(row: &VisualRow, decoration: Option<&LineDecoration>) -> Vec<MappedSyntax> {
+    let Some(decoration) = decoration else {
+        return Vec::new();
+    };
+    let spans = decoration.syntax_spans();
+    let first = spans.partition_point(|span| span.byte_range.end <= row.content_range.start);
+    spans[first..]
+        .iter()
+        .take_while(|span| span.byte_range.start < row.content_range.end)
+        .flat_map(|span| {
+            row.rendered_ranges_for_logical(span.byte_range.clone())
+                .into_iter()
+                .map(|range| MappedSyntax {
+                    range,
+                    foreground: span.foreground,
+                    bold: span.bold,
+                    italic: span.italic,
+                    underline: span.underline,
+                })
+        })
+        .collect()
+}
+
+fn intraline_overlays(
+    row: &VisualRow,
+    line: &DocumentLine,
+    decoration: Option<&LineDecoration>,
+) -> Vec<StyledRange> {
+    let role = match line.kind {
+        LineKind::Deletion => SemanticRole::IntralineRemoved,
+        LineKind::Addition => SemanticRole::IntralineAdded,
+        _ => return Vec::new(),
+    };
+    let Some(decoration) = decoration else {
+        return Vec::new();
+    };
+    let ranges = decoration.intraline_ranges();
+    let first = ranges.partition_point(|range| range.end <= row.content_range.start);
+    ranges[first..]
+        .iter()
+        .take_while(|range| range.start < row.content_range.end)
+        .flat_map(|range| row.rendered_ranges_for_logical(range.clone()))
+        .map(|range| StyledRange { range, role })
+        .collect()
+}
+
+fn whitespace_replacements(
+    state: &AppState,
+    row: &VisualRow,
+    row_index: usize,
+    line: &DocumentLine,
+    decoration: Option<&LineDecoration>,
+) -> HashMap<usize, char> {
+    let mut replacements = HashMap::new();
+    let Some(decoration) = decoration else {
+        return replacements;
+    };
+    let ranges = decoration.intraline_ranges();
+    let first = ranges.partition_point(|range| range.end <= row.content_range.start);
+    for changed in ranges[first..]
+        .iter()
+        .take_while(|range| range.start < row.content_range.end)
+    {
+        let visible =
+            changed.start.max(row.content_range.start)..changed.end.min(row.content_range.end);
+        let Some(text) = line.text.get(visible.clone()) else {
+            continue;
+        };
+        for (relative, character) in text.char_indices() {
+            if !matches!(character, ' ' | '\t') {
+                continue;
+            }
+            let logical = visible.start + relative;
+            let first_visual_row =
+                state.layout().row_for_anchor(line.id, logical) == Some(row_index);
+            for mapped in row.rendered_ranges_for_logical(logical..logical + character.len_utf8()) {
+                for rendered in mapped.clone() {
+                    if row.text.as_bytes().get(rendered) != Some(&b' ') {
+                        continue;
+                    }
+                    let glyph = if character == '\t' && first_visual_row && rendered == mapped.start
+                    {
+                        '→'
+                    } else {
+                        '·'
+                    };
+                    replacements.insert(rendered, glyph);
+                }
+            }
+        }
+    }
+    replacements
+}
+
+fn decorated_segment(
+    text: &str,
+    range: Range<usize>,
+    replacements: &HashMap<usize, char>,
+) -> String {
+    let source = &text[range.clone()];
+    if replacements.is_empty() {
+        return source.to_owned();
+    }
+    let mut output = String::with_capacity(source.len());
+    for (relative, character) in source.char_indices() {
+        output.push(
+            replacements
+                .get(&(range.start + relative))
+                .copied()
+                .unwrap_or(character),
+        );
+    }
+    output
+}
+
+#[derive(Clone, Debug)]
 struct StyledRange {
     range: Range<usize>,
     role: SemanticRole,
-    priority: u8,
+}
+
+impl RangedOverlay for StyledRange {
+    fn range(&self) -> &Range<usize> {
+        &self.range
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct SearchOverlays {
+    weak: Vec<StyledRange>,
+    current: Vec<StyledRange>,
 }
 
 fn search_overlays(
@@ -314,19 +603,19 @@ fn search_overlays(
     row_index: usize,
     line: &DocumentLine,
     weak_matches: &[Range<usize>],
-) -> Vec<StyledRange> {
+) -> SearchOverlays {
     let current = displayed_current_match(state);
-    let mut overlays = Vec::new();
+    let mut overlays = SearchOverlays::default();
 
-    for found in weak_matches {
-        if found.is_empty() {
-            continue;
-        }
+    let first = weak_matches.partition_point(|found| found.end <= row.content_range.start);
+    for found in weak_matches[first..]
+        .iter()
+        .take_while(|found| found.start < row.content_range.end)
+    {
         for mapped in map_logical_range(row, line, found.clone()) {
-            overlays.push(StyledRange {
+            overlays.weak.push(StyledRange {
                 range: mapped,
                 role: SemanticRole::SearchMatch,
-                priority: 1,
             });
         }
     }
@@ -338,22 +627,26 @@ fn search_overlays(
             if row_contains_logical_offset(state, row_index, current.byte_range.start)
                 && let Some(marker) = current_row_marker(row, line)
             {
-                overlays.push(StyledRange {
+                overlays.current.push(StyledRange {
                     range: marker,
                     role: SemanticRole::SearchCurrent,
-                    priority: 3,
                 });
             }
         } else {
             for mapped in map_logical_range(row, line, current.byte_range.clone()) {
-                overlays.push(StyledRange {
+                overlays.current.push(StyledRange {
                     range: mapped,
                     role: SemanticRole::SearchCurrent,
-                    priority: 3,
                 });
             }
         }
     }
+    overlays
+        .weak
+        .sort_by_key(|overlay| (overlay.range.start, overlay.range.end));
+    overlays
+        .current
+        .sort_by_key(|overlay| (overlay.range.start, overlay.range.end));
     overlays
 }
 
@@ -629,7 +922,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Th
         Mode::Search(search) => render_search_prompt(frame, area, state, search, theme),
         Mode::FileList(list) if list.filter.is_some() => {
             if let Some(filter) = list.filter.as_ref() {
-                let suffix = status_suffix(state.status());
+                let suffix = status_suffix(&combined_status(state));
                 render_input_prompt(frame, area, "/", filter, &suffix, theme);
             }
         }
@@ -637,7 +930,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Th
             Paragraph::new(fit_end(
                 &append_status(
                     "Tab/Esc close  / filter  Enter jump  j/k select",
-                    state.status(),
+                    &combined_status(state),
                 ),
                 width,
             ))
@@ -646,7 +939,7 @@ fn render_status(frame: &mut Frame<'_>, area: Rect, state: &AppState, theme: &Th
         ),
         Mode::Help { .. } => frame.render_widget(
             Paragraph::new(fit_end(
-                &append_status("Esc/q/h close  j/k scroll", state.status()),
+                &append_status("Esc/q/h close  j/k scroll", &combined_status(state)),
                 width,
             ))
             .style(theme.style(SemanticRole::Status)),
@@ -678,7 +971,11 @@ fn render_search_prompt(
             IncrementalQueryStatus::Invalid(error) => Some(format!("  regex: {error}")),
             IncrementalQueryStatus::Empty | IncrementalQueryStatus::Valid => None,
         });
-    let suffix = regex_error.unwrap_or_else(|| status_suffix(state.status()));
+    let status = combined_status(state);
+    let suffix = regex_error.map_or_else(
+        || status_suffix(&status),
+        |error| status_suffix(&append_status(&error, &status)),
+    );
     render_input_prompt(frame, area, prefix, &search.input, &suffix, theme);
 }
 
@@ -695,6 +992,14 @@ fn append_status(base: &str, status: &str) -> String {
         base.to_owned()
     } else {
         format!("{base}  {status}")
+    }
+}
+
+fn combined_status(state: &AppState) -> String {
+    match (state.status().is_empty(), state.background_status()) {
+        (true, Some(background)) => background.to_owned(),
+        (false, Some(background)) => format!("{}  {background}", state.status()),
+        (_, None) => state.status().to_owned(),
     }
 }
 
@@ -821,6 +1126,7 @@ fn body_status(state: &AppState) -> String {
     parts.extend(fallback.map(str::to_owned));
     parts.extend(skipped);
     parts.extend(current);
+    parts.extend(state.background_status().map(str::to_owned));
     if !state.status().is_empty() {
         parts.push(state.status().to_owned());
     }
@@ -930,12 +1236,16 @@ fn display_width(text: &str) -> usize {
 mod tests {
     use std::sync::Arc;
 
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
     use super::*;
     use crate::cli::ThemeChoice;
+    use crate::decorations::DecorationSet;
     use crate::parser::parse_bytes;
+    use crate::search::compile_smart_case;
+    use crate::state::{Effect, Event};
     use crate::theme::ColorLevel;
 
     fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
@@ -950,6 +1260,27 @@ mod tests {
             .join("\n")
     }
 
+    fn apply_search_preview(state: &mut AppState, pattern: &str) {
+        state.update(Event::Key(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE,
+        )));
+        let effects = state.update(Event::Paste(pattern.to_owned()));
+        let task = effects
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::Search(task) => Some(task),
+                _ => None,
+            })
+            .expect("search preview task");
+        let result = state.execute_search_task(&task);
+        state.update(Event::SearchCompleted {
+            generation: task.generation,
+            result,
+            preview: true,
+        });
+    }
+
     #[test]
     fn body_renders_sticky_file_and_dual_gutter() {
         let document = parse_bytes(
@@ -957,15 +1288,101 @@ mod tests {
         );
         let state = AppState::new(Arc::new(document), 60, 8, 4, WhitespaceChoice::Ignore, true);
         let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore);
         let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
         terminal
-            .draw(|frame| render(frame, &state, &theme))
+            .draw(|frame| render(frame, &state, &theme, &decorations))
             .unwrap();
         let screen = buffer_text(&terminal);
         assert!(screen.contains("src/main.rs"), "{screen}");
         assert!(screen.contains("10     │-old"), "{screen}");
         assert!(screen.contains("10 │+new"), "{screen}");
         assert!(screen.contains("row 1/"), "{screen}");
+    }
+
+    #[test]
+    fn show_whitespace_renders_changed_tab_cells() {
+        let document = parse_bytes(
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-\tfoo\n+    foo\n",
+        );
+        let state = AppState::new(Arc::new(document), 60, 8, 4, WhitespaceChoice::Show, true);
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let decorations = DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Show);
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &decorations))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains("-→···foo"), "{screen}");
+        assert!(screen.contains("+····foo"), "{screen}");
+    }
+
+    #[test]
+    fn weak_matches_keep_only_visible_non_empty_ranges_with_a_frame_cap() {
+        let dense = compile_smart_case(".").unwrap();
+        let text = "x".repeat(1_000);
+        let mut remaining = 3;
+        let matches = weak_matches_in_visible_range(&dense, &text, 500..520, &mut remaining);
+        assert_eq!(matches, vec![500..501, 501..502, 502..503]);
+        assert_eq!(remaining, 0);
+
+        let crossing = compile_smart_case("x+").unwrap();
+        let mut remaining = 3;
+        assert_eq!(
+            weak_matches_in_visible_range(&crossing, &text, 500..520, &mut remaining),
+            vec![0..520]
+        );
+
+        let zero_width = compile_smart_case("").unwrap();
+        let mut remaining = 3;
+        assert!(
+            weak_matches_in_visible_range(&zero_width, &text, 500..520, &mut remaining).is_empty()
+        );
+        assert_eq!(remaining, 3);
+
+        let large = "x".repeat(100_000);
+        let mut remaining = 2;
+        assert_eq!(
+            weak_matches_in_visible_range(&dense, &large, 90_000..90_020, &mut remaining),
+            vec![90_000..90_001, 90_001..90_002]
+        );
+    }
+
+    #[test]
+    fn current_search_style_wins_over_syntax_and_intraline_layers() {
+        let document = parse_bytes(
+            b"diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let old = 1;\n+let new = 2;\n",
+        );
+        let mut state = AppState::new(Arc::new(document), 60, 8, 4, WhitespaceChoice::Ignore, true);
+        apply_search_preview(&mut state, "new");
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor);
+        let decorations =
+            DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore);
+        let mut terminal = Terminal::new(TestBackend::new(60, 8)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &decorations))
+            .unwrap();
+        let expected = theme.style(SemanticRole::SearchCurrent);
+        assert!(terminal.backend().buffer().content.iter().any(|cell| {
+            cell.symbol() == "n"
+                && cell.fg == expected.fg.unwrap()
+                && cell.bg == expected.bg.unwrap()
+        }));
+    }
+
+    #[test]
+    fn zero_width_match_on_empty_plain_line_gets_a_visible_marker() {
+        let document = parse_bytes(b"\n");
+        let mut state = AppState::new(Arc::new(document), 20, 6, 4, WhitespaceChoice::Ignore, true);
+        apply_search_preview(&mut state, "^$");
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &DecorationSet::default()))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+        assert!(screen.contains('▏'), "{screen}");
     }
 
     #[test]

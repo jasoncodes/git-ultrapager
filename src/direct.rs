@@ -13,6 +13,7 @@ use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
+use crate::decorations::{DecorationSet, LineDecoration};
 use crate::model::{CommitId, Document, DocumentLine, FileId, HunkId, LineId, LineKind};
 use crate::text::wrap_hard;
 use crate::theme::{SemanticRole, Theme};
@@ -453,12 +454,241 @@ pub fn write_direct<W: Write>(
     layout: &DocumentLayout,
     theme: &Theme,
 ) -> io::Result<()> {
-    for row in layout.rows() {
+    write_direct_rows(writer, layout.rows(), theme)
+}
+
+/// 選択済みvisual rowだけをTTYへ順に書く。Streaming direct modeはclosed fileまでのrowを渡し、
+/// open fileのgutter/countが確定する前に出力しない。
+pub fn write_direct_rows<'row, W, I>(writer: &mut W, rows: I, theme: &Theme) -> io::Result<()>
+where
+    W: Write,
+    I: IntoIterator<Item = &'row VisualRow>,
+{
+    for row in rows {
         write_style(writer, theme.style(row.role))?;
         writer.write_all(row.text.as_bytes())?;
         writer.write_all(b"\x1b[0m\n")?;
     }
     writer.flush()
+}
+
+/// Syntax・intralineを合成し、指定logical-line範囲のvisual rowだけをTTYへ書く。
+///
+/// Precedenceはinteractive rendererと同じく、diff構造、syntax foreground、intraline backgroundの
+/// 順とする。Searchはinteractive stateだけのためdirect outputへは含めない。
+pub fn write_direct_decorated_range<W: Write>(
+    writer: &mut W,
+    layout: &DocumentLayout,
+    document: &Document,
+    decorations: &DecorationSet,
+    theme: &Theme,
+    line_range: Range<usize>,
+) -> io::Result<()> {
+    for (row_index, row) in layout.rows().iter().enumerate() {
+        let Ok(line_index) = usize::try_from(row.line_id.get()) else {
+            continue;
+        };
+        if !line_range.contains(&line_index) {
+            continue;
+        }
+        write_decorated_row(writer, layout, document, decorations, theme, row_index, row)?;
+    }
+    writer.flush()
+}
+
+fn write_decorated_row<W: Write>(
+    writer: &mut W,
+    layout: &DocumentLayout,
+    document: &Document,
+    decorations: &DecorationSet,
+    theme: &Theme,
+    row_index: usize,
+    row: &VisualRow,
+) -> io::Result<()> {
+    let Some(line) = document.line(row.line_id) else {
+        write_style(writer, theme.style(row.role))?;
+        writer.write_all(row.text.as_bytes())?;
+        return writer.write_all(b"\x1b[0m\n");
+    };
+    let decoration = decorations.line(row.line_id);
+    let syntax = direct_syntax_ranges(row, decoration);
+    let intraline = direct_intraline_ranges(row, line, decoration);
+    let replacements =
+        direct_whitespace_replacements(layout, row, row_index, line, decoration, decorations);
+    let gutter_end = if is_source_line(line.kind) {
+        row.rendered_content_range.start.saturating_sub(1)
+    } else {
+        0
+    };
+    let mut boundaries = vec![0, row.text.len(), gutter_end];
+    for (range, _) in &syntax {
+        boundaries.extend([range.start, range.end]);
+    }
+    for range in &intraline {
+        boundaries.extend([range.start, range.end]);
+    }
+    boundaries.retain(|offset| *offset <= row.text.len() && row.text.is_char_boundary(*offset));
+    boundaries.sort_unstable();
+    boundaries.dedup();
+
+    for pair in boundaries.windows(2) {
+        let range = pair[0]..pair[1];
+        if range.is_empty() {
+            continue;
+        }
+        let base_role = if range.start < gutter_end {
+            SemanticRole::LineNumber
+        } else {
+            row.role
+        };
+        let mut style = theme.style(base_role);
+        if let Some((_, span)) = syntax
+            .iter()
+            .find(|(candidate, _)| candidate.start <= range.start && range.end <= candidate.end)
+        {
+            style = style.patch(theme.syntax_style(
+                span.foreground,
+                span.bold,
+                span.italic,
+                span.underline,
+            ));
+        }
+        if intraline
+            .iter()
+            .any(|candidate| candidate.start <= range.start && range.end <= candidate.end)
+        {
+            let role = match line.kind {
+                LineKind::Deletion => SemanticRole::IntralineRemoved,
+                LineKind::Addition => SemanticRole::IntralineAdded,
+                _ => row.role,
+            };
+            style = style.patch(theme.style(role));
+        }
+        write_style(writer, style)?;
+        let rendered = replace_direct_whitespace(&row.text, range, &replacements);
+        writer.write_all(rendered.as_bytes())?;
+    }
+    writer.write_all(b"\x1b[0m\n")
+}
+
+fn direct_syntax_ranges<'decoration>(
+    row: &VisualRow,
+    decoration: Option<&'decoration LineDecoration>,
+) -> Vec<(Range<usize>, &'decoration crate::highlight::SyntaxSpan)> {
+    decoration
+        .into_iter()
+        .flat_map(LineDecoration::syntax_spans)
+        .flat_map(|span| {
+            row.rendered_ranges_for_logical(span.byte_range.clone())
+                .into_iter()
+                .map(move |range| (range, span))
+        })
+        .collect()
+}
+
+fn direct_intraline_ranges(
+    row: &VisualRow,
+    line: &DocumentLine,
+    decoration: Option<&LineDecoration>,
+) -> Vec<Range<usize>> {
+    if !matches!(line.kind, LineKind::Deletion | LineKind::Addition) {
+        return Vec::new();
+    }
+    decoration
+        .into_iter()
+        .flat_map(LineDecoration::intraline_ranges)
+        .flat_map(|range| row.rendered_ranges_for_logical(range.clone()))
+        .collect()
+}
+
+fn direct_whitespace_replacements(
+    layout: &DocumentLayout,
+    row: &VisualRow,
+    row_index: usize,
+    line: &DocumentLine,
+    decoration: Option<&LineDecoration>,
+    decorations: &DecorationSet,
+) -> HashMap<usize, char> {
+    let mut replacements = HashMap::new();
+    if decorations.whitespace() != crate::cli::WhitespaceChoice::Show {
+        return replacements;
+    }
+    let Some(decoration) = decoration else {
+        return replacements;
+    };
+    for changed in decoration.intraline_ranges() {
+        let Some(text) = line.text.get(changed.clone()) else {
+            continue;
+        };
+        for (relative, character) in text.char_indices() {
+            if !matches!(character, ' ' | '\t') {
+                continue;
+            }
+            let logical = changed.start + relative;
+            let first_row = layout.row_for_anchor(line.id, logical) == Some(row_index);
+            for mapped in row.rendered_ranges_for_logical(logical..logical + character.len_utf8()) {
+                for rendered in mapped.clone() {
+                    if row.text.as_bytes().get(rendered) != Some(&b' ') {
+                        continue;
+                    }
+                    let glyph = if character == '\t' && first_row && rendered == mapped.start {
+                        '→'
+                    } else {
+                        '·'
+                    };
+                    replacements.insert(rendered, glyph);
+                }
+            }
+        }
+    }
+    replacements
+}
+
+fn replace_direct_whitespace(
+    text: &str,
+    range: Range<usize>,
+    replacements: &HashMap<usize, char>,
+) -> String {
+    let source = &text[range.clone()];
+    if replacements.is_empty() {
+        return source.to_owned();
+    }
+    let mut output = String::with_capacity(source.len());
+    for (relative, character) in source.char_indices() {
+        output.push(
+            replacements
+                .get(&(range.start + relative))
+                .copied()
+                .unwrap_or(character),
+        );
+    }
+    output
+}
+
+/// File grammarへ入る前のplain/commit metadata lineを、既出document全体のreflowなしで直接書く。
+/// Source lineはfile entry単位のgutter確定が必要なので、このAPIへ渡さない。
+pub fn write_direct_metadata_lines<W: Write>(
+    writer: &mut W,
+    lines: &[DocumentLine],
+    width: usize,
+    tab_width: usize,
+    theme: &Theme,
+) -> Result<(), DirectWriteError> {
+    let mut rows = Vec::new();
+    for line in lines {
+        append_metadata_rows(&mut rows, line, width, tab_width)?;
+    }
+    write_direct_rows(writer, &rows, theme)?;
+    Ok(())
+}
+
+/// Streaming direct layoutまたは出力のfailure。
+#[derive(Debug, Error)]
+pub enum DirectWriteError {
+    #[error(transparent)]
+    Layout(#[from] LayoutError),
+    #[error(transparent)]
+    Io(#[from] io::Error),
 }
 
 fn write_style<W: Write>(writer: &mut W, style: Style) -> io::Result<()> {
@@ -534,6 +764,8 @@ fn ansi16_code(color: Color, background: bool) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::WhitespaceChoice;
+    use crate::decorations::DecorationSet;
     use crate::parser::parse_bytes;
     use crate::theme::ColorLevel;
 
@@ -615,5 +847,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8(output).unwrap(), "\x1b[0mhello\x1b[0m\n");
+    }
+
+    #[test]
+    fn decorated_direct_output_visualizes_changed_whitespace() {
+        let document = parse_bytes(
+            b"diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-\tfoo\n+    foo\n",
+        );
+        let layout = layout_document(&document, 60, 4).unwrap();
+        let theme = Theme::new(crate::cli::ThemeChoice::Dark, ColorLevel::None);
+        let decorations = DecorationSet::compute(&document, &theme, WhitespaceChoice::Show);
+        let mut output = Vec::new();
+        write_direct_decorated_range(
+            &mut output,
+            &layout,
+            &document,
+            &decorations,
+            &theme,
+            0..document.lines().len(),
+        )
+        .unwrap();
+        let plain = crate::ansi::strip_ansi(&output);
+        let rendered = String::from_utf8(plain).unwrap();
+        assert!(rendered.contains("-→···foo"), "{rendered}");
+        assert!(rendered.contains("+····foo"), "{rendered}");
     }
 }

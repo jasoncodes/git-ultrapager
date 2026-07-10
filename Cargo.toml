@@ -12,7 +12,7 @@ publish = false
 anyhow = "1.0"
 clap = { version = "4.6", features = ["derive"] }
 crossbeam-channel = "0.5"
-crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "derive-more", "events"] }
+crossterm = { version = "0.29", default-features = false, features = ["bracketed-paste", "derive-more", "events", "use-dev-tty"] }
 lru = "0.18"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29", "layout-cache"] }
 regex = "1.12"

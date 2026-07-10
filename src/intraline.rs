@@ -56,6 +56,21 @@ pub fn compute(
     added: &[String],
     whitespace: WhitespaceChoice,
 ) -> IntralineResult {
+    let removed = removed.iter().map(String::as_str).collect::<Vec<_>>();
+    let added = added.iter().map(String::as_str).collect::<Vec<_>>();
+    compute_refs(&removed, &added, whitespace)
+}
+
+/// Borrowした削除・追加lineをcopyせず対応付け、changed byte spanを返す。
+///
+/// Document snapshotを処理するworkerはraw textを所有し直さず、このAPIへ`DocumentLine::content()`を
+/// 渡す。返すrangeは各入力`str`のUTF-8 byte offsetで、所有権には依存しない。
+#[must_use]
+pub fn compute_refs(
+    removed: &[&str],
+    added: &[&str],
+    whitespace: WhitespaceChoice,
+) -> IntralineResult {
     if removed.len().saturating_add(added.len()) > MAX_CHANGED_LINES {
         return IntralineResult::Skipped(SkipReason::TooManyLines);
     }
@@ -103,8 +118,8 @@ pub fn compute(
                     pairs.push(pair_lines(
                         old_index + delta,
                         new_index + delta,
-                        &removed[old_index + delta],
-                        &added[new_index + delta],
+                        removed[old_index + delta],
+                        added[new_index + delta],
                         whitespace,
                     ));
                 }
@@ -119,8 +134,8 @@ pub fn compute(
                     pairs.push(pair_lines(
                         old_index + delta,
                         new_index + delta,
-                        &removed[old_index + delta],
-                        &added[new_index + delta],
+                        removed[old_index + delta],
+                        added[new_index + delta],
                         whitespace,
                     ));
                 }

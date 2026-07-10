@@ -10,6 +10,7 @@
 pub mod ansi;
 pub mod app;
 pub mod cli;
+pub mod decorations;
 pub mod direct;
 pub mod highlight;
 pub mod input;

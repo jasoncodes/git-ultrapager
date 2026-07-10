@@ -56,6 +56,18 @@ impl Theme {
         Self { choice, level }
     }
 
+    /// Syntax grammar選択に使うbuilt-in theme名を返す。
+    #[must_use]
+    pub const fn choice(&self) -> ThemeChoice {
+        self.choice
+    }
+
+    /// 現在のterminal color capabilityを返す。
+    #[must_use]
+    pub const fn color_level(&self) -> ColorLevel {
+        self.level
+    }
+
     /// Semantic role を terminal style へ変換する。
     #[must_use]
     pub fn style(&self, role: SemanticRole) -> Style {
@@ -73,6 +85,36 @@ impl Theme {
             style = style.bg(self.map_color(color));
         }
         style
+    }
+
+    /// Syntectが返したRGB foregroundとfont属性をterminal capabilityへ変換する。
+    ///
+    /// `NO_COLOR`ではsyntax由来のforegroundと属性を両方捨てる。Diff markerやselectionの属性は
+    /// [`Self::style`]が別layerとして付けるため、この戻り値へ構造styleを混ぜない。
+    #[must_use]
+    pub fn syntax_style(
+        &self,
+        foreground: (u8, u8, u8),
+        bold: bool,
+        italic: bool,
+        underline: bool,
+    ) -> Style {
+        if self.level == ColorLevel::None {
+            return Style::default();
+        }
+        let mut modifiers = Modifier::empty();
+        if bold {
+            modifiers.insert(Modifier::BOLD);
+        }
+        if italic {
+            modifiers.insert(Modifier::ITALIC);
+        }
+        if underline {
+            modifiers.insert(Modifier::UNDERLINED);
+        }
+        Style::default()
+            .fg(self.map_color(Rgb(foreground.0, foreground.1, foreground.2)))
+            .add_modifier(modifiers)
     }
 
     fn map_color(&self, rgb: Rgb) -> Color {
@@ -383,5 +425,26 @@ mod tests {
             classify_color_level(false, true, Some("truecolor"), Some("xterm-direct")),
             ColorLevel::None
         );
+    }
+
+    #[test]
+    fn syntax_rgb_respects_terminal_capability_and_no_color() {
+        let true_color = Theme::new(ThemeChoice::Dark, ColorLevel::TrueColor).syntax_style(
+            (12, 34, 56),
+            true,
+            false,
+            true,
+        );
+        assert_eq!(true_color.fg, Some(Color::Rgb(12, 34, 56)));
+        assert!(true_color.add_modifier.contains(Modifier::BOLD));
+        assert!(true_color.add_modifier.contains(Modifier::UNDERLINED));
+
+        let colorless = Theme::new(ThemeChoice::Dark, ColorLevel::None).syntax_style(
+            (12, 34, 56),
+            true,
+            true,
+            true,
+        );
+        assert_eq!(colorless, Style::default());
     }
 }

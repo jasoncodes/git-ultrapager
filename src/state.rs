@@ -44,6 +44,9 @@ pub enum Event {
     WorkerFailed {
         message: String,
     },
+    BackgroundStatus {
+        message: Option<String>,
+    },
 }
 
 /// State updateがmain loopへ要求する副作用。
@@ -179,6 +182,7 @@ pub struct AppState {
     pending_line: Option<usize>,
     search: SearchSession<LineId>,
     status: String,
+    background_status: Option<String>,
     // 幅不足で layout を作れない間も、最後に見えていた論理位置を次の resize まで保持する。
     // 空 layout からは anchor を再構築できないため、viewport index だけでは復帰できない。
     deferred_layout_anchor: Option<(LineId, usize)>,
@@ -215,6 +219,7 @@ impl AppState {
             pending_line: None,
             search: SearchSession::default(),
             status: String::new(),
+            background_status: None,
             deferred_layout_anchor: None,
         }
     }
@@ -281,6 +286,11 @@ impl AppState {
     }
 
     #[must_use]
+    pub fn background_status(&self) -> Option<&str> {
+        self.background_status.as_deref()
+    }
+
+    #[must_use]
     pub const fn search(&self) -> &SearchSession<LineId> {
         &self.search
     }
@@ -307,6 +317,10 @@ impl AppState {
             } => self.apply_search_result(generation, result, preview),
             Event::WorkerFailed { message } => {
                 self.status = message;
+                Vec::new()
+            }
+            Event::BackgroundStatus { message } => {
+                self.background_status = message;
                 Vec::new()
             }
         };
