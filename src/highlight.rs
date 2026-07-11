@@ -7,6 +7,7 @@
 //! derived-data partitionには含めない。Requestごとのparse state、synthetic line、region/span Vecだけを
 //! `DecorationWorkspace`へ計上する。
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::mem::size_of;
 use std::ops::Range;
@@ -18,7 +19,8 @@ use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{FontStyle, Style, ThemeSet};
 use syntect::parsing::{
-    ParseState, Regex as SyntaxRegex, Scope, ScopeStack, SyntaxReference, SyntaxSet,
+    ParseState, Regex as SyntaxRegex, Region as SyntaxRegion, Scope, ScopeStack, SyntaxReference,
+    SyntaxSet,
 };
 use thiserror::Error;
 
@@ -201,29 +203,94 @@ struct ContinuationCandidate {
     exit_patterns: Vec<SyntaxRegex>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ExitEvidence {
+    start: usize,
+    consumed: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContinuationScore {
+    convergence_line: usize,
+    exit: ExitEvidence,
+}
+
+impl ContinuationScore {
+    /// 長いdelimiterを先に選び、同じ消費長なら早く通常stateへ戻る候補を選ぶ。
+    /// 合流位置も同じ場合だけ、delimiterが行内の早い位置にある候補を優先する。
+    fn strength_cmp(self, other: Self) -> Ordering {
+        self.exit
+            .consumed
+            .cmp(&other.exit.consumed)
+            .then_with(|| other.convergence_line.cmp(&self.convergence_line))
+            .then_with(|| other.exit.start.cmp(&self.exit.start))
+    }
+}
+
+impl ExitEvidence {
+    /// 同じ行で複数contextが閉じる場合は、delimiterを長く消費するregexを強い証拠とする。
+    /// 消費長も同じなら早い位置のmatchを選び、別delimiter内のsuffixだけに一致した候補を落とす。
+    fn strength_cmp(self, other: Self) -> Ordering {
+        self.consumed
+            .cmp(&other.consumed)
+            .then_with(|| other.start.cmp(&self.start))
+    }
+}
+
 impl ContinuationCandidate {
-    fn last_exit_line(&self, lines: &[String], line_with_newline: &mut String) -> Option<usize> {
+    fn exit_evidence(
+        &self,
+        line: &str,
+        line_with_newline: &mut String,
+        region: &mut SyntaxRegion,
+    ) -> Option<ExitEvidence> {
+        line_with_newline.clear();
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+        let mut strongest = None;
+        for pattern in &self.exit_patterns {
+            if pattern.search(line_with_newline, 0, line_with_newline.len(), Some(region))
+                && let Some((start, end)) = region.pos(0)
+            {
+                let evidence = ExitEvidence {
+                    start,
+                    consumed: end.saturating_sub(start),
+                };
+                if strongest
+                    .is_none_or(|current| evidence.strength_cmp(current) == Ordering::Greater)
+                {
+                    strongest = Some(evidence);
+                }
+            }
+        }
+        strongest
+    }
+
+    fn last_exit_line(
+        &self,
+        lines: &[String],
+        line_with_newline: &mut String,
+        region: &mut SyntaxRegion,
+    ) -> Option<usize> {
         if self.exit_patterns.is_empty() {
             return None;
         }
-        let mut matches_exit = |line: &str| {
-            line_with_newline.clear();
-            line_with_newline.push_str(line);
-            line_with_newline.push('\n');
-            self.exit_patterns
-                .iter()
-                .any(|pattern| pattern.search(line_with_newline, 0, line_with_newline.len(), None))
-        };
         let (first, remaining) = lines.split_first()?;
         // 先頭行でexit regexが成立する候補は、missing openerの継続より通常の一時contextである
         // 可能性が高い。後続行だけにcloserがある候補へ絞ると、1行目だけで戻る候補をparse前に除ける。
-        if matches_exit(first) {
+        if self
+            .exit_evidence(first, line_with_newline, region)
+            .is_some()
+        {
             return None;
         }
         remaining
             .iter()
             .enumerate()
-            .filter_map(|(index, line)| matches_exit(line).then_some(index + 1))
+            .filter_map(|(index, line)| {
+                self.exit_evidence(line, line_with_newline, region)
+                    .map(|_| index + 1)
+            })
             .last()
     }
 }
@@ -312,8 +379,9 @@ impl SyntaxEngine {
 
     /// Hunk先頭から読めるsource lineだけを使い、欠けたprefixで継続中だったgrammar contextを選ぶ。
     ///
-    /// 候補は改行後も残り、prefix内で通常stateへ合流するcontextに限る。複数候補が異なるspanを
-    /// 返す場合は入力だけでは一意に決められないため、通常stateのsessionを返す。
+    /// 候補は改行後も残り、prefix内で通常stateへ合流するcontextに限る。終了regexが消費する
+    /// delimiter長、合流位置の順で候補を絞り、同じ強さの候補が異なるspanを返す場合は入力だけでは
+    /// 一意に決められないため、通常stateのsessionを返す。
     pub(crate) fn session_with_inferred_continuation<'engine>(
         &'engine self,
         path: Option<&str>,
@@ -377,7 +445,14 @@ impl SyntaxEngine {
             .ok()?;
         let candidate_entry_bytes =
             size_of::<(&ContinuationCandidate, usize)>().checked_add(size_of::<&str>())?;
-        let candidate_workspace_bytes = candidates.len().checked_mul(candidate_entry_bytes)?;
+        // `SyntaxRegion::new`はOnigurumaのcapture 8個分を確保する。候補Vec 2本と合わせて
+        // request固有allocationを生成前にDecorationWorkspaceへ計上する。
+        let exit_region_bytes = size_of::<SyntaxRegion>()
+            .checked_add(8_usize.checked_mul(2)?.checked_mul(size_of::<i32>())?)?;
+        let candidate_workspace_bytes = candidates
+            .len()
+            .checked_mul(candidate_entry_bytes)?
+            .checked_add(exit_region_bytes)?;
         let _candidate_workspace_lease = ledger
             .reserve(
                 DerivedMemoryPool::DecorationWorkspace,
@@ -385,14 +460,15 @@ impl SyntaxEngine {
             )
             .ok()?;
         let mut filter_line = String::with_capacity(filter_line_bytes);
+        let mut exit_region = SyntaxRegion::new();
         let mut eligible_candidates = Vec::with_capacity(candidates.len());
         eligible_candidates.extend(candidates.iter().filter_map(|candidate| {
             candidate
-                .last_exit_line(lines, &mut filter_line)
+                .last_exit_line(lines, &mut filter_line, &mut exit_region)
                 .map(|last_exit| (candidate, last_exit))
         }));
-        let mut earliest_line = None;
-        let mut earliest_markers = Vec::with_capacity(candidates.len());
+        let mut best_score = None;
+        let mut selected_markers = Vec::with_capacity(candidates.len());
         if eligible_candidates.is_empty() {
             return None;
         }
@@ -453,22 +529,33 @@ impl SyntaxEngine {
             if convergence_line == 0 {
                 continue;
             }
-            match earliest_line {
-                Some(current) if convergence_line > current => {}
-                Some(current) if convergence_line == current => {
-                    earliest_markers.push(candidate.marker.as_str());
+            let Some(exit_evidence) = candidate.exit_evidence(
+                &lines[convergence_line],
+                &mut filter_line,
+                &mut exit_region,
+            ) else {
+                continue;
+            };
+            let score = ContinuationScore {
+                convergence_line,
+                exit: exit_evidence,
+            };
+            match best_score.map(|current| score.strength_cmp(current)) {
+                Some(Ordering::Less) => {}
+                Some(Ordering::Equal) => {
+                    selected_markers.push(candidate.marker.as_str());
                 }
-                _ => {
-                    earliest_line = Some(convergence_line);
-                    earliest_markers.clear();
-                    earliest_markers.push(candidate.marker.as_str());
+                Some(Ordering::Greater) | None => {
+                    best_score = Some(score);
+                    selected_markers.clear();
+                    selected_markers.push(candidate.marker.as_str());
                 }
             }
         }
 
-        let convergence_line = earliest_line?;
-        let first_marker = *earliest_markers.first()?;
-        if earliest_markers.len() == 1 {
+        let convergence_line = best_score?.convergence_line;
+        let first_marker = *selected_markers.first()?;
+        if selected_markers.len() == 1 {
             return Some(first_marker.to_owned());
         }
 
@@ -486,7 +573,7 @@ impl SyntaxEngine {
             &lines[..=convergence_line],
             ledger,
         )?;
-        for marker in earliest_markers.into_iter().skip(1) {
+        for marker in selected_markers.into_iter().skip(1) {
             let actual = self.inference_highlight_output(
                 syntax,
                 theme,

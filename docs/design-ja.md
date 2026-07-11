@@ -218,10 +218,11 @@ path の拡張子と既知 file name から syntax を選ぶ。
 削除側と追加側は別の parse state を持ち、hunk 内で継続し、hunk 境界で reset する。
 両 state が diverge した context 行は new side の style、deleted file では old side を使う。
 
-Hunk 冒頭では各 side の先頭32行・64 KiBを先読みし、grammar が opener から push し得る multiline context を候補にする。
+Hunk 冒頭では同一 file・各 side の visible source を32行・64 KiBまで先読みし、grammar が opener から push し得る multiline context を候補にする。
+現在 hunk の全行が `*`、`>`、`|` の同じ leader を持つ場合は、直後 hunk で同じ leader が続く範囲の closer も推定根拠にする。hunk 間で省略された source は parse せず、選んだ state は現在 hunk の session だけに使う。
 候補 context と終了 regex は build 時に grammar から抽出し、埋め込み syntax asset として生成する。
 実行時は終了 regex が後続行に現れる候補だけを parse state で比較し、先頭行を越えて通常 state へ戻る場合だけ採用する。
-複数候補が戻る場合は最初の合流位置を選び、同じ位置で異なる style を返す候補があれば推定しない。
+複数候補が戻る場合は closer delimiter をより長く消費する終了 regex を選び、消費長が同じなら最初の合流位置を選ぶ。同じ強さで異なる style を返す候補があれば推定しない。
 stdin に hunk 外の本文がないため、合流を観測できない multiline context は通常 state のまま表示する。
 
 syntax 計算は decoration worker で行い、未計算部分を plain diff style で先に表示する。

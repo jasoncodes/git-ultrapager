@@ -51,7 +51,8 @@ use crate::theme::{ColorLevel, Theme};
 
 /// Syntax上限はsource本文に適用するため、bounded readerへはdiff marker 1 byteを加えて渡す。
 const MAX_SYNTAX_DISPLAY_BYTES: usize = MAX_SYNTAX_LINE_BYTES + 1;
-/// Prefix推定は各sideの先頭32行・64 KiBまでとし、候補context数との積で計算量を固定する。
+/// Prefix推定は各hunkから同一file・各sideの後続32行・64 KiBまでとし、候補context数との積で
+/// 計算量を固定する。
 const MAX_CONTINUATION_INFERENCE_LINES: usize = 32;
 const MAX_CONTINUATION_INFERENCE_BYTES: usize = 64 * 1024;
 /// Intralineのblock byte上限もsource本文だけを数える。1 lineの復元上限にはmarkerを含める。
@@ -803,14 +804,14 @@ fn decorate_syntax_hunk(
     let mut new_opened = false;
     let use_old_context = file.status == ChangeStatus::Deleted;
 
-    if let Some(prefix) = collect_inference_prefix(context, hunk, SyntaxSide::Old, readers)? {
+    if let Some(prefix) = collect_inference_prefix(context, file, hunk, SyntaxSide::Old, readers)? {
         old = open_inferred_session(builder, engine, old_path, &prefix.lines, context.theme);
         old_opened = true;
     }
     if (context.cancelled)() {
         return Ok(false);
     }
-    if let Some(prefix) = collect_inference_prefix(context, hunk, SyntaxSide::New, readers)? {
+    if let Some(prefix) = collect_inference_prefix(context, file, hunk, SyntaxSide::New, readers)? {
         new = open_inferred_session(builder, engine, new_path, &prefix.lines, context.theme);
         new_opened = true;
     }
@@ -950,13 +951,17 @@ struct InferencePrefix {
     _lease: DerivedMemoryLease,
 }
 
-/// Hunk先頭から片側のsource列をboundedに復元する。
+/// Hunk先頭から同一file・片側のsource列をboundedに復元する。
 ///
-/// Source順はaddition/deletionを除けば各file sideの行順と一致する。上限超過lineを読むと欠けた
-/// 遷移を既知扱いしてしまうため、そのsideの推定全体を捨てる。固定leaseはString payloadとVecの
-/// 最大capacityを復元前に確保し、候補評価が終わるまでprefixと同じlifetimeで保持する。
+/// 現在hunkの全行が`*`、`>`、`|`の同じleaderを持つ場合だけ、直後hunkの同じleaderが続く範囲まで
+/// 読む。これによりJSDocのcloserを次hunkから拾いつつ、通常code hunkがfile後半の無関係なcloserを
+/// 根拠に推定されるのを避ける。Hunk間で省略されたsourceはparseせず、推定で選んだstateも現在
+/// hunkのsessionだけに使う。上限超過lineを読むと欠けた遷移を既知扱いしてしまうため、そのsideの
+/// 推定全体を捨てる。固定leaseはString payloadとVecの最大capacityを復元前に確保し、候補評価が
+/// 終わるまでprefixと同じlifetimeで保持する。
 fn collect_inference_prefix(
     context: &DecorationContext<'_>,
+    file: StoredFileRef<'_>,
     hunk: StoredHunk,
     side: SyntaxSide,
     readers: &mut DecorationReaders,
@@ -971,8 +976,18 @@ fn collect_inference_prefix(
     };
     let mut lines = Vec::with_capacity(MAX_CONTINUATION_INFERENCE_LINES);
     let mut bytes = 0_usize;
+    let mut continuation_hunk = None;
+    let mut continuation_leader = None;
 
-    for raw_id in hunk_line_range(context.document, hunk) {
+    let document_end = u64::try_from(context.document.line_count()).unwrap_or(u64::MAX);
+    let start = hunk.span.start.get().min(document_end);
+    let end = file
+        .span
+        .end_exclusive
+        .unwrap_or(document_end)
+        .min(document_end)
+        .max(start);
+    for raw_id in start..end {
         if (context.cancelled)() {
             return Ok(None);
         }
@@ -985,7 +1000,24 @@ fn collect_inference_prefix(
             SyntaxSide::Old => matches!(metadata.kind, LineKind::Deletion | LineKind::Context),
             SyntaxSide::New => matches!(metadata.kind, LineKind::Addition | LineKind::Context),
         };
-        if !belongs_to_side || metadata.hunk_id != Some(hunk.id) {
+        if metadata.file_id != Some(file.id) {
+            continue;
+        }
+        let is_later_hunk = metadata.hunk_id != Some(hunk.id);
+        if let Some(line_hunk) = metadata.hunk_id.filter(|line_hunk| *line_hunk != hunk.id) {
+            match continuation_hunk {
+                Some(current) if current != line_hunk => break,
+                Some(_) => {}
+                None => {
+                    let Some(leader) = shared_continuation_leader(&lines) else {
+                        break;
+                    };
+                    continuation_hunk = Some(line_hunk);
+                    continuation_leader = Some(leader);
+                }
+            }
+        }
+        if !belongs_to_side {
             continue;
         }
         if lines.len() == MAX_CONTINUATION_INFERENCE_LINES {
@@ -1006,6 +1038,9 @@ fn collect_inference_prefix(
             BoundedTextRead::Oversized { .. } | BoundedTextRead::Cancelled => return Ok(None),
         };
         let content = text.get(1..).unwrap_or_default();
+        if is_later_hunk && continuation_leader != continuation_leader_for_line(content) {
+            break;
+        }
         let Some(next_bytes) = bytes.checked_add(content.len()) else {
             return Ok(None);
         };
@@ -1020,6 +1055,21 @@ fn collect_inference_prefix(
         lines,
         _lease: lease,
     }))
+}
+
+fn shared_continuation_leader(lines: &[String]) -> Option<char> {
+    let leader = continuation_leader_for_line(lines.first()?)?;
+    lines
+        .iter()
+        .all(|line| continuation_leader_for_line(line) == Some(leader))
+        .then_some(leader)
+}
+
+fn continuation_leader_for_line(line: &str) -> Option<char> {
+    line.trim_start()
+        .chars()
+        .next()
+        .filter(|leader| matches!(leader, '*' | '>' | '|'))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2548,6 +2598,51 @@ mod tests {
             .unwrap();
         let HighlightedLine::Styled(expected) = expected else {
             panic!("expected inferred comment syntax");
+        };
+
+        let expected = expected
+            .into_iter()
+            .filter_map(|span| shift_syntax_span(span, added.text.len()))
+            .collect::<Vec<_>>();
+        let actual = &decorations.line(added.id).unwrap().syntax;
+        assert!(
+            syntax_spans_equivalent(actual, &expected),
+            "actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
+    fn hunk_prefix_infers_typescript_jsdoc_across_next_hunk_and_embedded_slash() {
+        let document = parse_bytes(
+            b"diff --git a/src/use-simulator.ts b/src/use-simulator.ts\n--- a/src/use-simulator.ts\n+++ b/src/use-simulator.ts\n@@ -45,3 +45,4 @@ import type {\n  * existing contract.\n+ * added contract.\n  * device.offline/online remains inside the comment.\n  * still inside the comment.\n@@ -63,2 +64,3 @@ import type {\n  * later contract.\n+ * later addition.\n  */\n",
+        );
+        let added = read_lines(&document)
+            .into_iter()
+            .find(|line| line.text == "+ * added contract.")
+            .unwrap();
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+
+        let engine = SyntaxEngine::new().unwrap();
+        let mut expected_session = engine
+            .session(
+                Some("src/use-simulator.ts"),
+                Some("/** hidden before the hunk"),
+                ThemeChoice::Dark,
+            )
+            .unwrap()
+            .unwrap();
+        let _ = expected_session
+            .highlight_line("/** hidden before the hunk")
+            .unwrap();
+        let _ = expected_session
+            .highlight_line(" * existing contract.")
+            .unwrap();
+        let expected = expected_session
+            .highlight_line(" * added contract.")
+            .unwrap();
+        let HighlightedLine::Styled(expected) = expected else {
+            panic!("expected inferred JSDoc syntax");
         };
 
         let expected = expected
