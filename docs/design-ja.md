@@ -212,14 +212,15 @@ search/filter input は grapheme 単位で cursor 移動と削除を行い、Lef
 path の拡張子と既知 file name から syntax を選ぶ。
 判定できない場合は、各 hunk の old 側で最初に現れる削除または context 行と、new 側で最初に現れる追加または context 行にある shebang を使う。
 該当する source 行がなければ推測しない。
-`two-face` が curated した TextMate grammar set と、`syntect` の pure-Rust `fancy-regex` backend を使う。
-`fancy-regex` 向け set に JavaScript (Babel) grammar は含まれないため、`.jsx` は JSX expression を解釈できる TypeScriptReact grammar へ割り当てる。
+`two-face` が curated した TextMate grammar set と、`syntect` の Oniguruma backend を使う。
+`.jsx` は JSX expression を解釈できる TypeScriptReact grammar へ割り当てる。
 
 削除側と追加側は別の parse state を持ち、hunk 内で継続し、hunk 境界で reset する。
 両 state が diverge した context 行は new side の style、deleted file では old side を使う。
 
 Hunk 冒頭では各 side の先頭32行・64 KiBを先読みし、grammar が opener から push し得る multiline context を候補にする。
-候補は dark/light theme のどちらかで通常 state と異なる style を持ち、先頭行を越えて継続し、先読み範囲内で通常 state へ戻る場合だけ採用する。
+候補 context と終了 regex は build 時に grammar から抽出し、埋め込み syntax asset として生成する。
+実行時は終了 regex が後続行に現れる候補だけを parse state で比較し、先頭行を越えて通常 state へ戻る場合だけ採用する。
 複数候補が戻る場合は最初の合流位置を選び、同じ位置で異なる style を返す候補があれば推定しない。
 stdin に hunk 外の本文がないため、合流を観測できない multiline context は通常 state のまま表示する。
 

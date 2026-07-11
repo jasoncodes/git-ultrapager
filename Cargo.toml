@@ -20,12 +20,16 @@ rustix = { version = "1.1", features = ["process", "stdio", "termios"] }
 serde = { version = "1.0", features = ["derive"] }
 signal-hook = "0.3"
 similar = { version = "3.1", default-features = false, features = ["std", "text", "unicode"] }
-syntect = { version = "5.3", default-features = false, features = ["default-themes", "regex-fancy"] }
+syntect = { version = "5.3", default-features = false, features = ["default-themes", "parsing", "regex-onig"] }
 tempfile = "3.27"
 thiserror = "2.0"
-two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
 unicode-segmentation = "1.13"
 unicode-width = "0.2"
+
+[build-dependencies]
+regex = "1.12"
+syntect = { version = "5.3", default-features = false, features = ["default-themes", "regex-onig"] }
+two-face = { version = "0.5.1", default-features = false, features = ["syntect-onig"] }
 
 [dev-dependencies]
 insta = "1.46"
@@ -34,9 +38,6 @@ proptest = "1.9"
 pretty_assertions = "1.4"
 
 [profile.dev.package.aho-corasick]
-opt-level = 2
-
-[profile.dev.package.fancy-regex]
 opt-level = 2
 
 [profile.dev.package.regex-automata]

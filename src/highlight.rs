@@ -8,7 +8,7 @@
 //! `DecorationWorkspace`へ計上する。
 
 use std::collections::HashMap;
-use std::mem::{replace, size_of};
+use std::mem::size_of;
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -16,12 +16,9 @@ use std::thread;
 
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{FontStyle, HighlightState, Highlighter, Style, ThemeSet};
-use syntect::parsing::syntax_definition::{
-    Context, ContextReference, MatchOperation, MatchPattern, Pattern,
-};
+use syntect::highlighting::{FontStyle, Style, ThemeSet};
 use syntect::parsing::{
-    ParseState, SyntaxDefinition, SyntaxReference, SyntaxSet, SyntaxSetBuilder,
+    ParseState, Regex as SyntaxRegex, Scope, ScopeStack, SyntaxReference, SyntaxSet,
 };
 use thiserror::Error;
 
@@ -30,7 +27,6 @@ use crate::derived_memory::{DerivedMemoryLease, DerivedMemoryLedger, DerivedMemo
 use crate::text::MAX_SYNTAX_LINE_BYTES;
 
 const SYNTAX_STATE_BASE_BYTES: usize = 64 * 1024;
-const MAX_CONTINUATION_CANDIDATES: usize = 64;
 
 /// Syntax style を renderer へ渡す immutable span。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,27 +183,49 @@ pub(crate) struct SyntaxEngine {
     assets: Arc<SyntaxAssets>,
 }
 
-/// Bundled grammarへ内部seed entryを足したprocess-wide asset。
+/// Build時に内部seed entryを追加したprocess-wide asset。
 ///
 /// Seedはsanitized sourceに現れないNUL prefixでだけ到達でき、通常sessionのgrammar動作を変えない。
-/// Rebuildとtheme selector解析は最初のengine生成時に1回行い、actorと同期decoratorはimmutable setを共有する。
+/// Runtimeは生成済みdumpを1回deserializeし、actorと同期decoratorはimmutable setを共有する。
 struct SyntaxAssets {
     syntaxes: SyntaxSet,
     themes: ThemeSet,
-    continuation_candidates: HashMap<syntect::parsing::Scope, Vec<ContinuationCandidate>>,
+    continuation_candidates: HashMap<Scope, Vec<ContinuationCandidate>>,
 }
 
-#[derive(Clone, Debug)]
+type SerializedContinuationCandidates = HashMap<Scope, Vec<(String, Vec<String>)>>;
+type GeneratedSyntaxAsset = (SyntaxSet, SerializedContinuationCandidates);
+
 struct ContinuationCandidate {
     marker: String,
+    exit_patterns: Vec<SyntaxRegex>,
 }
 
-/// Grammar内の1回のpush/setが作るcontext stackと、そのtopへ付くprototype。
-/// Openerのregexやcaptureは復元せず、backreferenceを使うstackは候補生成時に除外する。
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ContinuationStack {
-    contexts: Vec<ContextReference>,
-    with_prototype: Option<ContextReference>,
+impl ContinuationCandidate {
+    fn last_exit_line(&self, lines: &[String], line_with_newline: &mut String) -> Option<usize> {
+        if self.exit_patterns.is_empty() {
+            return None;
+        }
+        let mut matches_exit = |line: &str| {
+            line_with_newline.clear();
+            line_with_newline.push_str(line);
+            line_with_newline.push('\n');
+            self.exit_patterns
+                .iter()
+                .any(|pattern| pattern.search(line_with_newline, 0, line_with_newline.len(), None))
+        };
+        let (first, remaining) = lines.split_first()?;
+        // 先頭行でexit regexが成立する候補は、missing openerの継続より通常の一時contextである
+        // 可能性が高い。後続行だけにcloserがある候補へ絞ると、1行目だけで戻る候補をparse前に除ける。
+        if matches_exit(first) {
+            return None;
+        }
+        remaining
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| matches_exit(line).then_some(index + 1))
+            .last()
+    }
 }
 
 impl SyntaxEngine {
@@ -216,8 +234,25 @@ impl SyntaxEngine {
         let assets = ASSETS
             .get_or_init(|| {
                 let themes = ThemeSet::load_defaults();
-                let (syntaxes, continuation_candidates) =
-                    syntax_set_with_continuation_candidates(&themes);
+                let (syntaxes, serialized_candidates): GeneratedSyntaxAsset =
+                    syntect::dumps::from_uncompressed_data(include_bytes!(concat!(
+                        env!("OUT_DIR"),
+                        "/syntax-with-continuations.packdump"
+                    )))
+                    .map_err(|error| HighlightError::Syntect(error.to_string()))?;
+                let continuation_candidates = serialized_candidates
+                    .into_iter()
+                    .map(|(scope, candidates)| {
+                        let candidates = candidates
+                            .into_iter()
+                            .map(|(marker, patterns)| ContinuationCandidate {
+                                marker,
+                                exit_patterns: patterns.into_iter().map(SyntaxRegex::new).collect(),
+                            })
+                            .collect();
+                        (scope, candidates)
+                    })
+                    .collect();
                 if syntaxes.find_syntax_by_name("Plain Text").is_none() {
                     return Err(HighlightError::MissingPlainText);
                 }
@@ -331,39 +366,84 @@ impl SyntaxEngine {
         ledger: &DerivedMemoryLedger,
     ) -> Option<String> {
         let candidates = self.assets.continuation_candidates.get(&syntax.scope)?;
-        let output_vec_bytes = lines
-            .len()
-            .checked_mul(size_of::<BudgetedHighlightedLine>())?
-            .checked_mul(2)?;
-        let _output_vec_lease = ledger
-            .reserve(DerivedMemoryPool::DecorationWorkspace, output_vec_bytes)
+        let filter_line_bytes = lines
+            .iter()
+            .map(String::len)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)?;
+        let _filter_line_lease = ledger
+            .reserve(DerivedMemoryPool::DecorationWorkspace, filter_line_bytes)
             .ok()?;
-        let mut accepted: Option<(usize, String, Vec<BudgetedHighlightedLine>)> = None;
+        let candidate_entry_bytes =
+            size_of::<(&ContinuationCandidate, usize)>().checked_add(size_of::<&str>())?;
+        let candidate_workspace_bytes = candidates.len().checked_mul(candidate_entry_bytes)?;
+        let _candidate_workspace_lease = ledger
+            .reserve(
+                DerivedMemoryPool::DecorationWorkspace,
+                candidate_workspace_bytes,
+            )
+            .ok()?;
+        let mut filter_line = String::with_capacity(filter_line_bytes);
+        let mut eligible_candidates = Vec::with_capacity(candidates.len());
+        eligible_candidates.extend(candidates.iter().filter_map(|candidate| {
+            candidate
+                .last_exit_line(lines, &mut filter_line)
+                .map(|last_exit| (candidate, last_exit))
+        }));
+        let mut earliest_line = None;
+        let mut earliest_markers = Vec::with_capacity(candidates.len());
+        if eligible_candidates.is_empty() {
+            return None;
+        }
 
-        for candidate in candidates {
-            let mut baseline = self.inference_session(syntax, theme, ledger)?;
-            let mut inferred = self.inference_session(syntax, theme, ledger)?;
-            drop(baseline.highlight_line_with_budget("", ledger).ok()??);
-            drop(
-                inferred
-                    .highlight_line_with_budget(&candidate.marker, ledger)
-                    .ok()??,
-            );
-            if inferred.same_state(&mut baseline) {
+        let max_probe_line = eligible_candidates
+            .iter()
+            .map(|(_, last_exit)| *last_exit)
+            .max()?;
+        let probe_lines = &lines[..=max_probe_line];
+        let max_line_bytes = probe_lines.iter().map(String::len).max().unwrap_or(0);
+        let state_bytes = SYNTAX_STATE_BASE_BYTES
+            .checked_add(
+                max_line_bytes.checked_mul(SyntaxProbeSession::STATE_BYTES_PER_INPUT_BYTE)?,
+            )?
+            .checked_mul(probe_lines.len().checked_add(1)?)?
+            .checked_add(
+                probe_lines
+                    .len()
+                    .checked_mul(size_of::<SyntaxProbeState>())?,
+            )?;
+        let _baseline_states_lease = ledger
+            .reserve(DerivedMemoryPool::DecorationWorkspace, state_bytes)
+            .ok()?;
+        let (baseline_seed, baseline_states) = {
+            let mut baseline = self.probe_session(syntax, ledger)?;
+            baseline.advance_with_budget("", ledger).ok()??;
+            let seed = baseline.snapshot();
+            let mut states = Vec::with_capacity(probe_lines.len());
+            for line in probe_lines {
+                baseline.advance_with_budget(line, ledger).ok()??;
+                states.push(baseline.snapshot());
+            }
+            (seed, states)
+        };
+
+        for (candidate, last_exit) in &eligible_candidates {
+            let mut inferred = self.probe_session(syntax, ledger)?;
+            inferred
+                .advance_with_budget(&candidate.marker, ledger)
+                .ok()??;
+            if inferred.same_state(&baseline_seed) {
                 continue;
             }
 
             let mut convergence_line = None;
-            let mut output = Vec::with_capacity(lines.len());
-            for (line_index, line) in lines.iter().enumerate() {
-                let baseline_line = baseline.highlight_line_with_budget(line, ledger).ok()??;
-                let inferred_line = inferred.highlight_line_with_budget(line, ledger).ok()??;
-                let states_match = inferred.same_state(&mut baseline);
-                if states_match && convergence_line.is_none() {
+            for (line_index, line) in lines[..=*last_exit].iter().enumerate() {
+                inferred.advance_with_budget(line, ledger).ok()??;
+                if inferred.same_state(&baseline_states[line_index]) {
                     convergence_line = Some(line_index);
+                    break;
                 }
-                drop(baseline_line);
-                output.push(inferred_line);
             }
             let Some(convergence_line) = convergence_line else {
                 continue;
@@ -373,54 +453,96 @@ impl SyntaxEngine {
             if convergence_line == 0 {
                 continue;
             }
-
-            if accepted
-                .as_ref()
-                .is_some_and(|(accepted_line, _, _)| convergence_line > *accepted_line)
-            {
-                continue;
-            }
-            if accepted
-                .as_ref()
-                .is_some_and(|(accepted_line, _, _)| convergence_line < *accepted_line)
-            {
-                accepted = Some((convergence_line, candidate.marker.clone(), output));
-                continue;
-            }
-            if let Some((_, _, expected)) = accepted.as_ref() {
-                if output.len() != expected.len()
-                    || output.iter().zip(expected).any(|(actual, expected)| {
-                        !highlighted_lines_equivalent(actual.line(), expected.line())
-                    })
-                {
-                    return None;
+            match earliest_line {
+                Some(current) if convergence_line > current => {}
+                Some(current) if convergence_line == current => {
+                    earliest_markers.push(candidate.marker.as_str());
                 }
-            } else {
-                accepted = Some((convergence_line, candidate.marker.clone(), output));
+                _ => {
+                    earliest_line = Some(convergence_line);
+                    earliest_markers.clear();
+                    earliest_markers.push(candidate.marker.as_str());
+                }
             }
         }
 
-        accepted.map(|(_, marker, _)| marker)
+        let convergence_line = earliest_line?;
+        let first_marker = *earliest_markers.first()?;
+        if earliest_markers.len() == 1 {
+            return Some(first_marker.to_owned());
+        }
+
+        let output_vec_bytes = convergence_line
+            .checked_add(1)?
+            .checked_mul(size_of::<BudgetedHighlightedLine>())?
+            .checked_mul(2)?;
+        let _output_vec_lease = ledger
+            .reserve(DerivedMemoryPool::DecorationWorkspace, output_vec_bytes)
+            .ok()?;
+        let expected = self.inference_highlight_output(
+            syntax,
+            theme,
+            first_marker,
+            &lines[..=convergence_line],
+            ledger,
+        )?;
+        for marker in earliest_markers.into_iter().skip(1) {
+            let actual = self.inference_highlight_output(
+                syntax,
+                theme,
+                marker,
+                &lines[..=convergence_line],
+                ledger,
+            )?;
+            if actual.len() != expected.len()
+                || actual.iter().zip(&expected).any(|(actual, expected)| {
+                    !highlighted_lines_equivalent(actual.line(), expected.line())
+                })
+            {
+                return None;
+            }
+        }
+        Some(first_marker.to_owned())
     }
 
-    fn inference_session<'engine>(
+    fn probe_session<'engine>(
         &'engine self,
         syntax: &'engine SyntaxReference,
-        theme: &'engine syntect::highlighting::Theme,
         ledger: &DerivedMemoryLedger,
-    ) -> Option<SyntaxSession<'engine>> {
+    ) -> Option<SyntaxProbeSession<'engine>> {
         let lease = ledger
             .reserve(
                 DerivedMemoryPool::DecorationWorkspace,
                 SYNTAX_STATE_BASE_BYTES,
             )
             .ok()?;
-        Some(SyntaxSession::new(
+        Some(SyntaxProbeSession::new(
             &self.assets.syntaxes,
             syntax,
-            theme,
-            Some(lease),
+            lease,
         ))
+    }
+
+    fn inference_highlight_output<'engine>(
+        &'engine self,
+        syntax: &'engine SyntaxReference,
+        theme: &'engine syntect::highlighting::Theme,
+        marker: &str,
+        lines: &[String],
+        ledger: &DerivedMemoryLedger,
+    ) -> Option<Vec<BudgetedHighlightedLine>> {
+        let lease = ledger
+            .reserve(
+                DerivedMemoryPool::DecorationWorkspace,
+                SYNTAX_STATE_BASE_BYTES,
+            )
+            .ok()?;
+        let mut session = SyntaxSession::new(&self.assets.syntaxes, syntax, theme, Some(lease));
+        drop(session.highlight_line_with_budget(marker, ledger).ok()??);
+        lines
+            .iter()
+            .map(|line| session.highlight_line_with_budget(line, ledger).ok()?)
+            .collect()
     }
 
     fn highlight(&self, request: &SyntaxRequest) -> Result<Vec<HighlightedLine>, HighlightError> {
@@ -453,10 +575,18 @@ pub(crate) struct SyntaxSession<'engine> {
     state_lease: Option<DerivedMemoryLease>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-struct SyntaxSessionState {
-    highlight: HighlightState,
-    parse: ParseState,
+/// 候補stateの合流判定だけを行い、theme lookupと`SyntaxSpan`生成を持たないparse session。
+struct SyntaxProbeSession<'engine> {
+    syntaxes: &'engine SyntaxSet,
+    parse_state: ParseState,
+    scope_stack: ScopeStack,
+    state_lease: DerivedMemoryLease,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SyntaxProbeState {
+    parse_state: ParseState,
+    scope_stack: ScopeStack,
 }
 
 impl SyntaxSession<'_> {
@@ -591,199 +721,80 @@ impl SyntaxSession<'_> {
     pub(crate) fn reset_after_skipped_line(&mut self) {
         self.highlighter = HighlightLines::new(self.syntax, self.theme);
     }
-
-    fn same_state(&mut self, other: &mut SyntaxSession<'_>) -> bool {
-        let own_state = self.take_state();
-        let other_state = other.take_state();
-        let same = own_state == other_state;
-        self.restore_state(own_state);
-        other.restore_state(other_state);
-        same
-    }
-
-    fn take_state(&mut self) -> SyntaxSessionState {
-        let current = replace(
-            &mut self.highlighter,
-            HighlightLines::new(self.syntax, self.theme),
-        );
-        let (highlight, parse) = current.state();
-        SyntaxSessionState { highlight, parse }
-    }
-
-    fn restore_state(&mut self, state: SyntaxSessionState) {
-        self.highlighter = HighlightLines::from_state(self.theme, state.highlight, state.parse);
-    }
 }
 
-fn syntax_set_with_continuation_candidates(
-    themes: &ThemeSet,
-) -> (
-    SyntaxSet,
-    HashMap<syntect::parsing::Scope, Vec<ContinuationCandidate>>,
-) {
-    let base = two_face::syntax::extra_newlines();
-    let builder = base.clone().into_builder();
-    let mut definitions = builder.syntaxes().to_vec();
-    let context_references = definitions
-        .iter()
-        .flat_map(pushed_context_groups)
-        .flat_map(|stack| stack.contexts)
-        .collect::<Vec<_>>();
-    let mut candidates = HashMap::new();
+impl<'engine> SyntaxProbeSession<'engine> {
+    const STATE_BYTES_PER_INPUT_BYTE: usize = 8;
 
-    for definition in &mut definitions {
-        let syntax_candidates =
-            add_continuation_markers(definition, &base, &context_references, themes);
-        if !syntax_candidates.is_empty() {
-            candidates.insert(definition.scope, syntax_candidates);
+    fn new(
+        syntaxes: &'engine SyntaxSet,
+        syntax: &'engine SyntaxReference,
+        state_lease: DerivedMemoryLease,
+    ) -> Self {
+        Self {
+            syntaxes,
+            parse_state: ParseState::new(syntax),
+            scope_stack: ScopeStack::new(),
+            state_lease,
         }
     }
 
-    let mut rebuilt = SyntaxSetBuilder::new();
-    for definition in definitions {
-        rebuilt.add(definition);
-    }
-    (rebuilt.build(), candidates)
-}
-
-fn add_continuation_markers(
-    definition: &mut SyntaxDefinition,
-    syntax_set: &SyntaxSet,
-    context_references: &[ContextReference],
-    themes: &ThemeSet,
-) -> Vec<ContinuationCandidate> {
-    let Some(main) = definition.contexts.get("__main") else {
-        return Vec::new();
-    };
-    let Some(main_reference) = reference_to_context(syntax_set, context_references, main) else {
-        return Vec::new();
-    };
-
-    let mut context_groups = pushed_context_groups(definition)
-        .into_iter()
-        .filter(|stack| {
-            let contexts = stack
-                .contexts
-                .iter()
-                .map(|reference| reference.resolve(syntax_set))
-                .collect::<Result<Vec<_>, _>>();
-            let Ok(contexts) = contexts else {
-                return false;
+    fn advance_with_budget(
+        &mut self,
+        line: &str,
+        ledger: &DerivedMemoryLedger,
+    ) -> Result<Option<()>, HighlightError> {
+        if line.len() > MAX_SYNTAX_LINE_BYTES || !self.ensure_state_budget(line.len()) {
+            return Ok(None);
+        }
+        let Some(workspace_bytes) = syntax_workspace_upper_bound(line.len()) else {
+            return Ok(None);
+        };
+        let _workspace =
+            match ledger.reserve(DerivedMemoryPool::DecorationWorkspace, workspace_bytes) {
+                Ok(lease) => lease,
+                Err(_) => return Ok(None),
             };
-            !contexts.iter().any(|context| context.uses_backrefs)
-                && contexts
-                    .last()
-                    .is_some_and(|context| context_can_pop(context, syntax_set, 0))
-                && context_group_changes_visible_style(definition.scope, &contexts, themes)
-        })
-        .collect::<Vec<_>>();
-    context_groups.sort_by_cached_key(|stack| format!("{stack:?}"));
-    context_groups.dedup();
-    context_groups.truncate(MAX_CONTINUATION_CANDIDATES);
-
-    let mut marker_patterns = Vec::with_capacity(context_groups.len());
-    let mut candidates = Vec::with_capacity(context_groups.len());
-    for (index, context_group) in context_groups.into_iter().enumerate() {
-        // Sanitized source textはNULを可視表記へ変えるため、このprefixは内部seedと入力行で衝突しない。
-        let marker = format!("\0GUP-CONTINUATION-{index:02x}\0");
-        let mut seeded_stack = Vec::with_capacity(1 + context_group.contexts.len());
-        seeded_stack.push(main_reference.clone());
-        seeded_stack.extend(context_group.contexts);
-        marker_patterns.push(Pattern::Match(MatchPattern::new(
-            false,
-            format!(r"\A{}", regex::escape(&marker)),
-            Vec::new(),
-            None,
-            MatchOperation::Push(seeded_stack),
-            context_group.with_prototype,
-        )));
-        candidates.push(ContinuationCandidate { marker });
+        let mut line_with_newline = String::with_capacity(line.len() + 1);
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+        let operations = self
+            .parse_state
+            .parse_line(&line_with_newline, self.syntaxes)
+            .map_err(|error| HighlightError::Syntect(error.to_string()))?;
+        for (_, operation) in operations {
+            self.scope_stack
+                .apply(&operation)
+                .map_err(|error| HighlightError::Syntect(error.to_string()))?;
+        }
+        Ok(Some(()))
     }
 
-    if let Some(start) = definition.contexts.get_mut("__start") {
-        start.patterns.splice(0..0, marker_patterns);
-    } else {
-        candidates.clear();
-    }
-    candidates
-}
-
-fn context_group_changes_visible_style(
-    syntax_scope: syntect::parsing::Scope,
-    contexts: &[&Context],
-    themes: &ThemeSet,
-) -> bool {
-    let scope_count = contexts
-        .iter()
-        .map(|context| context.meta_scope.len() + context.meta_content_scope.len())
-        .sum::<usize>();
-    let mut continuation_stack = Vec::with_capacity(1 + scope_count);
-    continuation_stack.push(syntax_scope);
-    for context in contexts {
-        continuation_stack.extend_from_slice(&context.meta_scope);
-        continuation_stack.extend_from_slice(&context.meta_content_scope);
-    }
-
-    ["base16-ocean.dark", "InspiredGitHub"]
-        .into_iter()
-        .filter_map(|name| themes.themes.get(name))
-        .any(|theme| {
-            let highlighter = Highlighter::new(theme);
-            let baseline = highlighter.style_for_stack(&[syntax_scope]);
-            let continuation = highlighter.style_for_stack(&continuation_stack);
-            baseline.foreground != continuation.foreground
-                || baseline.font_style != continuation.font_style
-        })
-}
-
-fn pushed_context_groups(definition: &SyntaxDefinition) -> Vec<ContinuationStack> {
-    let mut context_names = definition.contexts.keys().collect::<Vec<_>>();
-    context_names.sort_unstable();
-    let mut groups = Vec::new();
-    for context_name in context_names {
-        let context = &definition.contexts[context_name];
-        for pattern in &context.patterns {
-            if let Pattern::Match(pattern) = pattern
-                && let MatchOperation::Push(pushed) | MatchOperation::Set(pushed) =
-                    &pattern.operation
-                && !pushed.is_empty()
-            {
-                groups.push(ContinuationStack {
-                    contexts: pushed.clone(),
-                    with_prototype: pattern.with_prototype.clone(),
-                });
-            }
+    fn snapshot(&self) -> SyntaxProbeState {
+        SyntaxProbeState {
+            parse_state: self.parse_state.clone(),
+            scope_stack: self.scope_stack.clone(),
         }
     }
-    groups
-}
 
-fn context_can_pop(context: &Context, syntax_set: &SyntaxSet, depth: usize) -> bool {
-    const MAX_INCLUDE_DEPTH: usize = 16;
-    if depth == MAX_INCLUDE_DEPTH {
-        return false;
+    fn same_state(&self, other: &SyntaxProbeState) -> bool {
+        self.parse_state == other.parse_state && self.scope_stack == other.scope_stack
     }
-    context.patterns.iter().any(|pattern| match pattern {
-        Pattern::Match(pattern) => matches!(pattern.operation, MatchOperation::Pop),
-        Pattern::Include(reference) => reference
-            .resolve(syntax_set)
-            .is_ok_and(|included| context_can_pop(included, syntax_set, depth + 1)),
-    })
-}
 
-fn reference_to_context(
-    syntax_set: &SyntaxSet,
-    references: &[ContextReference],
-    target: &Context,
-) -> Option<ContextReference> {
-    references
-        .iter()
-        .find(|reference| {
-            reference
-                .resolve(syntax_set)
-                .is_ok_and(|context| context == target)
-        })
-        .cloned()
+    fn ensure_state_budget(&mut self, line_len: usize) -> bool {
+        let Some(required) = line_len
+            .checked_mul(Self::STATE_BYTES_PER_INPUT_BYTE)
+            .and_then(|bytes| bytes.checked_add(SYNTAX_STATE_BASE_BYTES))
+        else {
+            return false;
+        };
+        if required <= self.state_lease.bytes() {
+            return true;
+        }
+        self.state_lease
+            .reserve(required - self.state_lease.bytes())
+            .is_ok()
+    }
 }
 
 fn highlighted_lines_equivalent(left: &HighlightedLine, right: &HighlightedLine) -> bool {
@@ -856,8 +867,8 @@ fn detect_syntax<'a>(
             .extension()
             .and_then(|value| value.to_str())
             .unwrap_or("");
-        // fancy-regex では JavaScript (Babel) grammar が除外されるため、JSX は JSX を内包する
-        // TypeScriptReact grammar へ割り当てる。TSX と同じ parse state を使うことで、タグと
+        // JSX は JSX を内包する TypeScriptReact grammar へ割り当てる。TSX と同じ parse state
+        // を使うことで、タグと
         // JavaScript expression の境界を plain JavaScript grammar より細かく保持できる。
         let jsx = extension
             .eq_ignore_ascii_case("jsx")
@@ -879,14 +890,16 @@ mod tests {
 
     #[test]
     fn path_detection_does_not_read_repository_files() {
-        let syntaxes = two_face::syntax::extra_newlines();
-        let syntax = detect_syntax(&syntaxes, Some("not/on/disk/main.rs"), None).unwrap();
+        let engine = SyntaxEngine::new().unwrap();
+        let syntax =
+            detect_syntax(&engine.assets.syntaxes, Some("not/on/disk/main.rs"), None).unwrap();
         assert_eq!(syntax.name, "Rust");
     }
 
     #[test]
     fn detects_swift_typescript_and_jsx_family_extensions() {
-        let syntaxes = two_face::syntax::extra_newlines();
+        let engine = SyntaxEngine::new().unwrap();
+        let syntaxes = &engine.assets.syntaxes;
         let cases = [
             ("main.swift", "Swift"),
             ("main.ts", "TypeScript"),
@@ -895,7 +908,7 @@ mod tests {
         ];
 
         for (path, expected) in cases {
-            let syntax = detect_syntax(&syntaxes, Some(path), None)
+            let syntax = detect_syntax(syntaxes, Some(path), None)
                 .unwrap_or_else(|| panic!("{path} should have a syntax"));
             assert_eq!(syntax.name, expected, "unexpected syntax for {path}");
         }
@@ -903,17 +916,26 @@ mod tests {
 
     #[test]
     fn shebang_is_used_only_as_fallback() {
-        let syntaxes = two_face::syntax::extra_newlines();
-        let syntax =
-            detect_syntax(&syntaxes, Some("script"), Some("#!/usr/bin/env python3")).unwrap();
+        let engine = SyntaxEngine::new().unwrap();
+        let syntax = detect_syntax(
+            &engine.assets.syntaxes,
+            Some("script"),
+            Some("#!/usr/bin/env python3"),
+        )
+        .unwrap();
         assert!(syntax.name.contains("Python"));
     }
 
     #[test]
     fn non_shebang_first_line_does_not_guess_a_syntax() {
-        let syntaxes = two_face::syntax::extra_newlines();
+        let engine = SyntaxEngine::new().unwrap();
         assert!(
-            detect_syntax(&syntaxes, Some("unknown"), Some("<?xml version=\"1.0\"?>")).is_none()
+            detect_syntax(
+                &engine.assets.syntaxes,
+                Some("unknown"),
+                Some("<?xml version=\"1.0\"?>"),
+            )
+            .is_none()
         );
     }
 
