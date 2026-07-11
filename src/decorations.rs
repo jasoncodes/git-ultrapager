@@ -2657,6 +2657,59 @@ mod tests {
     }
 
     #[test]
+    fn hunk_prefix_prefers_jsdoc_context_for_star_led_markup() {
+        let document = parse_bytes(
+            b"diff --git a/server/src/lambda/shared/position-rate.ts b/server/src/lambda/shared/position-rate.ts\n--- a/server/src/lambda/shared/position-rate.ts\n+++ b/server/src/lambda/shared/position-rate.ts\n@@ -27,5 +28,9 @@ import {\n  * existing contract.\n  * gate acquisition can fail.\n  *\n+ * gate shares the `device_state` row.\n+ * conflicts are retried by the caller.\n+ * release uses {@link POSITION_RATE_GATE_RELEASE_RETRY_DELAYS_MS}.\n+ *\n  * external behavior remains unchanged.\n  */\n",
+        );
+        let added = read_lines(&document)
+            .into_iter()
+            .find(|line| {
+                line.text == "+ * release uses {@link POSITION_RATE_GATE_RELEASE_RETRY_DELAYS_MS}."
+            })
+            .unwrap();
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+
+        let engine = SyntaxEngine::new().unwrap();
+        let mut expected_session = engine
+            .session(
+                Some("server/src/lambda/shared/position-rate.ts"),
+                Some("/** hidden before the hunk"),
+                ThemeChoice::Dark,
+            )
+            .unwrap()
+            .unwrap();
+        for line in [
+            "/** hidden before the hunk",
+            " * existing contract.",
+            " * gate acquisition can fail.",
+            " *",
+            " * gate shares the `device_state` row.",
+            " * conflicts are retried by the caller.",
+        ] {
+            let _ = expected_session.highlight_line(line).unwrap();
+        }
+        let expected = expected_session
+            .highlight_line(" * release uses {@link POSITION_RATE_GATE_RELEASE_RETRY_DELAYS_MS}.")
+            .unwrap();
+        let HighlightedLine::Styled(expected) = expected else {
+            panic!("expected inferred JSDoc syntax");
+        };
+        let expected = expected
+            .into_iter()
+            .filter_map(|span| shift_syntax_span(span, added.text.len()))
+            .collect::<Vec<_>>();
+        let actual = decorations
+            .line(added.id)
+            .map(|decoration| decoration.syntax.clone())
+            .unwrap_or_default();
+        assert!(
+            syntax_spans_equivalent(&actual, &expected),
+            "actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
     fn hunk_prefix_infers_unclosed_typescript_jsdoc_from_star_leaders() {
         let document = parse_bytes(
             b"diff --git a/src/use-simulator.ts b/src/use-simulator.ts\n--- a/src/use-simulator.ts\n+++ b/src/use-simulator.ts\n@@ -58,4 +58,5 @@ import type {\n  * speed uses the route.\n  * repeatMode controls the terminal behavior.\n- * old fold wording.\n+ * foldRepeat uses fold.direction.\n+ * startFromEnd mirrors the route.\n  * device.offline/online stays serialized.\n",
@@ -2693,6 +2746,49 @@ mod tests {
             panic!("expected inferred JSDoc syntax");
         };
 
+        let expected = expected
+            .into_iter()
+            .filter_map(|span| shift_syntax_span(span, added.text.len()))
+            .collect::<Vec<_>>();
+        let actual = decorations
+            .line(added.id)
+            .map(|decoration| decoration.syntax.clone())
+            .unwrap_or_default();
+        assert!(
+            syntax_spans_equivalent(&actual, &expected),
+            "actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
+    fn hunk_prefix_does_not_seed_regex_before_a_typescript_line_comment() {
+        let document = parse_bytes(
+            b"diff --git a/server/test/lambda-data/positions-api.test.ts b/server/test/lambda-data/positions-api.test.ts\n--- a/server/test/lambda-data/positions-api.test.ts\n+++ b/server/test/lambda-data/positions-api.test.ts\n@@ -540,4 +544,9 @@ describe(\"positions-api\", () => {\n     }\n   });\n \n+  // gate shares the device_state row with the write pipeline.\n+  // retry a transient transaction conflict.\n+  it(\"retries gate acquisition\", async () => {\n+    expect(true).toBe(true);\n+  });\n });\n",
+        );
+        let added = read_lines(&document)
+            .into_iter()
+            .find(|line| {
+                line.text == "+  // gate shares the device_state row with the write pipeline."
+            })
+            .unwrap();
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+
+        let engine = SyntaxEngine::new().unwrap();
+        let content = added.text.get(1..).unwrap();
+        let expected = engine
+            .session(
+                Some("server/test/lambda-data/positions-api.test.ts"),
+                Some(content),
+                ThemeChoice::Dark,
+            )
+            .unwrap()
+            .unwrap()
+            .highlight_line(content)
+            .unwrap();
+        let HighlightedLine::Styled(expected) = expected else {
+            panic!("expected standalone TypeScript syntax");
+        };
         let expected = expected
             .into_iter()
             .filter_map(|span| shift_syntax_span(span, added.text.len()))

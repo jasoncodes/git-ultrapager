@@ -215,16 +215,19 @@ struct ExitEvidence {
 struct ContinuationScore {
     convergence_line: usize,
     exit: ExitEvidence,
+    opener_consumed: usize,
 }
 
 impl ContinuationScore {
     /// 長いdelimiterを先に選び、同じ消費長なら早く通常stateへ戻る候補を選ぶ。
-    /// 合流位置も同じ場合だけ、delimiterが行内の早い位置にある候補を優先する。
+    /// `* `prefixではsyntheticな`/**`を長く消費するopenerを優先し、JSDoc固有の
+    /// markupを通常block commentへ丸めない。残りも同じ場合は行内の早いexitを選ぶ。
     fn strength_cmp(self, other: Self) -> Ordering {
         self.exit
             .consumed
             .cmp(&other.exit.consumed)
             .then_with(|| other.convergence_line.cmp(&self.convergence_line))
+            .then_with(|| self.opener_consumed.cmp(&other.opener_consumed))
             .then_with(|| other.exit.start.cmp(&self.exit.start))
     }
 }
@@ -256,6 +259,18 @@ impl ContinuationCandidate {
             .any(|pattern| pattern.search(line_with_newline, 0, line_with_newline.len(), None))
     }
 
+    fn opener_evidence(
+        &self,
+        line: &str,
+        line_with_newline: &mut String,
+        region: &mut SyntaxRegion,
+    ) -> Option<ExitEvidence> {
+        line_with_newline.clear();
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+        strongest_pattern_evidence(&self.opener_patterns, line_with_newline, region)
+    }
+
     /// `* `だけが続くprefix用に、grammar上のblock-comment contextかをsynthetic delimiterで判定する。
     fn is_block_comment(&self, line_with_newline: &mut String, region: &mut SyntaxRegion) -> bool {
         ["/**", "/*"]
@@ -275,23 +290,7 @@ impl ContinuationCandidate {
         line_with_newline.clear();
         line_with_newline.push_str(line);
         line_with_newline.push('\n');
-        let mut strongest = None;
-        for pattern in &self.exit_patterns {
-            if pattern.search(line_with_newline, 0, line_with_newline.len(), Some(region))
-                && let Some((start, end)) = region.pos(0)
-            {
-                let evidence = ExitEvidence {
-                    start,
-                    consumed: end.saturating_sub(start),
-                };
-                if strongest
-                    .is_none_or(|current| evidence.strength_cmp(current) == Ordering::Greater)
-                {
-                    strongest = Some(evidence);
-                }
-            }
-        }
-        strongest
+        strongest_pattern_evidence(&self.exit_patterns, line_with_newline, region)
     }
 
     fn last_exit_line(
@@ -324,11 +323,50 @@ impl ContinuationCandidate {
 }
 
 fn is_unclosed_comment_leader_prefix(lines: &[String]) -> bool {
+    is_star_comment_prefix(lines) && lines.iter().all(|line| line.trim_start() != "*/")
+}
+
+fn is_star_comment_prefix(lines: &[String]) -> bool {
     lines.len() >= 2
         && lines.iter().all(|line| {
             let trimmed = line.trim_start();
-            trimmed == "*" || trimmed.starts_with("* ")
+            trimmed == "*" || trimmed == "*/" || trimmed.starts_with("* ")
         })
+}
+
+fn strongest_pattern_evidence(
+    patterns: &[SyntaxRegex],
+    line_with_newline: &str,
+    region: &mut SyntaxRegion,
+) -> Option<ExitEvidence> {
+    let mut strongest = None;
+    for pattern in patterns {
+        if pattern.search(line_with_newline, 0, line_with_newline.len(), Some(region))
+            && let Some((start, end)) = region.pos(0)
+        {
+            let evidence = ExitEvidence {
+                start,
+                consumed: end.saturating_sub(start),
+            };
+            if strongest.is_none_or(|current| evidence.strength_cmp(current) == Ordering::Greater) {
+                strongest = Some(evidence);
+            }
+        }
+    }
+    strongest
+}
+
+fn exit_is_partial_comment_delimiter(line: &str, evidence: ExitEvidence) -> bool {
+    let Some(end) = evidence.start.checked_add(evidence.consumed) else {
+        return true;
+    };
+    line.get(evidence.start..end) == Some("/")
+        && (line
+            .get(end..)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+            || line
+                .get(..evidence.start)
+                .is_some_and(|prefix| prefix.ends_with('*')))
 }
 
 impl SyntaxEngine {
@@ -425,9 +463,10 @@ impl SyntaxEngine {
     /// Hunk先頭から読めるsource lineだけを使い、欠けたprefixで継続中だったgrammar contextを選ぶ。
     ///
     /// 候補は改行後も残り、prefix内で通常stateへ合流するcontextに限る。終了regexが消費する
-    /// delimiter長、合流位置の順で候補を絞り、同じ強さの候補が異なるspanを返す場合は入力だけでは
-    /// 一意に決められないため、通常stateのsessionを返す。全行が`* `で始まるprefixだけは、closerが
-    /// なくてもgrammarのblock-comment候補が継続し、候補間のspanが一致すれば採用する。
+    /// delimiter長、合流位置の順で候補を絞る。`* `prefixでは`/**`に対するopener regexの
+    /// 消費長も使い、JSDocと通常block commentを区別する。同じ強さの候補が異なるspanを返す場合は
+    /// 入力だけでは一意に決められないため、通常stateのsessionを返す。closerがない`* `prefixも、
+    /// grammarのblock-comment候補のうち同じ基準で最も具体的な候補を採用する。
     pub(crate) fn session_with_inferred_continuation<'engine>(
         &'engine self,
         path: Option<&str>,
@@ -485,6 +524,7 @@ impl SyntaxEngine {
             .map(String::len)
             .max()
             .unwrap_or(0)
+            .max(3)
             .checked_add(1)?;
         let _filter_line_lease = ledger
             .reserve(DerivedMemoryPool::DecorationWorkspace, filter_line_bytes)
@@ -516,6 +556,7 @@ impl SyntaxEngine {
         let mut best_score = None;
         let mut best_visible_score = None;
         let mut selected_markers = Vec::with_capacity(candidates.len());
+        let star_comment_prefix = is_star_comment_prefix(lines);
         let unclosed_comment_fallback = is_unclosed_comment_leader_prefix(lines);
         if eligible_candidates.is_empty() && !unclosed_comment_fallback {
             return None;
@@ -557,6 +598,7 @@ impl SyntaxEngine {
         };
 
         if unclosed_comment_fallback {
+            let mut best_opener_consumed = None;
             for candidate in candidates {
                 if !candidate.is_block_comment(&mut filter_line, &mut exit_region)
                     || candidate.has_visible_opener(lines, &mut filter_line)
@@ -579,7 +621,20 @@ impl SyntaxEngine {
                     }
                 }
                 if !converged {
-                    selected_markers.push(candidate.marker.as_str());
+                    let opener_consumed = candidate
+                        .opener_evidence("/**", &mut filter_line, &mut exit_region)
+                        .map_or(0, |evidence| evidence.consumed);
+                    match best_opener_consumed.map(|current| opener_consumed.cmp(&current)) {
+                        Some(Ordering::Less) => {}
+                        Some(Ordering::Equal) => {
+                            selected_markers.push(candidate.marker.as_str());
+                        }
+                        Some(Ordering::Greater) | None => {
+                            best_opener_consumed = Some(opener_consumed);
+                            selected_markers.clear();
+                            selected_markers.push(candidate.marker.as_str());
+                        }
+                    }
                 }
             }
             if !selected_markers.is_empty() {
@@ -625,9 +680,21 @@ impl SyntaxEngine {
             ) else {
                 continue;
             };
+            // `/`単独のexitが`//`や`*/`の一部に一致した場合、そのdelimiterは別contextが所有する。
+            // regex literal候補などを採用すると、delimiterより前の通常コードを誤って継続扱いする。
+            if exit_is_partial_comment_delimiter(&lines[convergence_line], exit_evidence) {
+                continue;
+            }
             let score = ContinuationScore {
                 convergence_line,
                 exit: exit_evidence,
+                opener_consumed: if star_comment_prefix {
+                    candidate
+                        .opener_evidence("/**", &mut filter_line, &mut exit_region)
+                        .map_or(0, |evidence| evidence.consumed)
+                } else {
+                    0
+                },
             };
             // 候補と同じcontextを開くvisible openerがあれば、そのopenerだけでcloserを説明できる。
             // 同じか弱い終了証拠へfallbackすると別contextで前半を誤着色するため、scoreも保持する。
