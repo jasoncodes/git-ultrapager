@@ -195,11 +195,13 @@ struct SyntaxAssets {
     continuation_candidates: HashMap<Scope, Vec<ContinuationCandidate>>,
 }
 
-type SerializedContinuationCandidates = HashMap<Scope, Vec<(String, Vec<String>)>>;
+type SerializedContinuationCandidate = (String, Vec<String>, Vec<String>);
+type SerializedContinuationCandidates = HashMap<Scope, Vec<SerializedContinuationCandidate>>;
 type GeneratedSyntaxAsset = (SyntaxSet, SerializedContinuationCandidates);
 
 struct ContinuationCandidate {
     marker: String,
+    opener_patterns: Vec<SyntaxRegex>,
     exit_patterns: Vec<SyntaxRegex>,
 }
 
@@ -238,6 +240,18 @@ impl ExitEvidence {
 }
 
 impl ContinuationCandidate {
+    /// 同じstackをpush/setするgrammar規則がvisible source内で成立するかを返す。
+    fn has_visible_opener(&self, lines: &[String], line_with_newline: &mut String) -> bool {
+        lines.iter().any(|line| {
+            line_with_newline.clear();
+            line_with_newline.push_str(line);
+            line_with_newline.push('\n');
+            self.opener_patterns
+                .iter()
+                .any(|pattern| pattern.search(line_with_newline, 0, line_with_newline.len(), None))
+        })
+    }
+
     fn exit_evidence(
         &self,
         line: &str,
@@ -312,10 +326,19 @@ impl SyntaxEngine {
                     .map(|(scope, candidates)| {
                         let candidates = candidates
                             .into_iter()
-                            .map(|(marker, patterns)| ContinuationCandidate {
-                                marker,
-                                exit_patterns: patterns.into_iter().map(SyntaxRegex::new).collect(),
-                            })
+                            .map(
+                                |(marker, opener_patterns, exit_patterns)| ContinuationCandidate {
+                                    marker,
+                                    opener_patterns: opener_patterns
+                                        .into_iter()
+                                        .map(SyntaxRegex::new)
+                                        .collect(),
+                                    exit_patterns: exit_patterns
+                                        .into_iter()
+                                        .map(SyntaxRegex::new)
+                                        .collect(),
+                                },
+                            )
                             .collect();
                         (scope, candidates)
                     })
@@ -468,6 +491,7 @@ impl SyntaxEngine {
                 .map(|last_exit| (candidate, last_exit))
         }));
         let mut best_score = None;
+        let mut best_visible_score = None;
         let mut selected_markers = Vec::with_capacity(candidates.len());
         if eligible_candidates.is_empty() {
             return None;
@@ -540,6 +564,16 @@ impl SyntaxEngine {
                 convergence_line,
                 exit: exit_evidence,
             };
+            // 候補と同じcontextを開くvisible openerがあれば、そのopenerだけでcloserを説明できる。
+            // 同じか弱い終了証拠へfallbackすると別contextで前半を誤着色するため、scoreも保持する。
+            if candidate.has_visible_opener(&lines[..=convergence_line], &mut filter_line) {
+                if best_visible_score
+                    .is_none_or(|current| score.strength_cmp(current) == Ordering::Greater)
+                {
+                    best_visible_score = Some(score);
+                }
+                continue;
+            }
             match best_score.map(|current| score.strength_cmp(current)) {
                 Some(Ordering::Less) => {}
                 Some(Ordering::Equal) => {
@@ -553,7 +587,13 @@ impl SyntaxEngine {
             }
         }
 
-        let convergence_line = best_score?.convergence_line;
+        let best_score = best_score?;
+        if best_visible_score
+            .is_some_and(|visible| visible.strength_cmp(best_score) != Ordering::Less)
+        {
+            return None;
+        }
+        let convergence_line = best_score.convergence_line;
         let first_marker = *selected_markers.first()?;
         if selected_markers.len() == 1 {
             return Some(first_marker.to_owned());

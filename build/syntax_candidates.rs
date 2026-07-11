@@ -1,9 +1,9 @@
 //! `two-face` grammarへhunk先頭state推定用の内部entryを追加するbuild-time変換。
 //!
-//! Runtimeは生成済み[`SyntaxSet`]とscope別markerだけをdeserializeする。候補はgrammar内の
-//! push/set stackを複製し、backreferenceを使わず、dark/light themeのどちらかで通常stateと
-//! 異なるstyleを持ち、include先を含めてpop可能なものに絞る。元の`__start`へNUL marker規則を
-//! 追加するが、sanitized sourceにはNULが残らないため通常入力からは到達できない。
+//! Runtimeは生成済み[`SyntaxSet`]とscope別marker・opener/exit regexをdeserializeする。候補は
+//! grammar内のpush/set stackを複製し、backreferenceを使わず、dark/light themeのどちらかで
+//! 通常stateと異なるstyleを持ち、include先を含めてpop可能なものに絞る。元の`__start`へNUL
+//! marker規則を追加するが、sanitized sourceにはNULが残らないため通常入力からは到達できない。
 
 use std::collections::{HashMap, HashSet};
 
@@ -15,7 +15,8 @@ use syntect::parsing::{Scope, SyntaxDefinition, SyntaxSet, SyntaxSetBuilder};
 
 const MAX_CONTINUATION_CANDIDATES: usize = 64;
 
-type SerializedContinuationCandidates = HashMap<Scope, Vec<(String, Vec<String>)>>;
+type SerializedContinuationCandidate = (String, Vec<String>, Vec<String>);
+type SerializedContinuationCandidates = HashMap<Scope, Vec<SerializedContinuationCandidate>>;
 pub type GeneratedSyntaxAsset = (SyntaxSet, SerializedContinuationCandidates);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,7 +25,12 @@ struct ContinuationStack {
     with_prototype: Option<ContextReference>,
 }
 
-/// Runtimeがそのままdeserializeできるsyntax setとscope別(marker, pop regex)を生成する。
+struct ContinuationTransition {
+    stack: ContinuationStack,
+    opener_pattern: String,
+}
+
+/// Runtimeがそのままdeserializeできるsyntax setとscope別(marker, opener regex, pop regex)を生成する。
 pub fn build() -> GeneratedSyntaxAsset {
     let themes = ThemeSet::load_defaults();
     let base = two_face::syntax::extra_newlines();
@@ -32,8 +38,8 @@ pub fn build() -> GeneratedSyntaxAsset {
     let mut definitions = builder.syntaxes().to_vec();
     let context_references = definitions
         .iter()
-        .flat_map(pushed_context_groups)
-        .flat_map(|stack| stack.contexts)
+        .flat_map(pushed_context_transitions)
+        .flat_map(|transition| transition.stack.contexts)
         .collect::<Vec<_>>();
     let context_reference_by_id = context_references
         .iter()
@@ -67,7 +73,7 @@ fn add_continuation_markers(
     context_references: &[ContextReference],
     context_reference_by_id: &HashMap<ContextId, ContextReference>,
     themes: &ThemeSet,
-) -> Vec<(String, Vec<String>)> {
+) -> Vec<SerializedContinuationCandidate> {
     let Some(main) = definition.contexts.get("__main") else {
         return Vec::new();
     };
@@ -75,10 +81,11 @@ fn add_continuation_markers(
         return Vec::new();
     };
 
-    let mut context_groups = pushed_context_groups(definition)
+    let mut transitions = pushed_context_transitions(definition)
         .into_iter()
-        .filter_map(|stack| {
-            let contexts = stack
+        .filter_map(|transition| {
+            let contexts = transition
+                .stack
                 .contexts
                 .iter()
                 .map(|reference| reference.resolve(syntax_set))
@@ -107,34 +114,56 @@ fn add_continuation_markers(
                     &mut visited,
                     &mut pop_patterns,
                 )
-            }) && stack.with_prototype.as_ref().is_none_or(|prototype| {
-                prototype.resolve(syntax_set).is_ok_and(|context| {
-                    collect_pop_patterns(
-                        context,
-                        syntax_set,
-                        context_reference_by_id,
-                        0,
-                        &mut visited,
-                        &mut pop_patterns,
-                    )
-                })
-            });
+            }) && transition
+                .stack
+                .with_prototype
+                .as_ref()
+                .is_none_or(|prototype| {
+                    prototype.resolve(syntax_set).is_ok_and(|context| {
+                        collect_pop_patterns(
+                            context,
+                            syntax_set,
+                            context_reference_by_id,
+                            0,
+                            &mut visited,
+                            &mut pop_patterns,
+                        )
+                    })
+                });
             pop_patterns.sort_unstable();
             pop_patterns.dedup();
             pop_patterns.retain(|pattern| exit_pattern_is_discriminating(pattern));
             if pop_patterns.is_empty() {
                 return None;
             }
-            Some((stack, pop_patterns))
+            Some((transition.stack, transition.opener_pattern, pop_patterns))
         })
         .collect::<Vec<_>>();
-    context_groups.sort_by_cached_key(|(stack, _)| format!("{stack:?}"));
-    context_groups.dedup_by(|left, right| left.0 == right.0);
+    transitions.sort_by_cached_key(|(stack, _, _)| format!("{stack:?}"));
+    let mut context_groups: Vec<(ContinuationStack, Vec<String>, Vec<String>)> = Vec::new();
+    for (stack, opener_pattern, pop_patterns) in transitions {
+        if let Some((current, opener_patterns, current_pop_patterns)) = context_groups.last_mut()
+            && *current == stack
+        {
+            opener_patterns.push(opener_pattern);
+            current_pop_patterns.extend(pop_patterns);
+        } else {
+            context_groups.push((stack, vec![opener_pattern], pop_patterns));
+        }
+    }
+    for (_, opener_patterns, pop_patterns) in &mut context_groups {
+        opener_patterns.sort_unstable();
+        opener_patterns.dedup();
+        pop_patterns.sort_unstable();
+        pop_patterns.dedup();
+    }
     context_groups.truncate(MAX_CONTINUATION_CANDIDATES);
 
     let mut marker_patterns = Vec::with_capacity(context_groups.len());
     let mut markers = Vec::with_capacity(context_groups.len());
-    for (index, (context_group, pop_patterns)) in context_groups.into_iter().enumerate() {
+    for (index, (context_group, opener_patterns, pop_patterns)) in
+        context_groups.into_iter().enumerate()
+    {
         let marker = format!("\0GUP-CONTINUATION-{index:02x}\0");
         let mut seeded_stack = Vec::with_capacity(1 + context_group.contexts.len());
         seeded_stack.push(main_reference.clone());
@@ -147,7 +176,7 @@ fn add_continuation_markers(
             MatchOperation::Push(seeded_stack),
             context_group.with_prototype,
         )));
-        markers.push((marker, pop_patterns));
+        markers.push((marker, opener_patterns, pop_patterns));
     }
 
     if let Some(start) = definition.contexts.get_mut("__start") {
@@ -194,7 +223,7 @@ fn context_group_changes_visible_style(
         })
 }
 
-fn pushed_context_groups(definition: &SyntaxDefinition) -> Vec<ContinuationStack> {
+fn pushed_context_transitions(definition: &SyntaxDefinition) -> Vec<ContinuationTransition> {
     let mut context_names = definition.contexts.keys().collect::<Vec<_>>();
     context_names.sort_unstable();
     let mut groups = Vec::new();
@@ -206,9 +235,12 @@ fn pushed_context_groups(definition: &SyntaxDefinition) -> Vec<ContinuationStack
                     &pattern.operation
                 && !pushed.is_empty()
             {
-                groups.push(ContinuationStack {
-                    contexts: pushed.clone(),
-                    with_prototype: pattern.with_prototype.clone(),
+                groups.push(ContinuationTransition {
+                    stack: ContinuationStack {
+                        contexts: pushed.clone(),
+                        with_prototype: pattern.with_prototype.clone(),
+                    },
+                    opener_pattern: pattern.regex().regex_str().to_owned(),
                 });
             }
         }
