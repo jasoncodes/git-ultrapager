@@ -224,7 +224,8 @@ Hunk 冒頭では同一 file・各 side の visible source を32行・64 KiBま�
 実行時は終了 regex が後続行に現れる候補だけを parse state で比較し、先頭行を越えて通常 state へ戻る場合だけ採用する。
 合流位置までに同じ候補の開始 regex が見えていれば、visible source だけで終了を説明できるため外側 context は補わない。
 複数候補が戻る場合は closer delimiter をより長く消費する終了 regex を選び、消費長が同じなら最初の合流位置を選ぶ。同じ強さで異なる style を返す候補があれば推定しない。
-stdin に hunk 外の本文がないため、合流を観測できない multiline context は通常 state のまま表示する。
+closer がなくても、2行以上の全行が `* ` または `*` で始まり、grammar の block-comment 候補が通常 state と合流せず、候補間の style が一致する場合はコメント継続として扱う。
+それ以外で合流を観測できない multiline context は通常 state のまま表示する。
 
 syntax 計算は decoration worker で行い、未計算部分を plain diff style で先に表示する。
 現在の hunk を8 MiBの priority result として先に返し、その後 document 先頭から64 MiBの full result を計算する。

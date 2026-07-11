@@ -2657,6 +2657,57 @@ mod tests {
     }
 
     #[test]
+    fn hunk_prefix_infers_unclosed_typescript_jsdoc_from_star_leaders() {
+        let document = parse_bytes(
+            b"diff --git a/src/use-simulator.ts b/src/use-simulator.ts\n--- a/src/use-simulator.ts\n+++ b/src/use-simulator.ts\n@@ -58,4 +58,5 @@ import type {\n  * speed uses the route.\n  * repeatMode controls the terminal behavior.\n- * old fold wording.\n+ * foldRepeat uses fold.direction.\n+ * startFromEnd mirrors the route.\n  * device.offline/online stays serialized.\n",
+        );
+        let added = read_lines(&document)
+            .into_iter()
+            .find(|line| line.text == "+ * foldRepeat uses fold.direction.")
+            .unwrap();
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+
+        let engine = SyntaxEngine::new().unwrap();
+        let mut expected_session = engine
+            .session(
+                Some("src/use-simulator.ts"),
+                Some("/** hidden before the hunk"),
+                ThemeChoice::Dark,
+            )
+            .unwrap()
+            .unwrap();
+        let _ = expected_session
+            .highlight_line("/** hidden before the hunk")
+            .unwrap();
+        let _ = expected_session
+            .highlight_line(" * speed uses the route.")
+            .unwrap();
+        let _ = expected_session
+            .highlight_line(" * repeatMode controls the terminal behavior.")
+            .unwrap();
+        let expected = expected_session
+            .highlight_line(" * foldRepeat uses fold.direction.")
+            .unwrap();
+        let HighlightedLine::Styled(expected) = expected else {
+            panic!("expected inferred JSDoc syntax");
+        };
+
+        let expected = expected
+            .into_iter()
+            .filter_map(|span| shift_syntax_span(span, added.text.len()))
+            .collect::<Vec<_>>();
+        let actual = decorations
+            .line(added.id)
+            .map(|decoration| decoration.syntax.clone())
+            .unwrap_or_default();
+        assert!(
+            syntax_spans_equivalent(&actual, &expected),
+            "actual={actual:?} expected={expected:?}"
+        );
+    }
+
+    #[test]
     fn hunk_prefix_does_not_seed_typescript_comment_before_visible_opener() {
         let document = parse_bytes(
             b"diff --git a/src/domain/types.ts b/src/domain/types.ts\n--- a/src/domain/types.ts\n+++ b/src/domain/types.ts\n@@ -165,7 +172,7 @@ export interface RuntimeDeviceState {\n   accessTokenExpiresAt: string | null\n   /**\n    * current progress.\n-   * old terminal wording.\n+   * new terminal wording.\n    */\n   progressRatio: number | null\n   /** current direction. */\n@@ -217,8 +224,10 @@ export interface RunningDevice {\n   lastTickAt: number\n   distanceMeters: number\n   repeatMode: RepeatMode\n+  /** mirror the route. */\n+  startFromEnd: boolean\n   /**\n-   * old lap wording.\n+   * new lap wording.\n    * detect a crossed leg.\n    * null immediately after start.\n    */\n",

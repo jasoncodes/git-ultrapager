@@ -242,14 +242,28 @@ impl ExitEvidence {
 impl ContinuationCandidate {
     /// 同じstackをpush/setするgrammar規則がvisible source内で成立するかを返す。
     fn has_visible_opener(&self, lines: &[String], line_with_newline: &mut String) -> bool {
-        lines.iter().any(|line| {
-            line_with_newline.clear();
-            line_with_newline.push_str(line);
-            line_with_newline.push('\n');
-            self.opener_patterns
-                .iter()
-                .any(|pattern| pattern.search(line_with_newline, 0, line_with_newline.len(), None))
-        })
+        lines
+            .iter()
+            .any(|line| self.opener_matches(line, line_with_newline))
+    }
+
+    fn opener_matches(&self, line: &str, line_with_newline: &mut String) -> bool {
+        line_with_newline.clear();
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+        self.opener_patterns
+            .iter()
+            .any(|pattern| pattern.search(line_with_newline, 0, line_with_newline.len(), None))
+    }
+
+    /// `* `だけが続くprefix用に、grammar上のblock-comment contextかをsynthetic delimiterで判定する。
+    fn is_block_comment(&self, line_with_newline: &mut String, region: &mut SyntaxRegion) -> bool {
+        ["/**", "/*"]
+            .into_iter()
+            .any(|opener| self.opener_matches(opener, line_with_newline))
+            && self
+                .exit_evidence(" */", line_with_newline, region)
+                .is_some_and(|evidence| evidence.consumed >= 2)
     }
 
     fn exit_evidence(
@@ -307,6 +321,14 @@ impl ContinuationCandidate {
             })
             .last()
     }
+}
+
+fn is_unclosed_comment_leader_prefix(lines: &[String]) -> bool {
+    lines.len() >= 2
+        && lines.iter().all(|line| {
+            let trimmed = line.trim_start();
+            trimmed == "*" || trimmed.starts_with("* ")
+        })
 }
 
 impl SyntaxEngine {
@@ -404,7 +426,8 @@ impl SyntaxEngine {
     ///
     /// 候補は改行後も残り、prefix内で通常stateへ合流するcontextに限る。終了regexが消費する
     /// delimiter長、合流位置の順で候補を絞り、同じ強さの候補が異なるspanを返す場合は入力だけでは
-    /// 一意に決められないため、通常stateのsessionを返す。
+    /// 一意に決められないため、通常stateのsessionを返す。全行が`* `で始まるprefixだけは、closerが
+    /// なくてもgrammarのblock-comment候補が継続し、候補間のspanが一致すれば採用する。
     pub(crate) fn session_with_inferred_continuation<'engine>(
         &'engine self,
         path: Option<&str>,
@@ -493,14 +516,19 @@ impl SyntaxEngine {
         let mut best_score = None;
         let mut best_visible_score = None;
         let mut selected_markers = Vec::with_capacity(candidates.len());
-        if eligible_candidates.is_empty() {
+        let unclosed_comment_fallback = is_unclosed_comment_leader_prefix(lines);
+        if eligible_candidates.is_empty() && !unclosed_comment_fallback {
             return None;
         }
 
-        let max_probe_line = eligible_candidates
-            .iter()
-            .map(|(_, last_exit)| *last_exit)
-            .max()?;
+        let max_probe_line = if unclosed_comment_fallback {
+            lines.len().checked_sub(1)?
+        } else {
+            eligible_candidates
+                .iter()
+                .map(|(_, last_exit)| *last_exit)
+                .max()?
+        };
         let probe_lines = &lines[..=max_probe_line];
         let max_line_bytes = probe_lines.iter().map(String::len).max().unwrap_or(0);
         let state_bytes = SYNTAX_STATE_BASE_BYTES
@@ -527,6 +555,43 @@ impl SyntaxEngine {
             }
             (seed, states)
         };
+
+        if unclosed_comment_fallback {
+            for candidate in candidates {
+                if !candidate.is_block_comment(&mut filter_line, &mut exit_region)
+                    || candidate.has_visible_opener(lines, &mut filter_line)
+                {
+                    continue;
+                }
+                let mut inferred = self.probe_session(syntax, ledger)?;
+                inferred
+                    .advance_with_budget(&candidate.marker, ledger)
+                    .ok()??;
+                if inferred.same_state(&baseline_seed) {
+                    continue;
+                }
+                let mut converged = false;
+                for (line_index, line) in lines.iter().enumerate() {
+                    inferred.advance_with_budget(line, ledger).ok()??;
+                    if inferred.same_state(&baseline_states[line_index]) {
+                        converged = true;
+                        break;
+                    }
+                }
+                if !converged {
+                    selected_markers.push(candidate.marker.as_str());
+                }
+            }
+            if !selected_markers.is_empty() {
+                return self.equivalent_inference_marker(
+                    syntax,
+                    theme,
+                    &selected_markers,
+                    lines,
+                    ledger,
+                );
+            }
+        }
 
         for (candidate, last_exit) in &eligible_candidates {
             let mut inferred = self.probe_session(syntax, ledger)?;
@@ -594,33 +659,39 @@ impl SyntaxEngine {
             return None;
         }
         let convergence_line = best_score.convergence_line;
-        let first_marker = *selected_markers.first()?;
-        if selected_markers.len() == 1 {
+        self.equivalent_inference_marker(
+            syntax,
+            theme,
+            &selected_markers,
+            &lines[..=convergence_line],
+            ledger,
+        )
+    }
+
+    fn equivalent_inference_marker(
+        &self,
+        syntax: &SyntaxReference,
+        theme: &syntect::highlighting::Theme,
+        markers: &[&str],
+        lines: &[String],
+        ledger: &DerivedMemoryLedger,
+    ) -> Option<String> {
+        let first_marker = *markers.first()?;
+        if markers.len() == 1 {
             return Some(first_marker.to_owned());
         }
 
-        let output_vec_bytes = convergence_line
-            .checked_add(1)?
+        let output_vec_bytes = lines
+            .len()
             .checked_mul(size_of::<BudgetedHighlightedLine>())?
             .checked_mul(2)?;
         let _output_vec_lease = ledger
             .reserve(DerivedMemoryPool::DecorationWorkspace, output_vec_bytes)
             .ok()?;
-        let expected = self.inference_highlight_output(
-            syntax,
-            theme,
-            first_marker,
-            &lines[..=convergence_line],
-            ledger,
-        )?;
-        for marker in selected_markers.into_iter().skip(1) {
-            let actual = self.inference_highlight_output(
-                syntax,
-                theme,
-                marker,
-                &lines[..=convergence_line],
-                ledger,
-            )?;
+        let expected =
+            self.inference_highlight_output(syntax, theme, first_marker, lines, ledger)?;
+        for marker in markers.iter().copied().skip(1) {
+            let actual = self.inference_highlight_output(syntax, theme, marker, lines, ledger)?;
             if actual.len() != expected.len()
                 || actual.iter().zip(&expected).any(|(actual, expected)| {
                     !highlighted_lines_equivalent(actual.line(), expected.line())
