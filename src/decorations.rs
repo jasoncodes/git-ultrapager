@@ -2804,6 +2804,52 @@ mod tests {
     }
 
     #[test]
+    fn hunk_prefix_does_not_use_a_block_closer_inside_a_rust_line_comment() {
+        let document = parse_bytes(
+            b"diff --git a/src/highlight.rs b/src/highlight.rs\n--- a/src/highlight.rs\n+++ b/src/highlight.rs\n@@ -625,4 +680,9 @@ impl SyntaxEngine {\n             ) else {\n                 continue;\n             };\n+            // A `/` exit embedded in `//` or `*/` belongs to another context.\n+            // Keep the whole line in its visible single-line comment context.\n+            if exit_is_partial_comment_delimiter(line, exit_evidence) {\n+                continue;\n+            }\n             let score = ContinuationScore {\n",
+        );
+        let lines = read_lines(&document);
+        let targets = [
+            lines
+                .iter()
+                .find(|line| line.text.trim() == "continue;")
+                .unwrap(),
+            lines
+                .iter()
+                .find(|line| line.text.contains("embedded in `//` or `*/`"))
+                .unwrap(),
+        ];
+        let decorations =
+            DecorationSet::compute(&document, &theme(), WhitespaceChoice::Ignore).unwrap();
+        let engine = SyntaxEngine::new().unwrap();
+
+        for target in targets {
+            let content = target.text.get(1..).unwrap();
+            let expected = engine
+                .session(Some("src/highlight.rs"), Some(content), ThemeChoice::Dark)
+                .unwrap()
+                .unwrap()
+                .highlight_line(content)
+                .unwrap();
+            let HighlightedLine::Styled(expected) = expected else {
+                panic!("expected standalone Rust syntax");
+            };
+            let expected = expected
+                .into_iter()
+                .filter_map(|span| shift_syntax_span(span, target.text.len()))
+                .collect::<Vec<_>>();
+            let actual = decorations
+                .line(target.id)
+                .map(|decoration| decoration.syntax.clone())
+                .unwrap_or_default();
+            assert!(
+                syntax_spans_equivalent(&actual, &expected),
+                "line={content:?} actual={actual:?} expected={expected:?}"
+            );
+        }
+    }
+
+    #[test]
     fn hunk_prefix_does_not_seed_typescript_comment_before_visible_opener() {
         let document = parse_bytes(
             b"diff --git a/src/domain/types.ts b/src/domain/types.ts\n--- a/src/domain/types.ts\n+++ b/src/domain/types.ts\n@@ -165,7 +172,7 @@ export interface RuntimeDeviceState {\n   accessTokenExpiresAt: string | null\n   /**\n    * current progress.\n-   * old terminal wording.\n+   * new terminal wording.\n    */\n   progressRatio: number | null\n   /** current direction. */\n@@ -217,8 +224,10 @@ export interface RunningDevice {\n   lastTickAt: number\n   distanceMeters: number\n   repeatMode: RepeatMode\n+  /** mirror the route. */\n+  startFromEnd: boolean\n   /**\n-   * old lap wording.\n+   * new lap wording.\n    * detect a crossed leg.\n    * null immediately after start.\n    */\n",

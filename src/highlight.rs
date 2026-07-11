@@ -193,6 +193,8 @@ struct SyntaxAssets {
     syntaxes: SyntaxSet,
     themes: ThemeSet,
     continuation_candidates: HashMap<Scope, Vec<ContinuationCandidate>>,
+    /// Baseline grammarがdelimiter位置をこのscope内として読む場合、文字列自体は外側contextを閉じない。
+    opaque_scope_prefixes: [Scope; 2],
 }
 
 type SerializedContinuationCandidate = (String, Vec<String>, Vec<String>);
@@ -406,10 +408,17 @@ impl SyntaxEngine {
                 if syntaxes.find_syntax_by_name("Plain Text").is_none() {
                     return Err(HighlightError::MissingPlainText);
                 }
+                let opaque_scope_prefixes = [
+                    Scope::new("comment")
+                        .map_err(|error| HighlightError::Syntect(error.to_string()))?,
+                    Scope::new("string")
+                        .map_err(|error| HighlightError::Syntect(error.to_string()))?,
+                ];
                 Ok(Arc::new(SyntaxAssets {
                     syntaxes,
                     themes,
                     continuation_candidates,
+                    opaque_scope_prefixes,
                 }))
             })
             .clone()?;
@@ -465,8 +474,9 @@ impl SyntaxEngine {
     /// 候補は改行後も残り、prefix内で通常stateへ合流するcontextに限る。終了regexが消費する
     /// delimiter長、合流位置の順で候補を絞る。`* `prefixでは`/**`に対するopener regexの
     /// 消費長も使い、JSDocと通常block commentを区別する。同じ強さの候補が異なるspanを返す場合は
-    /// 入力だけでは一意に決められないため、通常stateのsessionを返す。closerがない`* `prefixも、
-    /// grammarのblock-comment候補のうち同じ基準で最も具体的な候補を採用する。
+    /// 入力だけでは一意に決められないため、通常stateのsessionを返す。Baseline grammarがexit位置を
+    /// commentまたはstring scopeとして読む場合、その文字列は外側contextのcloserに数えない。
+    /// Closerがない`* `prefixも、grammarのblock-comment候補のうち同じ基準で最も具体的な候補を採用する。
     pub(crate) fn session_with_inferred_continuation<'engine>(
         &'engine self,
         path: Option<&str>,
@@ -685,6 +695,27 @@ impl SyntaxEngine {
             if exit_is_partial_comment_delimiter(&lines[convergence_line], exit_evidence) {
                 continue;
             }
+            let baseline_before_exit = convergence_line
+                .checked_sub(1)
+                .map_or(&baseline_seed, |index| &baseline_states[index]);
+            let mut baseline_at_exit = self.probe_session_from_state(
+                baseline_before_exit,
+                lines[convergence_line].len(),
+                ledger,
+            )?;
+            // Raw exit regexより先にbaseline grammarを適用する。`// ... */`や文字列内のquoteなど、
+            // visibleな字句contextが所有するdelimiterは欠けた外側contextのcloserに数えない。
+            if baseline_at_exit
+                .scope_has_prefix_at_offset(
+                    &lines[convergence_line],
+                    exit_evidence.start,
+                    &self.assets.opaque_scope_prefixes,
+                    ledger,
+                )
+                .ok()??
+            {
+                continue;
+            }
             let score = ContinuationScore {
                 convergence_line,
                 exit: exit_evidence,
@@ -784,6 +815,25 @@ impl SyntaxEngine {
         Some(SyntaxProbeSession::new(
             &self.assets.syntaxes,
             syntax,
+            lease,
+        ))
+    }
+
+    fn probe_session_from_state<'engine>(
+        &'engine self,
+        state: &SyntaxProbeState,
+        line_len: usize,
+        ledger: &DerivedMemoryLedger,
+    ) -> Option<SyntaxProbeSession<'engine>> {
+        let state_bytes = line_len
+            .checked_mul(SyntaxProbeSession::STATE_BYTES_PER_INPUT_BYTE)?
+            .checked_add(SYNTAX_STATE_BASE_BYTES)?;
+        let lease = ledger
+            .reserve(DerivedMemoryPool::DecorationWorkspace, state_bytes)
+            .ok()?;
+        Some(SyntaxProbeSession::from_state(
+            &self.assets.syntaxes,
+            state,
             lease,
         ))
     }
@@ -1002,6 +1052,67 @@ impl<'engine> SyntaxProbeSession<'engine> {
             scope_stack: ScopeStack::new(),
             state_lease,
         }
+    }
+
+    fn from_state(
+        syntaxes: &'engine SyntaxSet,
+        state: &SyntaxProbeState,
+        state_lease: DerivedMemoryLease,
+    ) -> Self {
+        Self {
+            syntaxes,
+            parse_state: state.parse_state.clone(),
+            scope_stack: state.scope_stack.clone(),
+            state_lease,
+        }
+    }
+
+    /// Snapshotの次のlineをparseし、`offset`の文字へ適用されるscopeを返す。
+    ///
+    /// Parser operationはそのbyteから始まるspanのscopeを変更するため、`offset`と同位置のoperationも
+    /// 適用する。`None`はline上限、workspace不足、またはoffset範囲外で判定できなかったことを表す。
+    fn scope_has_prefix_at_offset(
+        &mut self,
+        line: &str,
+        offset: usize,
+        prefixes: &[Scope],
+        ledger: &DerivedMemoryLedger,
+    ) -> Result<Option<bool>, HighlightError> {
+        if offset > line.len()
+            || line.len() > MAX_SYNTAX_LINE_BYTES
+            || !self.ensure_state_budget(line.len())
+        {
+            return Ok(None);
+        }
+        let Some(workspace_bytes) = syntax_workspace_upper_bound(line.len()) else {
+            return Ok(None);
+        };
+        let _workspace =
+            match ledger.reserve(DerivedMemoryPool::DecorationWorkspace, workspace_bytes) {
+                Ok(lease) => lease,
+                Err(_) => return Ok(None),
+            };
+        let mut line_with_newline = String::with_capacity(line.len() + 1);
+        line_with_newline.push_str(line);
+        line_with_newline.push('\n');
+        let operations = self
+            .parse_state
+            .parse_line(&line_with_newline, self.syntaxes)
+            .map_err(|error| HighlightError::Syntect(error.to_string()))?;
+        for (position, operation) in operations {
+            if position > offset {
+                break;
+            }
+            self.scope_stack
+                .apply(&operation)
+                .map_err(|error| HighlightError::Syntect(error.to_string()))?;
+        }
+        Ok(Some(prefixes.iter().any(|prefix| {
+            self.scope_stack
+                .scopes
+                .iter()
+                .any(|scope| prefix.is_prefix_of(*scope))
+        })))
     }
 
     fn advance_with_budget(
