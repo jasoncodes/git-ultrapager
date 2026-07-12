@@ -1265,19 +1265,23 @@ fn render_body(
         .min(usize::from(body_area.height))];
     let mut screen_row = 0_usize;
     for (row_index, row) in visible_rows.iter().enumerate() {
-        for header in lines.inline_context_headers(row.line_id) {
-            frame.render_widget(
-                Paragraph::new(header.as_str()).style(theme.style(SemanticRole::Sticky)),
-                Rect::new(
-                    body_area.x,
-                    body_area.y.saturating_add(screen_row as u16),
-                    body_area.width,
-                    1,
-                ),
-            );
-            screen_row = screen_row.saturating_add(1);
-            if screen_row >= usize::from(body_area.height) {
-                break;
+        // Header indexはlogical LineId単位なので、折り返しfragmentは同じentryを共有する。
+        // Logical line先頭だけへ描き、本文fragmentの間へ同じheaderが再挿入されるのを防ぐ。
+        if !row.continuation {
+            for header in lines.inline_context_headers(row.line_id) {
+                frame.render_widget(
+                    Paragraph::new(header.as_str()).style(theme.style(SemanticRole::Sticky)),
+                    Rect::new(
+                        body_area.x,
+                        body_area.y.saturating_add(screen_row as u16),
+                        body_area.width,
+                        1,
+                    ),
+                );
+                screen_row = screen_row.saturating_add(1);
+                if screen_row >= usize::from(body_area.height) {
+                    break;
+                }
             }
         }
         if screen_row >= usize::from(body_area.height) {
@@ -2725,6 +2729,35 @@ mod tests {
             .unwrap();
         let screen = buffer_text(&terminal);
         assert!(screen.contains("second-new"), "{screen}");
+    }
+
+    #[test]
+    fn body_inserts_file_header_once_before_wrapped_diff_header() {
+        let long_path = "src/this-is-a-very-long-file-name-that-wraps-the-diff-header.rs";
+        let input = format!(
+            "diff --git a/first.rs b/first.rs\n--- a/first.rs\n+++ b/first.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/{long_path} b/{long_path}\n--- a/{long_path}\n+++ b/{long_path}\n@@ -1 +1 @@\n-old\n+new\n"
+        );
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let state = AppState::new(
+            Arc::new(document),
+            40,
+            20,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let theme = Theme::new(ThemeChoice::Dark, ColorLevel::None);
+        let decorations =
+            DecorationSet::compute(state.document(), &theme, WhitespaceChoice::Ignore).unwrap();
+        let lines = load_frame(&state);
+        let mut terminal = Terminal::new(TestBackend::new(40, 20)).unwrap();
+        terminal
+            .draw(|frame| render(frame, &state, &theme, &decorations, &lines))
+            .unwrap();
+        let screen = buffer_text(&terminal);
+
+        assert_eq!(screen.matches("2/2").count(), 1, "{screen}");
     }
 
     #[test]
