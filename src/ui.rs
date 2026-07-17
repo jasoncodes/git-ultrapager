@@ -28,7 +28,7 @@ use crate::direct::VisualRow;
 use crate::document::{
     DocumentError, DocumentIdentity, DocumentLineMetadata, DocumentLineMetadataReader,
 };
-use crate::model::{CommitId, CommitKind, FileId, LineId, LineKind};
+use crate::model::{ChangeStatus, CommitId, CommitKind, FileId, LineId, LineKind};
 use crate::search::{CompiledSearch, IncrementalQueryStatus, SearchMatch};
 use crate::state::{
     AppState, FileListItem, FileListState, Mode, SearchInputState, TextInput,
@@ -95,6 +95,57 @@ struct FileListRow {
     text: String,
     role: SemanticRole,
     selected: bool,
+    file: Option<FileListRowFile>,
+}
+
+/// File rowの再整形に使うfixed metadata。
+///
+/// Pathはframe内へ重複保持せず、表示行が揃ってから`FileId`で読み直す。これにより、長いpathを
+/// column幅の確定待ちとして保持せず、表示対象のstatus/countだけから幅を決められる。
+#[derive(Clone, Copy, Debug)]
+struct FileListRowFile {
+    id: FileId,
+    status: ChangeStatus,
+    additions: Option<u64>,
+    deletions: Option<u64>,
+}
+
+impl From<StoredFileRef<'_>> for FileListRowFile {
+    fn from(file: StoredFileRef<'_>) -> Self {
+        Self {
+            id: file.id,
+            status: file.status,
+            additions: file.additions,
+            deletions: file.deletions,
+        }
+    }
+}
+
+/// 1 frameに表示するfile row間で共有するcolumn幅。
+#[derive(Clone, Copy, Debug, Default)]
+struct FileListColumnWidths {
+    status: usize,
+    additions: usize,
+    deletions: usize,
+    show_counts: bool,
+}
+
+impl FileListColumnWidths {
+    fn observe(&mut self, file: FileListRowFile) {
+        self.status = self.status.max(display_width(file.status.label()));
+        if file.status == ChangeStatus::Binary {
+            return;
+        }
+        self.show_counts = true;
+        self.additions = self.additions.max(file_count_width(file.additions));
+        self.deletions = self.deletions.max(file_count_width(file.deletions));
+    }
+
+    fn for_file(file: FileListRowFile) -> Self {
+        let mut widths = Self::default();
+        widths.observe(file);
+        widths
+    }
 }
 
 /// Virtual file-list item 1件をowned表示行へ変換した値。
@@ -565,9 +616,10 @@ impl FrameLoader {
                     text: fit_end(text, width),
                     role: SemanticRole::Dim,
                     selected: false,
+                    file: None,
                 },
             );
-            return finish_file_list_frame(file_list);
+            return self.finish_file_list(state, file_list, width);
         };
         if window.total_matches == 0 || window.file_ids.is_empty() || entry_limit == 0 {
             let text = if file_list.loading {
@@ -581,9 +633,10 @@ impl FrameLoader {
                     text: fit_end(text, width),
                     role: SemanticRole::Dim,
                     selected: false,
+                    file: None,
                 },
             );
-            return finish_file_list_frame(file_list);
+            return self.finish_file_list(state, file_list, width);
         }
 
         let selected_index = window
@@ -657,12 +710,18 @@ impl FrameLoader {
                     .file_reader
                     .read_file(structure, file_id)?
                     .ok_or(FrameLinesError::MissingFile { file_id })?;
+                let row_file = FileListRowFile::from(file);
                 (
                     file.commit_id,
                     FileListRow {
-                        text: file_list_entry(file, width),
+                        text: file_list_entry(
+                            file,
+                            width,
+                            FileListColumnWidths::for_file(row_file),
+                        ),
                         role: SemanticRole::Plain,
                         selected,
+                        file: Some(row_file),
                     },
                 )
             }
@@ -672,6 +731,7 @@ impl FrameLoader {
                     text: fit_end("  (no file changes)", width),
                     role: SemanticRole::Dim,
                     selected,
+                    file: None,
                 },
             ),
         };
@@ -690,6 +750,7 @@ impl FrameLoader {
                 text: fit_end(&commit_label(commit), width),
                 role: SemanticRole::CommitHeader,
                 selected: false,
+                file: None,
             },
             entry,
         })
@@ -715,9 +776,10 @@ impl FrameLoader {
                     text: fit_end(text, width),
                     role: SemanticRole::Dim,
                     selected: false,
+                    file: None,
                 },
             );
-            return finish_file_list_frame(file_list);
+            return self.finish_file_list(state, file_list, width);
         };
 
         let selected = self.prepare_file_list_item(state, selected_item, width, true)?;
@@ -789,7 +851,7 @@ impl FrameLoader {
                 break;
             }
         }
-        finish_file_list_frame(file_list)
+        self.finish_file_list(state, file_list, width)
     }
 
     fn load_filtered_file_list_rows(
@@ -866,6 +928,36 @@ impl FrameLoader {
             if !added && (before_complete || after_complete) {
                 break;
             }
+        }
+        self.finish_file_list(state, file_list, width)
+    }
+
+    /// 表示対象が確定したfile rowだけからcolumn幅を決め、pathを最終幅でもう一度decodeする。
+    ///
+    /// Document全体のfileを走査しないため、巨大diffでもframe構築量はterminal heightで頭打ちになる。
+    /// Countを持たないbinary rowはcount columnと同じ幅の空白を置き、他のfileとpath開始位置を揃える。
+    fn finish_file_list(
+        &mut self,
+        state: &AppState,
+        mut file_list: FileListFrame,
+        width: usize,
+    ) -> Result<FrameLines, FrameLinesError> {
+        let mut columns = FileListColumnWidths::default();
+        for file in file_list.overlay_rows.iter().filter_map(|row| row.file) {
+            columns.observe(file);
+        }
+
+        for row in &mut file_list.overlay_rows {
+            let Some(row_file) = row.file else {
+                continue;
+            };
+            let file = self
+                .file_reader
+                .read_file(state.document().structure(), row_file.id)?
+                .ok_or(FrameLinesError::MissingFile {
+                    file_id: row_file.id,
+                })?;
+            row.text = file_list_entry(file, width, columns);
         }
         finish_file_list_frame(file_list)
     }
@@ -2070,17 +2162,36 @@ fn for_each_detail_line(
     emitted
 }
 
-fn file_list_entry(file: StoredFileRef<'_>, width: usize) -> String {
-    let prefix = if matches!(file.status, crate::model::ChangeStatus::Binary) {
-        "  binary ".to_owned()
-    } else {
+fn file_count_width(count: Option<u64>) -> usize {
+    count.map_or(1, |value| value.to_string().len())
+}
+
+fn file_list_entry(file: StoredFileRef<'_>, width: usize, columns: FileListColumnWidths) -> String {
+    let status = file.status.label();
+    let status_width = columns.status;
+    let prefix = if columns.show_counts && file.status == ChangeStatus::Binary {
+        let count_columns_width = columns
+            .additions
+            .saturating_add(columns.deletions)
+            .saturating_add(5);
+        format!(
+            "  {status:<status_width$}{}",
+            " ".repeat(count_columns_width)
+        )
+    } else if columns.show_counts {
         let additions = file
             .additions
             .map_or_else(|| "?".to_owned(), |value| value.to_string());
         let deletions = file
             .deletions
             .map_or_else(|| "?".to_owned(), |value| value.to_string());
-        format!("  {} +{additions} -{deletions} ", file.status.label())
+        let additions_width = columns.additions;
+        let deletions_width = columns.deletions;
+        format!(
+            "  {status:<status_width$} +{additions:>additions_width$} -{deletions:>deletions_width$} "
+        )
+    } else {
+        format!("  {status:<status_width$} ")
     };
     let path_width = width.saturating_sub(display_width(&prefix));
     let path = fit_file_path(file, path_width);
@@ -2640,6 +2751,18 @@ mod tests {
         input.push_str(&format!(
             "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-old\n+new\n"
         ));
+    }
+
+    fn append_counted_file(input: &mut String, path: &str, deletions: usize, additions: usize) {
+        input.push_str(&format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,{deletions} +1,{additions} @@\n"
+        ));
+        for index in 0..deletions {
+            input.push_str(&format!("-old {index}\n"));
+        }
+        for index in 0..additions {
+            input.push_str(&format!("+new {index}\n"));
+        }
     }
 
     fn append_empty_commit(input: &mut String, index: usize, subject: &str) {
@@ -3406,6 +3529,54 @@ commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
     }
 
     #[test]
+    fn file_list_aligns_visible_status_counts_and_paths() {
+        let mut input = String::new();
+        append_counted_file(&mut input, "one.rs", 1, 2);
+        append_counted_file(&mut input, "two.rs", 10, 12);
+        input.push_str(
+            "diff --git a/image.bin b/image.bin\nBinary files a/image.bin and b/image.bin differ\n",
+        );
+        append_counted_file(&mut input, "three.rs", 3, 4);
+        let document = parse_bytes(input.as_bytes()).unwrap();
+        let state = AppState::new(
+            Arc::new(document),
+            80,
+            10,
+            4,
+            WhitespaceChoice::Ignore,
+            true,
+        )
+        .unwrap();
+        let list = file_list_state(Some(FileListItem::File(FileId::new(0))), None, false);
+        let lines = FrameLoader::new().load_file_list(&state, &list).unwrap();
+        let rows = lines
+            .file_list
+            .as_ref()
+            .unwrap()
+            .overlay_rows
+            .iter()
+            .filter(|row| row.file.is_some())
+            .map(|row| row.text.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            vec![
+                "  M      + 2 - 1 one.rs",
+                "  M      +12 -10 two.rs",
+                "  binary         image.bin",
+                "  M      + 4 - 3 three.rs",
+            ]
+        );
+        let path_columns = ["one.rs", "two.rs", "image.bin", "three.rs"]
+            .into_iter()
+            .zip(&rows)
+            .map(|(path, row)| row.find(path).unwrap())
+            .collect::<Vec<_>>();
+        assert!(path_columns.windows(2).all(|pair| pair[0] == pair[1]));
+    }
+
+    #[test]
     fn file_list_preload_distinguishes_loading_and_no_matches() {
         let document = parse_bytes(b"plain\n").unwrap();
         let state =
@@ -3682,6 +3853,7 @@ commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
                     text: payload.clone(),
                     role: SemanticRole::Plain,
                     selected: false,
+                    file: None,
                 },
             ) {
                 break;
